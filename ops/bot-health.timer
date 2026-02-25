@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Bot Health Watchdog every minute
+
+[Timer]
+Unit=bot-health.service
+OnBootSec=60
+OnUnitActiveSec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

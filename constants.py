@@ -1,0 +1,7 @@
+# constants.py - Named constants for trading bot (avoids magic numbers)
+MAX_ATR_PERCENTAGE = 0.06
+MIN_LIQUIDITY_USD = 100_000
+DEFAULT_TAKE_PROFIT = 0.015
+MAX_POSITION_SIZE = 0.20
+DEFAULT_MAX_GAP_PCT = 0.06
+DEFAULT_DAILY_LOSS_LIMIT_PCT = 0.06

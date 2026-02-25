@@ -1,0 +1,278 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">DCA Dashboard</div>
+      <div class="muted">Live bot performance + trades</div>
+      {% if not kraken_ready %}
+        <div class="muted mt-6">
+          <span class="tag tag-neg">Kraken not ready</span>
+          <span class="mono text-xs">{{ kraken_error }}</span>
+        </div>
+      {% endif %}
+    </div>
+    <div class="row gap-8 row-wrap row-end">
+      <a class="btn" href="/">Dashboard</a>
+      <a class="btn btn-purple" href="/bots">Open Bots</a>
+    </div>
+  </div>
+
+  <!-- DCA bot dashboard -->
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <div class="h2">DCA bots</div>
+        <div class="muted">Open/closed deals + realized PnL</div>
+      </div>
+      <div class="row gap-8 row-wrap row-end">
+        <span class="tag">Open deals: {{ deals_stats.open_count }}</span>
+        <span class="tag">Closed deals: {{ deals_stats.closed_count }}</span>
+        <span class="tag {% if deals_stats.realized_total >= 0 %}tag-pos{% else %}tag-neg{% endif %}">
+          Realized: {{ "%.2f"|format(deals_stats.realized_total) }}
+        </span>
+        <span class="tag {% if deals_stats.unrealized_total >= 0 %}tag-pos{% else %}tag-neg{% endif %}">
+          Unrealized: {{ "%.2f"|format(deals_stats.unrealized_total) }}
+        </span>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Bot</th>
+            <th>Symbol</th>
+            <th class="right">Mode</th>
+            <th class="right">State</th>
+            <th class="right">Enabled</th>
+            <th>Action</th>
+            <th class="right">PnL</th>
+            <th class="right">Open deals</th>
+            <th class="right">Closed deals</th>
+            <th class="right">Realized PnL</th>
+            <th class="right">Unrealized PnL</th>
+            <th class="right">Position</th>
+            <th class="right">Last price</th>
+            <th class="right">Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for b in bot_rows %}
+          <tr>
+            <td class="mono">{{ b.name }}</td>
+            <td class="mono">{{ b.symbol }}</td>
+            <td class="right">
+              {% if b.dry_run %}
+                <span class="tag">DRY</span>
+              {% else %}
+                <span class="tag">LIVE</span>
+              {% endif %}
+            </td>
+            <td class="right">
+              {% if b.runtime and b.runtime.running %}
+                <span class="tag tag-pos">RUNNING</span>
+              {% else %}
+                <span class="tag tag-neg">STOPPED</span>
+              {% endif %}
+            </td>
+            <td class="right">
+              {% if b.enabled %}
+                <span class="tag tag-pos">ON</span>
+              {% else %}
+                <span class="tag tag-neg">OFF</span>
+              {% endif %}
+            </td>
+            <td class="mono">{{ b.runtime.last_event if b.runtime else "—" }}</td>
+            <td class="right"><canvas class="spark" id="spark-{{ b.id }}" width="120" height="32"></canvas></td>
+            <td class="right mono">{{ b.stats.open_count }}</td>
+            <td class="right mono">{{ b.stats.closed_count }}</td>
+            <td class="right mono {% if b.stats.realized_total >= 0 %}pos{% else %}neg{% endif %}">
+              {{ "%.2f"|format(b.stats.realized_total) }}
+            </td>
+            <td class="right mono {% if b.unrealized_pnl >= 0 %}pos{% else %}neg{% endif %}">
+              {{ "%.2f"|format(b.unrealized_pnl) }}
+            </td>
+            <td class="right mono">
+              {% if b.runtime and b.runtime.base_pos is not none %}
+                {{ "%.8f"|format(b.runtime.base_pos) }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="right mono">
+              {% if b.runtime and b.runtime.last_price is not none %}
+                {{ "%.2f"|format(b.runtime.last_price) }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="right">
+              <a class="btn" href="/bots/{{ b.id }}">View</a>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if bot_rows|length == 0 %}
+          <tr>
+            <td colspan="14" class="muted">No bots yet.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Trades tabs -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Trades</div>
+        <div class="muted">Active vs closed deals</div>
+      </div>
+      <div class="row gap-8 row-wrap row-end">
+        <button class="btn tab-btn tab-active" data-tab="active">Active trades</button>
+        <button class="btn tab-btn" data-tab="closed">Closed trades</button>
+      </div>
+    </div>
+
+    <div id="tab-active" class="tab-panel">
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Bot</th>
+              <th>Symbol</th>
+              <th>Opened</th>
+              <th class="right">Entry</th>
+              <th class="right">Size</th>
+              <th class="right">TP target</th>
+              <th class="right">Last price</th>
+              <th class="right">uPnL</th>
+              <th class="right">Open</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for d in active_deals %}
+            <tr>
+              <td class="mono">{{ d.bot_name or d.bot_id }}</td>
+              <td class="mono">{{ d.bot_symbol or d.symbol }}</td>
+              <td class="mono">{{ d.opened_at }}</td>
+              <td class="right mono">{{ "%.2f"|format(d.entry_avg) if d.entry_avg is not none else "—" }}</td>
+              <td class="right mono">{{ "%.8f"|format(d.base_amount) if d.base_amount is not none else "—" }}</td>
+              <td class="right mono">{{ "%.2f"|format(d.tp_target) if d.tp_target is not none else "—" }}</td>
+              <td class="right mono">{{ "%.2f"|format(d.last_price) if d.last_price is not none else "—" }}</td>
+              <td class="right mono {% if d.unrealized_pnl is not none and d.unrealized_pnl >= 0 %}pos{% else %}neg{% endif %}">
+                {{ "%.2f"|format(d.unrealized_pnl) if d.unrealized_pnl is not none else "—" }}
+              </td>
+              <td class="right">
+                <a class="btn" href="/deals/{{ d.id }}">View</a>
+              </td>
+            </tr>
+            {% endfor %}
+            {% if active_deals|length == 0 %}
+            <tr>
+              <td colspan="9" class="muted">No active trades.</td>
+            </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="tab-closed" class="tab-panel hidden">
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Bot</th>
+              <th>Symbol</th>
+              <th>Opened</th>
+              <th>Closed</th>
+              <th class="right">Entry</th>
+              <th class="right">Exit</th>
+              <th class="right">Size</th>
+              <th class="right">PnL</th>
+              <th class="right">Open</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for d in closed_deals %}
+            <tr>
+              <td class="mono">{{ d.bot_name or d.bot_id }}</td>
+              <td class="mono">{{ d.bot_symbol or d.symbol }}</td>
+              <td class="mono">{{ d.opened_at }}</td>
+              <td class="mono">{{ d.closed_at }}</td>
+              <td class="right mono">{{ "%.2f"|format(d.entry_avg) if d.entry_avg is not none else "—" }}</td>
+              <td class="right mono">{{ "%.2f"|format(d.exit_avg) if d.exit_avg is not none else "—" }}</td>
+              <td class="right mono">{{ "%.8f"|format(d.base_amount) if d.base_amount is not none else "—" }}</td>
+              <td class="right mono {% if d.realized_pnl_quote is not none and d.realized_pnl_quote >= 0 %}pos{% elif d.realized_pnl_quote is not none %}neg{% else %}muted{% endif %}">
+                {{ "%.2f"|format(d.realized_pnl_quote) if d.realized_pnl_quote is not none else "—" }}
+              </td>
+              <td class="right">
+                <a class="btn" href="/deals/{{ d.id }}">View</a>
+              </td>
+            </tr>
+            {% endfor %}
+            {% if closed_deals|length == 0 %}
+            <tr>
+              <td colspan="9" class="muted">No closed trades yet.</td>
+            </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const tabBtns = document.querySelectorAll(".tab-btn");
+  tabBtns.forEach(btn => {
+    btn.addEventListener("click", () => {
+      tabBtns.forEach(b => b.classList.remove("tab-active"));
+      btn.classList.add("tab-active");
+      const tab = btn.getAttribute("data-tab");
+      document.getElementById("tab-active").classList.toggle("hidden", tab !== "active");
+      document.getElementById("tab-closed").classList.toggle("hidden", tab !== "closed");
+    });
+  });
+
+  function drawSpark(canvas, series){
+    if (!canvas || !series || !series.length) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const vals = series.map(p => Number(p.value || 0));
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = (max - min) || 1;
+    ctx.beginPath();
+    vals.forEach((v, i) => {
+      const x = (i / (vals.length - 1)) * (w - 2) + 1;
+      const y = h - ((v - min) / span) * (h - 2) - 1;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = vals[vals.length - 1] >= vals[0] ? "#16a34a" : "#dc2626";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  async function loadSparks(){
+    const ids = Array.from(document.querySelectorAll("canvas.spark")).map(c => c.id.split("-")[1]);
+    for (const id of ids){
+      try{
+        const r = await fetch(`/api/bots/${id}/pnl_series?limit=120`);
+        const data = await r.json();
+        if (data && data.series){
+          drawSpark(document.getElementById(`spark-${id}`), data.series);
+        }
+      }catch(_){}
+    }
+  }
+
+  loadSparks();
+</script>
+
+{% endblock %}

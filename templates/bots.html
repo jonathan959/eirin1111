@@ -1,0 +1,1065 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Bots</div>
+      <div class="muted">Create, edit, and monitor bots. Crypto validated via Kraken; stocks via Alpaca.</div>
+      {% if not kraken_ready %}
+        <div class="muted mt-6">
+          <span class="tag tag-neg">Kraken not ready</span>
+          <span class="mono text-xs">{{ kraken_error }}</span>
+        </div>
+      {% endif %}
+    </div>
+    <div class="row gap-8 row-wrap row-end">
+      <button class="btn btn-purple" onclick="openCreate()">+ New Bot</button>
+      <a class="btn" href="/">Dashboard</a>
+    </div>
+  </div>
+
+  <!-- Bots list -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Your bots</div>
+        <div class="muted">Live status updates automatically.</div>
+        <div class="muted text-xs mt-6" style="max-width: 640px;">
+          <strong>Mode:</strong> DRY = paper trading (no real orders). LIVE = real money. To switch a bot to Live, click <strong>Edit</strong> and set Mode to &quot;Live&quot; (ensure live trading is enabled in Safety / .env). —
+          <strong>Why no trades?</strong> Status messages like &quot;Regime RISK_OFF not suitable for entry&quot; or &quot;entry not confirmed&quot; mean the strategy is waiting for conditions it considers safe; it will not place an order until then.
+        </div>
+      </div>
+      <div class="row gap-8 row-wrap row-end">
+        <span class="muted text-sm" id="lastRefreshSpan">Last refresh: —</span>
+        <button class="btn" onclick="refreshAllStatuses()">Refresh now</button>
+      </div>
+    </div>
+
+    <div class="table-wrap minw-0">
+      <table class="table minw-980">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Symbol</th>
+            <th title="DRY = paper only. LIVE = real money. Edit bot to change.">Mode</th>
+            <th>Status</th>
+            <th>Action</th>
+            <th>Strategy</th>
+            <th>Regime</th>
+            <th>Risk</th>
+            <th class="right">Position</th>
+            <th class="right">Last price</th>
+            <th class="right">uPnL</th>
+            <th class="right">Realized</th>
+            <th class="right">Poll</th>
+            <th class="right">Max spend</th>
+            <th class="right">TP (%)</th>
+            <th class="right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="botsBody">
+          {% if bots and bots|length > 0 %}
+            {% for b in bots %}
+            <tr data-bot-id="{{ b.id }}">
+              <td class="mono">{{ b.id }}</td>
+              <td class="mono">{{ b.name }}</td>
+              <td class="mono">{{ b.symbol }}</td>
+              <td class="mono">{{ "DRY" if b.dry_run else "LIVE" }}</td>
+
+              <td class="mono">
+                <span class="tag" id="st-{{ b.id }}">Loading…</span>
+                <span class="muted ml-8" id="ev-{{ b.id }}">—</span>
+              </td>
+
+              <td class="mono" id="act-{{ b.id }}">—</td>
+              <td class="mono" id="strat-{{ b.id }}">—</td>
+              <td class="mono" id="reg-{{ b.id }}">—</td>
+              <td class="mono" id="risk-{{ b.id }}">—</td>
+              <td class="right mono" id="pos-{{ b.id }}">—</td>
+              <td class="right mono" id="px-{{ b.id }}">—</td>
+              <td class="right mono" id="upnl-{{ b.id }}">—</td>
+              <td class="right mono" id="rpnl-{{ b.id }}">—</td>
+              <td class="right mono">{{ b.poll_seconds }}s</td>
+              <td class="right mono">{{ "%.2f"|format(b.max_spend_quote) }}</td>
+              <td class="right mono">{{ "%.2f%%"|format((b.tp or 0) * 100) }}</td>
+
+              <td class="right">
+                <a class="btn" href="/bots/{{ b.id }}">Open</a>
+                <button class="btn" onclick="openEdit({{ b.id }})">Edit</button>
+                <button class="btn btn-purple" onclick="startBot({{ b.id }})">Start</button>
+                <button class="btn" onclick="stopBot({{ b.id }})">Stop</button>
+                <button class="btn btn-neg" onclick="deleteBot({{ b.id }})">Delete</button>
+              </td>
+            </tr>
+            {% endfor %}
+          {% else %}
+          <tr><td colspan="17" class="muted">No bots yet. Click “New Bot”.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div id="modal" class="modal hidden">
+  <div class="modal-backdrop" onclick="closeModal()"></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <div id="modalTitle" class="h2">New Bot</div>
+        <div id="modalSub" class="muted">Validated + normalized symbols.</div>
+      </div>
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>
+
+    <div id="formErr" class="muted hidden mb-8"></div>
+
+    <div class="grid grid-3">
+      <div>
+        <div class="label">Name</div>
+        <input id="f_name" class="input" placeholder="My Bot" />
+      </div>
+      
+      <div>
+        <div class="label">Market Type</div>
+        <select id="f_market_type" class="input" onchange="onMarketTypeChange()">
+          <option value="crypto" selected>Crypto</option>
+          <option value="stocks">Stocks</option>
+        </select>
+        <div class="muted text-xs mt-6">Crypto (Kraken) or Stocks (Alpaca).</div>
+      </div>
+      
+      <div id="alpacaModeContainer" style="display:none;">
+        <div class="label">Trading Mode</div>
+        <select id="f_alpaca_mode" class="input">
+          <option value="paper" selected>Paper Trading</option>
+          <option value="live">Live Trading</option>
+        </select>
+        <div class="muted text-xs mt-6">Paper = simulated, Live = real money.</div>
+      </div>
+
+      <div>
+        <div class="label">Symbol</div>
+        <div style="position:relative;">
+          <input id="f_symbol_search" class="input" placeholder="Search symbol..." autocomplete="off" />
+          <div id="symbolDropdown" class="symbol-dropdown hidden"></div>
+        </div>
+        <input id="f_symbol" type="hidden" />
+        <div class="muted text-xs mt-6">Type to search crypto or stocks.</div>
+      </div>
+
+      <div>
+        <div class="label">Mode</div>
+        <select id="f_dry" class="input">
+          <option value="1" selected>Dry run (paper only)</option>
+          <option value="0">Live (real money)</option>
+        </select>
+        <div class="muted text-xs mt-6">Dry run = no real orders. Live = real trades (requires live keys and Safety / .env enabled).</div>
+      </div>
+      <div>
+        <div class="label">Strategy</div>
+        <select id="f_strategy" class="input">
+          <option value="classic_dca" selected>Classic DCA</option>
+          <option value="smart_dca">Smart DCA</option>
+          <option value="trend_follow">Trend follow</option>
+          <option value="range_mean_reversion">Range mean reversion</option>
+          <option value="high_vol_defensive">High-vol defensive</option>
+          <option value="router">Strategy router (auto)</option>
+          <option value="grid">Grid (legacy)</option>
+          <option value="trend">Trend (legacy)</option>
+          <option value="breakout">Breakout (legacy)</option>
+          <option value="classic">Classic DCA (legacy)</option>
+          <option value="auto">Auto (legacy)</option>
+        </select>
+        <div class="muted text-xs mt-6">
+          Classic = fixed DCA ladder + simple TP. Router selects per regime each tick.
+        </div>
+      </div>
+      <div>
+        <div class="label">Force strategy</div>
+        <select id="f_forced_strategy" class="input">
+          <option value="" selected>Auto</option>
+          <option value="smart_dca">Smart DCA</option>
+          <option value="trend_follow">Trend follow</option>
+          <option value="range_mean_reversion">Range mean reversion</option>
+          <option value="high_vol_defensive">High-vol defensive</option>
+          <option value="grid">Grid (legacy)</option>
+          <option value="trend">Trend (legacy)</option>
+          <option value="breakout">Breakout (legacy)</option>
+          <option value="smart">Smart DCA (legacy)</option>
+        </select>
+        <div class="muted text-xs mt-6">Overrides selector when set.</div>
+      </div>
+      <div>
+        <div class="label">Auto-restart</div>
+        <select id="f_auto_restart" class="input">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+        <div class="muted text-xs mt-6">Start a new deal after one closes.</div>
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Base order (quote)</div>
+        <input id="f_base" class="input" type="number" step="0.01" value="25" />
+      </div>
+
+      <div>
+        <div class="label">Safety order (quote)</div>
+        <input id="f_safety" class="input" type="number" step="0.01" value="25" />
+      </div>
+
+      <div>
+        <div class="label">Max safety orders</div>
+        <input id="f_max_safety" class="input" type="number" step="1" value="3" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Total budget (quote)</div>
+        <input id="f_budget" class="input" type="number" step="0.01" placeholder="e.g. 100" />
+        <div class="muted text-xs mt-6">Auto-sets base/safety/max spend.</div>
+      </div>
+      <div>
+        <div class="label">Max spend (quote)</div>
+        <input id="f_max_spend" class="input" type="number" step="0.01" value="250" />
+      </div>
+      <div>
+        <div class="label">Max open orders</div>
+        <input id="f_max_open_orders" class="input" type="number" step="1" value="6" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">First deviation (fraction)</div>
+        <input id="f_first_dev" class="input" type="number" step="0.0001" value="0.015" />
+      </div>
+
+      <div>
+        <div class="label">Step multiplier</div>
+        <input id="f_step_mult" class="input" type="number" step="0.01" value="1.20" />
+      </div>
+
+      <div>
+        <div class="label">Take profit (%)</div>
+        <input id="f_tp_pct" class="input" type="number" step="0.01" value="1.2" />
+      </div>
+    </div>
+    
+    <!-- Collapsible Advanced Settings -->
+    <div class="section-md">
+      <button type="button" class="btn btn-ghost" onclick="toggleAdvanced()" style="width:100%; text-align:left;">
+        <span id="advancedToggleIcon">▶</span> Advanced Settings
+      </button>
+    </div>
+    
+    <div id="advancedSettings" style="display:none;">
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Vol gap mult</div>
+        <input id="f_vol_gap_mult" class="input" type="number" step="0.01" value="1.0" />
+        <div class="muted text-xs mt-6">ATR gap scaling (higher = wider ladder).</div>
+      </div>
+      <div>
+        <div class="label">TP vol mult</div>
+        <input id="f_tp_vol_mult" class="input" type="number" step="0.1" value="1.0" />
+        <div class="muted text-xs mt-6">ATR/price impact on TP.</div>
+      </div>
+      <div>
+        <div class="label">Min/Max gap (pct)</div>
+        <div class="row gap-6">
+          <input id="f_min_gap_pct" class="input" type="number" step="0.001" value="0.003" />
+          <input id="f_max_gap_pct" class="input" type="number" step="0.001" value="0.06" />
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Regime hold candles</div>
+        <input id="f_regime_hold_candles" class="input" type="number" step="1" value="2" />
+      </div>
+      <div>
+        <div class="label">Regime switch ticks</div>
+        <input id="f_regime_switch_ticks" class="input" type="number" step="1" value="2" />
+      </div>
+      <div>
+        <div class="label">Regime switch threshold</div>
+        <input id="f_regime_switch_threshold" class="input" type="number" step="0.01" value="0.6" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Max total exposure (pct)</div>
+        <input id="f_max_total_exposure_pct" class="input" type="number" step="0.01" value="0.50" />
+      </div>
+      <div>
+        <div class="label">Per-symbol exposure (pct)</div>
+        <input id="f_per_symbol_exposure_pct" class="input" type="number" step="0.01" value="0.15" />
+      </div>
+      <div>
+        <div class="label">Min free cash (pct)</div>
+        <input id="f_min_free_cash_pct" class="input" type="number" step="0.01" value="0.1" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Max concurrent deals</div>
+        <input id="f_max_concurrent_deals" class="input" type="number" step="1" value="6" />
+      </div>
+      <div>
+        <div class="label">Spread guard (pct)</div>
+        <input id="f_spread_guard_pct" class="input" type="number" step="0.001" value="0.003" />
+      </div>
+      <div>
+        <div class="label">Limit timeout (sec)</div>
+        <input id="f_limit_timeout_sec" class="input" type="number" step="1" value="8" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Daily loss limit (pct)</div>
+        <input id="f_daily_loss_limit_pct" class="input" type="number" step="0.01" value="0.06" />
+      </div>
+      <div>
+        <div class="label">Pause hours</div>
+        <input id="f_pause_hours" class="input" type="number" step="1" value="6" />
+      </div>
+      <div class="muted text-xs mt-6">Circuit breaker pauses new entries.</div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Trend filter</div>
+        <select id="f_trend_filter" class="input">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+      </div>
+
+      <div>
+        <div class="label">Trend SMA</div>
+        <input id="f_trend_sma" class="input" type="number" step="1" value="200" />
+      </div>
+
+      <div>
+        <div class="label">Poll seconds</div>
+        <input id="f_poll" class="input" type="number" step="1" value="10" />
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Enabled</div>
+        <select id="f_enabled" class="input">
+          <option value="0" selected>Disabled</option>
+          <option value="1">Enabled</option>
+        </select>
+      </div>
+    </div>
+    
+    </div><!-- End advancedSettings -->
+    
+    <div class="row gap-8 row-end items-end mt-10">
+      <button id="btnSave" class="btn btn-purple" onclick="saveBot()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const _botsList = {{ (bots or [])|tojson }};
+  const INITIAL_BOTS = Array.isArray(_botsList) ? _botsList : [];
+  const KRAKEN_READY = {{ "true" if kraken_ready else "false" }};
+  const BOT_SNAP = {};
+
+  let SYMBOLS = [];
+  let STOCK_SYMBOLS = [];
+  let EDITING_ID = null;
+  let CURRENT_MARKET_TYPE = "crypto";
+
+  function $(id){ return document.getElementById(id); }
+  function setF(id, val) { var e = $(id); if (e) e.value = val; }
+
+  function toggleAdvanced(){
+    const section = document.getElementById("advancedSettings");
+    const icon = document.getElementById("advancedToggleIcon");
+    if (!section || !icon) return;
+    if (section.style.display === "none"){
+      section.style.display = "block";
+      icon.textContent = "▼";
+    }else{
+      section.style.display = "none";
+      icon.textContent = "▶";
+    }
+  }
+  
+  function onMarketTypeChange(skipClearSymbol){
+    const marketType = $("f_market_type") && $("f_market_type").value;
+    CURRENT_MARKET_TYPE = marketType || "crypto";
+    
+    const alpacaModeContainer = $("alpacaModeContainer");
+    if (alpacaModeContainer) {
+      alpacaModeContainer.style.display = (marketType === "stocks") ? "block" : "none";
+    }
+    
+    if (!skipClearSymbol) {
+      const sym = $("f_symbol_search");
+      const symH = $("f_symbol");
+      if (sym) sym.value = "";
+      if (symH) symH.value = "";
+    }
+    
+    if (marketType === "stocks") {
+      loadStockSymbols();
+    }
+  }
+  
+  async function loadStockSymbols(){
+    if (STOCK_SYMBOLS.length > 0) return; // Already loaded
+    
+    try {
+      const data = await getJSON("/api/alpaca/symbols");
+      STOCK_SYMBOLS = data.symbols || [];
+    } catch(e){
+      console.error("Failed to load stock symbols:", e);
+      STOCK_SYMBOLS = [];
+    }
+  }
+  
+  function setupSymbolSearch(){
+    const searchInput = $("f_symbol_search");
+    const dropdown = $("symbolDropdown");
+    if (!searchInput || !dropdown) return;
+
+    searchInput.addEventListener("input", async function(){
+      const query = this.value.trim().toUpperCase();
+      
+      if (query.length === 0){
+        dropdown.classList.add("hidden");
+        return;
+      }
+      
+      // If stocks and symbols not loaded, load them first
+      if (CURRENT_MARKET_TYPE === "stocks" && STOCK_SYMBOLS.length === 0){
+        dropdown.innerHTML = '<div class="symbol-dropdown-empty">Loading stocks...</div>';
+        dropdown.classList.remove("hidden");
+        try {
+          await loadStockSymbols();
+        } catch(e){
+          dropdown.innerHTML = '<div class="symbol-dropdown-empty">Failed to load stocks</div>';
+          return;
+        }
+      }
+      
+      const symbols = CURRENT_MARKET_TYPE === "stocks" ? STOCK_SYMBOLS : SYMBOLS;
+      
+      // Filter symbols
+      const filtered = symbols.filter(s => {
+        const symbol = String(s.symbol || s || "").toUpperCase();
+        const name = String(s.name || "").toUpperCase();
+        return symbol.includes(query) || name.includes(query);
+      }).slice(0, 50); // Limit to 50 results
+      
+      if (filtered.length === 0){
+        dropdown.innerHTML = '<div class="symbol-dropdown-empty">No symbols found</div>';
+        dropdown.classList.remove("hidden");
+        return;
+      }
+      
+      // Render dropdown
+      dropdown.innerHTML = filtered.map(s => {
+        const symbol = s.symbol || s;
+        const name = s.name || getSymbolName(symbol);
+        return `
+          <div class="symbol-dropdown-item" data-symbol="${symbol}">
+            <div>
+              <div class="symbol-code">${symbol}</div>
+              <div class="symbol-name">${name}</div>
+            </div>
+          </div>
+        `;
+      }).join("");
+      
+      dropdown.classList.remove("hidden");
+    });
+    
+    // Click handler for dropdown items
+    dropdown.addEventListener("click", function(e){
+      const item = e.target.closest(".symbol-dropdown-item");
+      if (item){
+        const symbol = item.dataset.symbol || "";
+        setF("f_symbol", symbol);
+        setF("f_symbol_search", symbol);
+        dropdown.classList.add("hidden");
+      }
+    });
+    
+    // Close dropdown when clicking outside
+    document.addEventListener("click", function(e){
+      if (!searchInput.contains(e.target) && !dropdown.contains(e.target)){
+        dropdown.classList.add("hidden");
+      }
+    });
+    
+    // Focus opens dropdown if there's a query
+    searchInput.addEventListener("focus", function(){
+      if (this.value.trim().length > 0){
+        searchInput.dispatchEvent(new Event("input"));
+      }
+    });
+  }
+  
+  function getSymbolName(symbol){
+    const parts = String(symbol || "").split("/");
+    const base = parts[0] || symbol;
+    const nameMap = {
+      "XBT": "Bitcoin", "BTC": "Bitcoin", "ETH": "Ethereum", "SOL": "Solana",
+      "ADA": "Cardano", "XRP": "XRP", "DOGE": "Dogecoin", "AVAX": "Avalanche",
+      "LINK": "Chainlink", "LTC": "Litecoin", "BCH": "Bitcoin Cash", "DOT": "Polkadot",
+      "ATOM": "Cosmos", "MATIC": "Polygon", "ALGO": "Algorand", "TRX": "Tron",
+      "UNI": "Uniswap", "AAVE": "Aave", "FIL": "Filecoin", "SAND": "Sandbox",
+    };
+    return nameMap[base] || base;
+  }
+
+  async function getJSON(url, opts){
+    const r = await fetch(url, opts || {});
+    
+    // Clone response to read body multiple times if needed
+    const rClone = r.clone();
+    
+    let data;
+    try {
+      data = await r.json();
+    } catch (jsonError) {
+      // If JSON parsing fails, read text from cloned response
+      const t = await rClone.text();
+      throw new Error(url + " -> " + r.status + " " + t);
+    }
+    
+    if(!r.ok){
+      throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+    }
+    return data;
+  }
+
+  function showErr(msg){
+    const el = $("formErr");
+    if (!el) return;
+    el.classList.remove("hidden");
+    el.textContent = msg;
+  }
+
+  function clearErr(){
+    const el = $("formErr");
+    if (!el) return;
+    el.classList.add("hidden");
+    el.textContent = "";
+  }
+
+  function openCreate(prefillSymbol, prefillStrategy, prefillBudget, prefillMarketType){
+    EDITING_ID = null;
+    var t = $("modalTitle"); if (t) t.textContent = "New Bot";
+    var sb = $("btnSave"); if (sb) sb.textContent = "Create";
+    clearErr();
+
+    setF("f_name", "My Bot");
+    setF("f_market_type", prefillMarketType || "crypto");
+    setF("f_alpaca_mode", "paper");
+    setF("f_dry", "1");
+    setF("f_strategy", "classic");
+    setF("f_forced_strategy", "");
+    setF("f_auto_restart", "0");
+    setF("f_enabled", "0");
+    setF("f_base", 25);
+    setF("f_safety", 25);
+    setF("f_max_safety", 3);
+    setF("f_first_dev", 0.015);
+    setF("f_step_mult", 1.20);
+    setF("f_tp_pct", 1.2);
+    setF("f_vol_gap_mult", 1.0);
+    setF("f_tp_vol_mult", 1.0);
+    setF("f_min_gap_pct", 0.003);
+    setF("f_max_gap_pct", 0.06);
+    setF("f_regime_hold_candles", 2);
+    setF("f_regime_switch_ticks", 2);
+    setF("f_regime_switch_threshold", 0.6);
+    setF("f_max_total_exposure_pct", 0.50);
+    setF("f_per_symbol_exposure_pct", 0.15);
+    setF("f_min_free_cash_pct", 0.1);
+    setF("f_max_concurrent_deals", 6);
+    setF("f_spread_guard_pct", 0.003);
+    setF("f_limit_timeout_sec", 8);
+    setF("f_daily_loss_limit_pct", 0.06);
+    setF("f_pause_hours", 6);
+    setF("f_max_drawdown_pct", 0);
+    setF("f_trend_filter", 0);
+    setF("f_trend_sma", 200);
+    setF("f_max_spend", 250);
+    setF("f_max_open_orders", 6);
+    setF("f_poll", 10);
+    setF("f_budget", "");
+
+    CURRENT_MARKET_TYPE = prefillMarketType || "crypto";
+    onMarketTypeChange(true);
+
+    if (prefillSymbol) {
+      setF("f_symbol", prefillSymbol);
+      setF("f_symbol_search", prefillSymbol);
+    } else {
+      setF("f_symbol", "");
+      setF("f_symbol_search", "");
+    }
+    if (prefillStrategy) setF("f_strategy", prefillStrategy);
+    if (prefillBudget && !Number.isNaN(Number(prefillBudget))) {
+      applyBudget(prefillBudget);
+      setF("f_budget", prefillBudget);
+    }
+
+    var mt = $("f_market_type");
+    if (mt && mt.value === "stocks" && STOCK_SYMBOLS.length === 0) loadStockSymbols();
+
+    var modal = $("modal");
+    if (modal) modal.classList.remove("hidden");
+  }
+
+  function openEdit(id){
+    const numId = typeof id === "number" ? id : parseInt(id, 10);
+    if (Number.isNaN(numId)) { console.warn("openEdit: invalid id", id); return; }
+    let b = (INITIAL_BOTS || []).find(x => (x && (Number(x.id) === numId || x.id === id)));
+    if (!b) {
+      try {
+        const el = document.querySelector('[data-bot-id="' + numId + '"]');
+        if (el) {
+          const nameEl = el.querySelector("td:nth-child(2)");
+          const symEl = el.querySelector("td:nth-child(3)");
+          b = { id: numId, name: (nameEl && nameEl.textContent) || ("Bot #" + numId), symbol: (symEl && symEl.textContent) || "" };
+        }
+      } catch (e) { console.warn(e); }
+    }
+    if (!b) {
+      getJSON("/api/bots/" + numId).then(function(res){
+        if (res && res.bot) { openEditWithBot(res.bot); }
+        else { alert("Could not load bot #" + numId + ". Try opening the bot page or refresh the list."); }
+      }).catch(function(e){ alert("Could not load bot: " + (e.message || e)); });
+      return;
+    }
+    openEditWithBot(b);
+  }
+
+  function openEditWithBot(b){
+    const id = Number(b.id) || b.bot_id;
+    EDITING_ID = id;
+    const titleEl = $("modalTitle");
+    const saveBtn = $("btnSave");
+    if (titleEl) titleEl.textContent = "Edit Bot #" + id;
+    if (saveBtn) saveBtn.textContent = "Update";
+    clearErr();
+
+    function setVal(sel, val, def) {
+      const el = $(sel);
+      if (el) el.value = val != null && val !== "" ? String(val) : (def != null ? String(def) : "");
+    }
+    setVal("f_name", b.name);
+    setVal("f_market_type", b.market_type, "crypto");
+    setVal("f_alpaca_mode", b.alpaca_mode, "paper");
+    setVal("f_dry", b.dry_run, 1);
+    setVal("f_enabled", b.enabled, 0);
+    setVal("f_strategy", b.strategy_mode || b.strategy, "classic_dca");
+    setVal("f_forced_strategy", b.forced_strategy, "");
+    setVal("f_auto_restart", b.auto_restart, 0);
+
+    setVal("f_base", b.base_quote, 0);
+    setVal("f_safety", b.safety_quote, 0);
+    setVal("f_max_safety", b.max_safety, 0);
+    setVal("f_first_dev", b.first_dev, 0.01);
+    setVal("f_step_mult", b.step_mult, 1.2);
+    setVal("f_tp_pct", (b.tp != null ? b.tp : 0.01) * 100, 1.2);
+    setVal("f_vol_gap_mult", b.vol_gap_mult, 1.0);
+    setVal("f_tp_vol_mult", b.tp_vol_mult, 1.0);
+    setVal("f_min_gap_pct", b.min_gap_pct, 0.003);
+    setVal("f_max_gap_pct", b.max_gap_pct, 0.06);
+    setVal("f_regime_hold_candles", b.regime_hold_candles, 2);
+    setVal("f_regime_switch_ticks", b.regime_switch_ticks, 2);
+    setVal("f_regime_switch_threshold", b.regime_switch_threshold, 0.6);
+    setVal("f_max_total_exposure_pct", b.max_total_exposure_pct, 0.50);
+    setVal("f_per_symbol_exposure_pct", b.per_symbol_exposure_pct, 0.15);
+    setVal("f_min_free_cash_pct", b.min_free_cash_pct, 0.1);
+    setVal("f_max_concurrent_deals", b.max_concurrent_deals, 6);
+    setVal("f_spread_guard_pct", b.spread_guard_pct, 0.003);
+    setVal("f_limit_timeout_sec", b.limit_timeout_sec, 8);
+    setVal("f_daily_loss_limit_pct", b.daily_loss_limit_pct, 0.06);
+    setVal("f_pause_hours", b.pause_hours, 6);
+    setVal("f_max_drawdown_pct", b.max_drawdown_pct, 0);
+    setVal("f_trend_filter", b.trend_filter, 0);
+    setVal("f_trend_sma", b.trend_sma, 200);
+    setVal("f_max_spend", b.max_spend_quote, 0);
+    setVal("f_max_open_orders", b.max_open_orders, 6);
+    setVal("f_poll", b.poll_seconds, 10);
+
+    CURRENT_MARKET_TYPE = b.market_type || "crypto";
+    onMarketTypeChange(true);
+    setVal("f_symbol", b.symbol || "");
+    setVal("f_symbol_search", b.symbol || "");
+
+    const modal = $("modal");
+    if (modal) modal.classList.remove("hidden");
+  }
+
+  function closeModal(){
+    $("modal").classList.add("hidden");
+  }
+
+  function applyBudget(val){
+    const budget = Number(val || 0);
+    if (Number.isNaN(budget) || budget <= 0) return;
+    const base = Math.max(1, budget * 0.25);
+    const safety = Math.max(1, budget * 0.25);
+    var el = $("f_base"); if (el) el.value = base.toFixed(2);
+    el = $("f_safety"); if (el) el.value = safety.toFixed(2);
+    el = $("f_max_spend"); if (el) el.value = budget.toFixed(2);
+  }
+
+  function _v(sel, def) {
+    var el = $(sel);
+    return el ? (el.value != null ? el.value : def) : def;
+  }
+  function payloadFromForm(){
+    return {
+      name: _v("f_name", ""),
+      symbol: _v("f_symbol", ""),
+      market_type: _v("f_market_type", "crypto"),
+      alpaca_mode: _v("f_alpaca_mode", "paper"),
+      enabled: Number(_v("f_enabled", "0")),
+      dry_run: Number(_v("f_dry", "1")),
+      strategy_mode: _v("f_strategy", "classic_dca"),
+      forced_strategy: _v("f_forced_strategy", ""),
+      max_open_orders: Number(_v("f_max_open_orders", "6")),
+      auto_restart: Number(_v("f_auto_restart", "0")),
+
+      base_quote: Number(_v("f_base", "0")),
+      safety_quote: Number(_v("f_safety", "0")),
+      max_safety: Number(_v("f_max_safety", "0")),
+      first_dev: Number(_v("f_first_dev", "0.01")),
+      step_mult: Number(_v("f_step_mult", "1.2")),
+      tp: Number(_v("f_tp_pct", "1")) / 100,
+      vol_gap_mult: Number(_v("f_vol_gap_mult", "1")),
+      tp_vol_mult: Number(_v("f_tp_vol_mult", "1")),
+      min_gap_pct: Number(_v("f_min_gap_pct", "0.003")),
+      max_gap_pct: Number(_v("f_max_gap_pct", "0.06")),
+      regime_hold_candles: Number(_v("f_regime_hold_candles", "2")),
+      regime_switch_ticks: Number(_v("f_regime_switch_ticks", "2")),
+      regime_switch_threshold: Number(_v("f_regime_switch_threshold", "0.6")),
+      max_total_exposure_pct: Number(_v("f_max_total_exposure_pct", "0.5")),
+      per_symbol_exposure_pct: Number(_v("f_per_symbol_exposure_pct", "0.15")),
+      min_free_cash_pct: Number(_v("f_min_free_cash_pct", "0.1")),
+      max_concurrent_deals: Number(_v("f_max_concurrent_deals", "6")),
+      spread_guard_pct: Number(_v("f_spread_guard_pct", "0.003")),
+      limit_timeout_sec: Number(_v("f_limit_timeout_sec", "8")),
+      daily_loss_limit_pct: Number(_v("f_daily_loss_limit_pct", "0.06")),
+      pause_hours: Number(_v("f_pause_hours", "6")),
+      max_drawdown_pct: Number(_v("f_max_drawdown_pct", "0")) || 0,
+
+      trend_filter: Number(_v("f_trend_filter", "0")),
+      trend_sma: Number(_v("f_trend_sma", "200")),
+
+      max_spend_quote: Number(_v("f_max_spend", "0")),
+      poll_seconds: Number(_v("f_poll", "10")),
+    };
+  }
+
+  async function saveBot(){
+    clearErr();
+    var saveBtn = $("btnSave");
+    if (saveBtn) saveBtn.disabled = true;
+
+    try{
+      const payload = payloadFromForm();
+
+      let res;
+      if(EDITING_ID == null){
+        res = await getJSON("/api/bots", {
+          method:"POST",
+          headers: { "Content-Type":"application/json" },
+          body: JSON.stringify(payload)
+        });
+      }else{
+        res = await getJSON(`/api/bots/${EDITING_ID}`, {
+          method:"PUT",
+          headers: { "Content-Type":"application/json" },
+          body: JSON.stringify(payload)
+        });
+      }
+
+      if(!res.ok){
+        const errs = (res.errors || []).join(" • ");
+        showErr((res.error || "Save failed") + (errs ? (": " + errs) : ""));
+        return;
+      }
+
+      // simplest: reload to repopulate table + initial list
+      window.location.reload();
+    }catch(e){
+      console.error(e);
+      showErr(e.message || String(e));
+    }finally{
+      var saveBtn = $("btnSave");
+      if (saveBtn) saveBtn.disabled = false;
+    }
+  }
+
+  async function deleteBot(id){
+    if(!confirm("Delete bot #" + id + "? This will also delete logs and deals.")) return;
+    try{
+      const res = await getJSON(`/api/bots/${id}`, { method:"DELETE" });
+      if(res.ok) window.location.reload();
+    }catch(e){
+      alert("Delete failed: " + (e.message || e));
+    }
+  }
+
+  async function startBot(id){
+    try{
+      const res = await getJSON(`/api/bots/${id}/start`, { method:"POST" });
+      await refreshStatusRow(id);
+    }catch(e){
+      console.error(e);
+      await refreshStatusRow(id);
+    }
+  }
+
+  async function stopBot(id){
+    try{
+      const res = await getJSON(`/api/bots/${id}/stop`, { method:"POST" });
+      await refreshStatusRow(id);
+    }catch(e){
+      console.error(e);
+      await refreshStatusRow(id);
+    }
+  }
+
+  function setRowStatus(id, running, lastEvent, lastPrice){
+    const st = $("st-" + id);
+    const ev = $("ev-" + id);
+    const act = $("act-" + id);
+    const strat = $("strat-" + id);
+    const reg = $("reg-" + id);
+    const risk = $("risk-" + id);
+    const pos = $("pos-" + id);
+    const px = $("px-" + id);
+    const upnl = $("upnl-" + id);
+
+    if(st){
+      var isErr = lastEvent && (String(lastEvent).toLowerCase().indexOf("error") >= 0 || String(lastEvent).toLowerCase().indexOf("unavailable") >= 0 || String(lastEvent).toLowerCase().indexOf("blocked") >= 0);
+      var isRetry = lastEvent && (String(lastEvent).indexOf("retrying") >= 0 || String(lastEvent).indexOf("timed out") >= 0);
+      var txt = running ? "RUNNING" : (isErr ? "ERROR" : (isRetry ? "RETRY" : "PAUSED"));
+      if (isErr && lastEvent) txt = "Blocked";
+      st.textContent = txt;
+      st.className = "tag " + (running ? "status-st-running" : (isErr || isRetry ? "status-st-error" : "status-st-paused"));
+    }
+    if(ev){
+      ev.textContent = lastEvent || "—";
+    }
+    if(act){
+      act.textContent = lastEvent || "—";
+    }
+    if(strat){
+      strat.textContent = (BOT_SNAP[id]?.active_strategy || "—");
+    }
+    if(reg){
+      const rl = BOT_SNAP[id]?.regime_label;
+      const rc = BOT_SNAP[id]?.regime_confidence;
+      reg.textContent = rl ? `${rl} (${(Number(rc || 0)*100).toFixed(0)}%)` : "—";
+    }
+    if(risk){
+      risk.textContent = BOT_SNAP[id]?.risk_state || "—";
+    }
+    if(px){
+      if(lastPrice == null || Number.isNaN(Number(lastPrice))){
+        px.textContent = "—";
+        px.className = "right mono muted";
+      }else{
+        const p = Number(lastPrice);
+        px.textContent = "$" + p.toFixed(2);
+        px.className = "right mono";
+      }
+    }
+    if(pos){
+      if(window.__botPos && window.__botPos[id] != null){
+        pos.textContent = Number(window.__botPos[id]).toFixed(8);
+      }else{
+        pos.textContent = "—";
+      }
+    }
+    if(upnl){
+      if(window.__botUpnl && window.__botUpnl[id] != null){
+        const v = Number(window.__botUpnl[id]);
+        const isPos = v > 0;
+        const isNeg = v < 0;
+        upnl.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + v.toFixed(2);
+        upnl.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
+      }else{
+        upnl.textContent = "—";
+        upnl.className = "right mono";
+      }
+    }
+  }
+
+  async function refreshStatusRow(id){
+    try{
+      // Add timeout protection
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout for status
+      let data;
+      try {
+        data = await getJSON(`/api/bots/${id}/status`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === "AbortError") {
+          setRowStatus(id, false, "Waiting for data (retrying…)", null);
+          return;
+        }
+        throw err;
+      }
+      const snap = data.snap || {};
+      BOT_SNAP[id] = snap || {};
+      const avg = snap.avg_entry;
+      const last = snap.last_price;
+      const pos = snap.base_pos;
+      window.__botPos = window.__botPos || {};
+      window.__botUpnl = window.__botUpnl || {};
+      window.__botPos[id] = (pos != null) ? Number(pos) : null;
+      window.__botUpnl[id] = (avg != null && last != null && pos != null)
+        ? (Number(last) - Number(avg)) * Number(pos)
+        : null;
+      setRowStatus(id, !!snap.running, snap.last_event, snap.last_price);
+    }catch(e){
+      const raw = (e && e.message) ? String(e.message) : "Status unavailable";
+      const msg = raw.replace(/^[^>]+ -> /, "").trim().slice(0, 80);
+      setRowStatus(id, false, "Error: " + msg, null);
+    }
+    try{
+      const stats = await getJSON(`/api/bots/${id}/dealstats`);
+      const rp = $("rpnl-" + id);
+      const realized = Number((stats.stats || {}).realized_total || 0);
+      if(rp){
+        const isPos = realized > 0;
+        const isNeg = realized < 0;
+        rp.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + realized.toFixed(2);
+        rp.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
+      }
+    }catch(e){
+      const rp = $("rpnl-" + id);
+      if(rp){
+        rp.textContent = "—";
+        rp.className = "right mono";
+      }
+    }
+  }
+
+  async function refreshAllStatuses(){
+    const rows = document.querySelectorAll("tr[data-bot-id]");
+    const ids = Array.from(rows).map(r => Number(r.getAttribute("data-bot-id")));
+    for(const id of ids){
+      refreshStatusRow(id);
+    }
+    const sp = document.getElementById("lastRefreshSpan");
+    if(sp) sp.textContent = "Last refresh: " + new Date().toLocaleTimeString();
+  }
+
+  async function refreshSymbols(){
+    try{
+      if(!KRAKEN_READY){
+        SYMBOLS = [];
+        return;
+      }
+      const data = await getJSON(`/api/symbols?quote=USD`);
+      SYMBOLS = (data.symbols || []).map(s => {
+        return { symbol: s, name: getSymbolName(s) };
+      });
+    }catch(e){
+      console.error(e);
+      SYMBOLS = [];
+    }
+  }
+
+  // init
+  refreshSymbols();
+  refreshAllStatuses();
+  setInterval(refreshAllStatuses, 4000);
+  var fBudget = $("f_budget");
+  if (fBudget) fBudget.addEventListener("change", (ev) => applyBudget(ev.target.value));
+  setupSymbolSearch();
+
+  // Open edit modal from query param (?edit_id=) or create modal (?create=true)
+  try{
+    const params = new URLSearchParams(window.location.search);
+    const editId = Number(params.get("edit_id"));
+    if(editId){
+      openEdit(editId);
+    }
+    
+    // Handle create=true from recommendations
+    const create = params.get("create");
+    const symbol = params.get("symbol");
+    const strategy = params.get("strategy");
+    const horizon = params.get("horizon");
+    const marketType = params.get("market_type") || "crypto"; // Default to crypto if not specified
+    
+    if (create === "true" && symbol){
+      // Map strategy to bot strategy value
+      const strategyMap = {
+        "smart_dca": "smart_dca",
+        "trend_follow": "trend_follow",
+        "range_mean_reversion": "range_mean_reversion",
+        "high_vol_defensive": "high_vol_defensive",
+        "grid": "grid",
+        "trend": "trend",
+        "breakout": "breakout",
+        "classic": "classic",
+        "auto": "router"
+      };
+      const mappedStrategy = strategyMap[strategy] || "router";
+      
+      // Suggest budget based on horizon
+      const suggestedBudget = horizon === "long" ? 200 : 100;
+      
+      // Set market type and load appropriate symbols
+      CURRENT_MARKET_TYPE = marketType;
+      if (marketType === "stocks") {
+        loadStockSymbols().then(() => {
+          setTimeout(() => {
+            openCreate(symbol, mappedStrategy, suggestedBudget, marketType);
+          }, 300);
+        });
+      } else {
+        // Wait for crypto symbols to load before opening modal
+        setTimeout(() => {
+          openCreate(symbol, mappedStrategy, suggestedBudget, marketType);
+        }, 500);
+      }
+    } else {
+      // Legacy prefill support
+      const prefillSymbol = params.get("prefill_symbol");
+      const prefillStrategy = params.get("prefill_strategy");
+      const prefillBudget = params.get("prefill_budget");
+      if (prefillSymbol || prefillStrategy || prefillBudget){
+        openCreate(prefillSymbol || null, prefillStrategy || null, prefillBudget || null);
+      }
+    }
+  }catch(_){}
+</script>
+
+{% endblock %}

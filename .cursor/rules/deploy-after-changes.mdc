@@ -1,0 +1,36 @@
+---
+description: Deploy to live site after changing app code so 3.148.6.246 stays in sync.
+alwaysApply: true
+---
+
+# Deploy to live site after code changes
+
+When you **change application code** (Python, templates, static, db, scripts), the **live site** (http://3.148.6.246) does **not** update automatically.
+
+**Rule: Whenever you change app code, you MUST run the deploy script yourself** — without being asked. Do not skip this. The user expects the live site to stay in sync automatically.
+
+## What counts as “app code”
+
+- Any `*.py` in the project root (e.g. `worker_api.py`, `env_utils.py`, `phase1_intelligence.py`, …)
+- `templates/**`, `static/**`, `requirements.txt`
+- `*.sh` fix/diagnostic scripts, `validate_before_restart.sh`, `tradingserver.service`
+
+## What to do after such changes
+
+1. **Run the deploy script** from the project root:
+   ```powershell
+   .\deploy.ps1
+   ```
+   Or, if backup hangs (e.g. bots running): `.\deploy.ps1 -Quick`
+
+2. **Options:**
+   - **`-Quick`**: Skip backup. Use when bots are running and deploy gets stuck at "Backing up...". Rollback is disabled for that run.
+   - **`-BringUpOnly`**: Only run `quick_fix_502` on the server to restore the site—no file copy or restart of new code. Use when the site is down and you just want it back up.
+
+3. The script uses **SSH timeouts** and a **lightweight, timed backup** (`deploy_backup.sh` → `timeout 30`). If backup times out, deploy continues without backup (rollback disabled). It then copies files, **validates** (import-only) before restart, restarts tradingserver, and health-checks. On validation failure it runs `deploy_restore.sh` (if backup existed) and restarts the previous version. On health failure after restart it rolls back and retries.
+
+4. **Do not** assume the live site is updated just because local code changed. Always run `deploy.ps1` after edits.
+
+## If you cannot run deploy
+
+Tell the user: *“Code changes are only on your machine. Run `.\deploy.ps1` from the project folder to update the live site.”*

@@ -1,0 +1,150 @@
+{% extends "layout.html" %}
+{% block title %}Performance Analytics{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Performance Analytics</div>
+      <div class="muted">Sharpe, Sortino, win rate, drawdown, by strategy & symbol</div>
+    </div>
+    <select id="daysFilter" class="input w-140">
+      <option value="30">Last 30 days</option>
+      <option value="90" selected>Last 90 days</option>
+      <option value="180">Last 180 days</option>
+    </select>
+  </div>
+
+  <div class="grid grid-3">
+    <div class="card card-stat">
+      <div class="card-label">Total PnL</div>
+      <div class="card-value" id="totalPnl">—</div>
+    </div>
+    <div class="card card-stat">
+      <div class="card-label">Win rate</div>
+      <div class="card-value" id="winRate">—</div>
+    </div>
+    <div class="card card-stat">
+      <div class="card-label">Trades</div>
+      <div class="card-value" id="trades">—</div>
+    </div>
+  </div>
+
+  <div class="grid grid-3 section">
+    <div class="card card-stat">
+      <div class="card-label">Sharpe ratio</div>
+      <div class="card-value" id="sharpe">—</div>
+    </div>
+    <div class="card card-stat">
+      <div class="card-label">Sortino ratio</div>
+      <div class="card-value" id="sortino">—</div>
+    </div>
+    <div class="card card-stat">
+      <div class="card-label">Max drawdown</div>
+      <div class="card-value neg" id="maxDd">—</div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">PnL heatmap (calendar)</div>
+      <div class="muted">Daily realized PnL</div>
+    </div>
+    <div id="pnlHeatmap" class="pnl-heatmap" style="display:flex; flex-wrap:wrap; gap:4px; min-height:80px;"></div>
+  </div>
+
+  <div class="grid grid-2 section">
+    <div class="card section">
+      <div class="card-head">
+        <div class="h2">By strategy</div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>Strategy</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Win %</th><th class="right">PnL</th></tr>
+          </thead>
+          <tbody id="byStrategyBody">
+            <tr><td colspan="5" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card section">
+      <div class="card-head">
+        <div class="h2">By symbol</div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>Symbol</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Win %</th><th class="right">PnL</th></tr>
+          </thead>
+          <tbody id="bySymbolBody">
+            <tr><td colspan="5" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Share performance</div>
+      <div class="muted">Copy to share (no $ amounts)</div>
+    </div>
+    <div class="row gap-8">
+      <input type="text" id="shareText" class="input" style="flex:1" readonly />
+      <button id="copyShare" class="btn btn-purple">Copy</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  async function loadAnalytics() {
+    const days = document.getElementById('daysFilter').value;
+    const r = await fetch('/api/analytics/performance?days=' + days, _authHeaders());
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+
+    const pnl = data.total_pnl ?? 0;
+    document.getElementById('totalPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
+    document.getElementById('totalPnl').className = 'card-value ' + (pnl >= 0 ? 'pos' : 'neg');
+    document.getElementById('winRate').textContent = ((data.win_rate ?? 0) * 100).toFixed(1) + '%';
+    document.getElementById('trades').textContent = data.trades ?? 0;
+    document.getElementById('sharpe').textContent = data.sharpe_ratio ?? '—';
+    document.getElementById('sortino').textContent = data.sortino_ratio ?? '—';
+    document.getElementById('maxDd').textContent = (data.max_drawdown ?? 0) >= 0 ? data.max_drawdown.toFixed(2) : '—';
+
+    const byStrat = data.by_strategy || {};
+    document.getElementById('byStrategyBody').innerHTML = Object.entries(byStrat).map(([s, v]) =>
+      '<tr><td class="mono">' + s + '</td><td class="right">' + v.count + '</td><td class="right">' + v.wins + '</td><td class="right">' + (v.count ? (v.wins/v.count*100).toFixed(0) : 0) + '%</td><td class="right ' + (v.pnl >= 0 ? 'pos' : 'neg') + '">' + (v.pnl >= 0 ? '+' : '') + v.pnl.toFixed(2) + '</td></tr>'
+    ).join('') || '<tr><td colspan="5" class="muted">No data</td></tr>';
+
+    const bySym = data.by_symbol || {};
+    document.getElementById('bySymbolBody').innerHTML = Object.entries(bySym).map(([s, v]) =>
+      '<tr><td class="mono">' + s + '</td><td class="right">' + v.count + '</td><td class="right">' + v.wins + '</td><td class="right">' + (v.count ? (v.wins/v.count*100).toFixed(0) : 0) + '%</td><td class="right ' + (v.pnl >= 0 ? 'pos' : 'neg') + '">' + (v.pnl >= 0 ? '+' : '') + v.pnl.toFixed(2) + '</td></tr>'
+    ).join('') || '<tr><td colspan="5" class="muted">No data</td></tr>';
+
+    const wr = ((data.win_rate ?? 0) * 100).toFixed(0);
+    const beat = pnl > 0 ? 'beat' : 'vs';
+    document.getElementById('shareText').value = 'My trading bot: ' + wr + '% win rate over ' + data.days + ' days. ' + beat + ' market.';
+
+    const daily = data.daily_pnl || {};
+    const heatEl = document.getElementById('pnlHeatmap');
+    if (heatEl && Object.keys(daily).length) {
+      const maxAbs = Math.max(1, ...Object.values(daily).map(Math.abs));
+      heatEl.innerHTML = Object.entries(daily).slice(0, 60).map(([k, v]) => {
+        const pct = v >= 0 ? Math.min(100, (v / maxAbs) * 50 + 50) : Math.max(0, 50 + (v / maxAbs) * 50);
+        const bg = v >= 0 ? 'rgba(34,197,94,' + (0.2 + pct/100*0.6) + ')' : 'rgba(248,113,113,' + (0.2 + (100-pct)/100*0.6) + ')';
+        return '<span title="' + k + ': ' + (v >= 0 ? '+' : '') + v.toFixed(2) + '" style="width:28px;height:28px;border-radius:6px;background:' + bg + ';font-size:9px;display:flex;align-items:center;justify-content:center;color:inherit;">' + k.slice(-2) + '</span>';
+      }).join('');
+    } else if (heatEl) heatEl.innerHTML = '<span class="muted">No daily data</span>';
+  }
+
+  document.getElementById('daysFilter').addEventListener('change', loadAnalytics);
+  document.getElementById('copyShare').addEventListener('click', () => {
+    document.getElementById('shareText').select();
+    navigator.clipboard?.writeText(document.getElementById('shareText').value);
+  });
+
+  loadAnalytics();
+</script>
+{% endblock %}

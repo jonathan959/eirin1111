@@ -1,0 +1,1275 @@
+{% extends "layout.html" %}
+
+{% block title %}Explore Market{% endblock %}
+
+{% block content %}
+<style>
+  /* TradingView-like Dark Theme overrides */
+  :root {
+    --bg-dark: #131722;
+    --bg-card: #1e222d;
+    --text-primary: #d1d4dc;
+    --text-secondary: #787b86;
+    --border-color: #2a2e39;
+    --color-up: #089981;
+    --color-down: #f23645;
+    --color-rating-buy: #089981;
+    --color-rating-sell: #f23645;
+    --color-rating-neutral: #787b86;
+  }
+
+  body {
+    background-color: var(--bg-dark) !important;
+    color: var(--text-primary) !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+  }
+
+  .screener-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 1px;
+  }
+
+  .screener-title {
+    font-size: 20px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .market-status {
+    font-size: 13px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .market-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-up);
+  }
+
+  .filters-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    overflow-x: auto;
+  }
+
+  .pill {
+    padding: 6px 12px;
+    border-radius: 12px;
+    background: #2a2e39;
+    color: var(--text-secondary);
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+
+  .pill:hover,
+  .pill.active {
+    background: #363a45;
+    color: var(--text-primary);
+  }
+
+  .screener-table-container {
+    background: var(--bg-card);
+    overflow-x: auto;
+    min-height: 80vh;
+  }
+
+  .tv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  .tv-table th {
+    text-align: left;
+    padding: 12px;
+    color: var(--text-secondary);
+    font-weight: normal;
+    border-bottom: 1px solid var(--border-color);
+    position: sticky;
+    top: 0;
+    background: var(--bg-card);
+    z-index: 10;
+    cursor: pointer;
+  }
+
+  .tv-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-primary);
+    vertical-align: middle;
+  }
+
+  .tv-table tr:hover td {
+    background-color: #2a2e39;
+  }
+
+  .symbol-cell {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .symbol-icon {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #363a45;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: bold;
+    color: var(--text-primary);
+  }
+
+  .symbol-info {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .symbol-ticker {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .symbol-name {
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .price-up {
+    color: var(--color-up);
+  }
+
+  .price-down {
+    color: var(--color-down);
+  }
+
+  .price-na {
+    color: var(--text-secondary);
+  }
+
+  .rating-badge {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+
+  .rating-strong-buy {
+    color: var(--color-rating-buy);
+  }
+
+  .rating-buy {
+    color: var(--color-rating-buy);
+    opacity: 0.8;
+  }
+
+  .rating-neutral {
+    color: var(--color-rating-neutral);
+  }
+
+  .rating-watch {
+    color: var(--color-rating-neutral);
+    opacity: 0.9;
+  }
+
+  .rating-sell {
+    color: var(--color-rating-sell);
+    opacity: 0.8;
+  }
+
+  .rating-strong-sell {
+    color: var(--color-rating-sell);
+  }
+
+  /* Sparkline canvas */
+  .sparkline {
+    width: 100px;
+    height: 30px;
+    display: block;
+  }
+  .sort-ind { font-size:10px; opacity:0.6; }
+  .tv-table th[onclick] { cursor:pointer; }
+  .tv-table th[onclick]:hover { color:var(--text-primary); }
+  .score-badge { font-size:11px; padding:2px 6px; border-radius:6px; font-weight:600; }
+  .score-high { background:rgba(8,153,129,0.2); color:#089981; }
+  .score-mid { background:rgba(201,162,39,0.2); color:#c9a227; }
+  .score-low { background:rgba(148,163,184,0.2); color:#94a3b8; }
+  .breakdown-row { background:#131722 !important; }
+  .breakdown-cell { padding:12px 20px !important; font-size:12px; border-bottom:1px solid #2a2e39; vertical-align:top; }
+  .breakdown-cell .breakdown-section { margin-bottom:8px; }
+  .breakdown-cell .breakdown-label { color:#787b86; font-size:11px; margin-bottom:4px; }
+  .breakdown-cell .breakdown-items { color:#d1d4dc; }
+  .breakdown-cell .breakdown-items ul { margin:0; padding-left:18px; }
+  .expand-icon { cursor:pointer; opacity:0.7; font-size:14px; padding:2px 6px; border-radius:4px; }
+  .expand-icon:hover { opacity:1; background:#2a2e39; }
+  .skeleton { background:linear-gradient(90deg,#2a2e39 25%,#363a45 50%,#2a2e39 75%); background-size:200% 100%; animation:skeleton 1.2s ease-in-out infinite; border-radius:4px; height:20px; }
+  @keyframes skeleton { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+</style>
+
+<div class="screener-header">
+  <div class="screener-title">
+    Explore <span style="font-weight:400; color:var(--text-secondary)">Market Screener</span>
+  </div>
+  <div class="market-status">
+    <div class="market-dot"></div> Market Open
+    <span style="margin-left:12px; font-size:11px; color:var(--text-secondary);">
+      Crypto: <span style="color:{% if kraken_ready %}#089981{% else %}#f23645{% endif %}">{% if kraken_ready %}Kraken ✓{% else %}Kraken ✗{% endif %}</span>
+      &nbsp;|&nbsp; Stocks: <span style="color:{% if alpaca_ready %}#089981{% else %}#f23645{% endif %}">{% if alpaca_ready %}Alpaca ✓{% else %}Alpaca ✗{% endif %}</span>
+    </span>
+  </div>
+</div>
+
+<div class="filters-bar">
+  <input type="text" id="filter-search" placeholder="Search symbol…" oninput="applyFilters()"
+    style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; width:140px;">
+  <div class="pill active" id="filter-all" onclick="setFilter('all')">All Assets</div>
+  <div class="pill" id="filter-crypto" onclick="setFilter('crypto')">Crypto</div>
+  <div class="pill" id="filter-stocks" onclick="setFilter('stocks')">Stocks</div>
+  
+  <select id="filter-horizon" onchange="applyFilters()" title="Short Term: 90+ days data, faster signals. Long Term: 180+ days data, slower but more stable." style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="short">Short Term (3mo+)</option>
+    <option value="long">Long Term (6mo+)</option>
+  </select>
+  
+  <select id="filter-signal" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="buy" selected>Buy Only</option>
+    <option value="watch">Buy + Watch</option>
+    <option value="all">All Signals</option>
+  </select>
+  
+  <select id="filter-sort" onchange="applyFilters()" title="Sort recommendations by different metrics" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="score" selected>Sort: Best Score</option>
+    <option value="winrate">Sort: Win Rate</option>
+    <option value="profit_factor">Sort: Profit Factor</option>
+    <option value="drawdown">Sort: Low Drawdown</option>
+  </select>
+  
+  <select id="filter-volatility" onchange="applyFilters()" title="Filter by volatility/risk level" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="all" selected>All Risk Levels</option>
+    <option value="low">Low Volatility</option>
+    <option value="medium">Medium Volatility</option>
+    <option value="high">High Volatility</option>
+  </select>
+  
+  <select id="filter-regime" onchange="applyFilters()" title="Filter by market regime" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="all" selected>All Regimes</option>
+    <option value="bull">Bull</option>
+    <option value="breakout">Breakout</option>
+    <option value="range">Range</option>
+    <option value="bear">Bear / Defensive</option>
+  </select>
+  
+  <select id="filter-sector" onchange="applyFilters()" title="Filter by sector (stocks only)" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="all" selected>All Sectors</option>
+    <option value="Technology">Technology</option>
+    <option value="Financial">Financial</option>
+    <option value="Healthcare">Healthcare</option>
+    <option value="Consumer Cyclical">Consumer Cyclical</option>
+    <option value="Consumer Defensive">Consumer Defensive</option>
+    <option value="Communication">Communication</option>
+    <option value="ETF">ETF</option>
+  </select>
+  
+  <select id="filter-min-score" onchange="applyFilters()" title="Minimum recommendation score" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="0" selected>Min Score: Any</option>
+    <option value="60">Min Score: 60+</option>
+    <option value="70">Min Score: 70+</option>
+    <option value="80">Min Score: 80+</option>
+    <option value="90">Min Score: 90+</option>
+  </select>
+  
+  <select id="filter-limit" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+    <option value="10">Top 10</option>
+    <option value="25">Top 25</option>
+    <option value="50" selected>Top 50</option>
+    <option value="100">Top 100</option>
+    <option value="200">Top 200</option>
+  </select>
+  
+  <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-secondary); cursor:pointer;">
+    <input type="checkbox" id="chk-auto-refresh" onchange="toggleAutoRefresh()" style="accent-color:#089981;">
+    Auto-refresh (60s)
+  </label>
+  <button id="btn-show-more" onclick="loadMore()" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer; display:none;">Show More</button>
+  <button id="btn-refresh" onclick="loadScreener(false)" title="Reload current view with current filters (no full scan)" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer;">Refresh</button>
+  <button id="btn-reset-filters" onclick="resetFilters()" title="Reset all filters to defaults" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">Reset</button>
+  <button id="btn-rescan" onclick="triggerRescan()" title="Full scan: crypto + stocks for short & long term. Reload or switch filters after a few minutes." style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">Rescan</button>
+  <div class="pill" id="filter-performance" onclick="togglePerformancePanel()" title="Show recommendation accuracy metrics">Accuracy</div>
+</div>
+
+<!-- Horizon description + last scan timestamp + export -->
+<div id="horizonBanner" style="padding: 8px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 12px; color: #787b86; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+  <span id="horizonDesc">Short Term: Quick trades with 90+ days of data. Scans every 15 minutes.</span>
+  <div style="display:flex; align-items:center; gap:12px;">
+    <span id="dataFreshness" class="muted" style="font-size:11px;" title="When recommendations were last refreshed"></span>
+    <button id="btn-export-csv" onclick="exportToCsv(event)" title="Export current filtered results to CSV" style="padding:4px 10px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:11px; cursor:pointer;">Export CSV</button>
+  </div>
+</div>
+<div id="explorePricesBanner" style="display:none; padding: 6px 20px; background: #2a2616; border-bottom: 1px solid #3a3520; font-size: 12px; color: #c9a227;"></div>
+<div id="exploreSignalBanner" style="display:none; padding: 6px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 12px; color: #94a3b8;"></div>
+
+<!-- Recommendation Accuracy Panel (collapsible) -->
+<div id="performancePanel" style="display:none; padding: 16px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 13px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+    <strong style="color:var(--text-primary);">Recommendation Accuracy</strong>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <select id="perfDays" onchange="loadPerformanceMetrics()" style="padding:4px 8px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:12px;">
+        <option value="30" selected>Last 30 days</option>
+        <option value="60">Last 60 days</option>
+        <option value="90">Last 90 days</option>
+      </select>
+      <button id="btn-calibrate" onclick="runCalibration()" title="Adjust scoring weights from historical performance" style="padding:4px 10px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:11px; cursor:pointer;">Calibrate</button>
+    </div>
+  </div>
+  <div id="performanceContent" style="color:var(--text-secondary);">Loading...</div>
+</div>
+
+<div class="screener-table-container">
+  <table class="tv-table">
+    <thead>
+      <tr>
+        <th width="250" onclick="sortBy('symbol')" title="Click to sort">Symbol <span id="sort-symbol" class="sort-ind"></span></th>
+        <th width="100" class="right" onclick="sortBy('price')" title="Click to sort">Last <span id="sort-price" class="sort-ind"></span></th>
+        <th width="80" class="right" onclick="sortBy('chg')" title="Click to sort">Chg % <span id="sort-chg" class="sort-ind"></span></th>
+        <th width="80" class="right">Chg</th>
+        <th width="130" class="center" onclick="sortBy('score')" title="Click to sort">Score / Rating <span id="sort-score" class="sort-ind">▼</span></th>
+        <th width="100" class="right" onclick="sortBy('volume')" title="Click to sort">Vol <span id="sort-volume" class="sort-ind"></span></th>
+        <th width="120" class="right">Mkt Cap</th>
+        <th width="150">7d Trend</th>
+        <th>Sector / Strategy</th>
+      </tr>
+    </thead>
+    <tbody id="screenerBody">
+      <tr><td colspan="9" style="padding:24px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- Customize Bot Modal -->
+<div id="botModal"
+  style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1100; align-items:center; justify-content:center;">
+  <div style="background:#1e222d; padding:24px; border-radius:12px; width:400px; border:1px solid #2a2e39;">
+    <h3 style="margin-top:0; color:#d1d4dc;">Launch Bot: <span id="modalSymbol" style="color:#089981"></span></h3>
+
+    <div style="margin-bottom:16px;">
+      <label style="display:block; color:#787b86; margin-bottom:8px; font-size:13px;">Investment Amount (USD)</label>
+      <input type="number" id="baseOrder" value="20" min="5" step="5"
+        style="width:100%; padding:10px; background:#131722; border:1px solid #2a2e39; color:#d1d4dc; border-radius:6px;">
+      <div style="font-size:11px; color:#787b86; margin-top:4px;">Total amount to invest. Safety orders will be scaled automatically.</div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="display:block; color:#787b86; margin-bottom:8px; font-size:13px;">Profit Target (%)</label>
+      <input type="number" id="profitTarget" value="1.5" min="0.5" max="10" step="0.1"
+        style="width:100%; padding:10px; background:#131722; border:1px solid #2a2e39; color:#d1d4dc; border-radius:6px;">
+      <div style="font-size:11px; color:#787b86; margin-top:4px;">Target profit percentage before selling (e.g., 1.5 = 1.5% profit).</div>
+    </div>
+
+    <div id="alpacaModeRow" style="margin-bottom:16px; display:none;">
+      <label style="display:block; color:#787b86; margin-bottom:8px; font-size:13px;">Alpaca Mode (Stocks)</label>
+      <select id="modalAlpacaMode" style="width:100%; padding:10px; background:#131722; border:1px solid #2a2e39; color:#d1d4dc; border-radius:6px;">
+        <option value="paper" selected>Paper Trading</option>
+        <option value="live">Live Trading</option>
+      </select>
+      <div style="font-size:11px; color:#787b86; margin-top:4px;">Paper = simulated, Live = real money.</div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="display:block; color:#787b86; margin-bottom:8px; font-size:13px;">Mode</label>
+      <div style="display:flex; gap:10px;">
+        <button onclick="setMode('dry')" id="btnDry"
+          style="flex:1; padding:10px; background:#2a2e39; border:1px solid #089981; color:#089981; border-radius:6px; cursor:pointer;">Dry
+          Run</button>
+        <button onclick="setMode('live')" id="btnLive"
+          style="flex:1; padding:10px; background:#131722; border:1px solid #2a2e39; color:#787b86; border-radius:6px; cursor:pointer;">Live
+          Trading</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:24px;">
+      <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
+        <input type="checkbox" id="chkEnabled" checked style="accent-color:#089981;">
+        <span style="color:#d1d4dc; font-size:14px;">Start Immediately</span>
+      </label>
+    </div>
+
+    <div style="display:flex; gap:10px;">
+      <button onclick="closeBotModal()"
+        style="flex:1; padding:12px; background:none; border:1px solid #2a2e39; color:#787b86; border-radius:6px; cursor:pointer;">Cancel</button>
+      <button onclick="confirmLaunch()"
+        style="flex:1; padding:12px; background:#089981; border:none; color:#fff; border-radius:6px; cursor:pointer; font-weight:600;">Create
+        Bot</button>
+    </div>
+  </div>
+</div>
+
+<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+<script>
+  let allData = [];
+  let currentFilter = 'all';
+  let currentHorizon = 'short';
+  let currentSignal = 'buy';
+  let currentLimit = 50;
+  let currentOffset = 0;
+  let hasMoreData = false;
+  let selectedSymbol = '';
+  let selectedMode = 'dry';
+  let relaxedSignal = false;
+  let currentSortCol = 'score';
+  let currentSortDesc = true;
+  let autoRefreshInterval = null;
+
+  function saveFilterPrefs() {
+    try {
+      const sortEl = document.getElementById('filter-sort');
+      const volEl = document.getElementById('filter-volatility');
+      const regEl = document.getElementById('filter-regime');
+      const minEl = document.getElementById('filter-min-score');
+      localStorage.setItem('explore_prefs', JSON.stringify({
+        filter: currentFilter, horizon: currentHorizon, signal: currentSignal, limit: currentLimit,
+        sort: sortEl ? sortEl.value : 'score', volatility: volEl ? volEl.value : 'all', regime: regEl ? regEl.value : 'all', minScore: minEl ? parseInt(minEl.value) || 0 : 0,
+        autoRefresh: !!document.getElementById('chk-auto-refresh')?.checked
+      }));
+    } catch (e) {}
+  }
+  function loadFilterPrefs() {
+    try {
+      const s = localStorage.getItem('explore_prefs');
+      if (!s) return;
+      const p = JSON.parse(s);
+      if (p.filter) { currentFilter = p.filter; document.querySelectorAll('.pill').forEach(el => el.classList.remove('active')); const pill = document.getElementById('filter-' + p.filter); if (pill) pill.classList.add('active'); }
+      if (p.horizon) { currentHorizon = p.horizon; const el = document.getElementById('filter-horizon'); if (el) el.value = p.horizon; }
+      if (p.signal) { currentSignal = p.signal; const el = document.getElementById('filter-signal'); if (el) el.value = p.signal; }
+      if (p.limit) { currentLimit = p.limit; const el = document.getElementById('filter-limit'); if (el) el.value = p.limit; }
+      if (p.sort) { const el = document.getElementById('filter-sort'); if (el) el.value = p.sort; }
+      if (p.volatility) { const el = document.getElementById('filter-volatility'); if (el) el.value = p.volatility; }
+      if (p.regime) { const el = document.getElementById('filter-regime'); if (el) el.value = p.regime; }
+      if (p.minScore != null) { const el = document.getElementById('filter-min-score'); if (el) el.value = p.minScore; }
+      if (p.autoRefresh) { const chk = document.getElementById('chk-auto-refresh'); if (chk) { chk.checked = true; toggleAutoRefresh(); } }
+    } catch (e) {}
+  }
+  function toggleAutoRefresh() {
+    const chk = document.getElementById('chk-auto-refresh');
+    if (chk?.checked) {
+      autoRefreshInterval = setInterval(() => loadScreener(false), 60000);
+    } else {
+      if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+      autoRefreshInterval = null;
+    }
+    saveFilterPrefs();
+  }
+  function togglePerformancePanel() {
+    const panel = document.getElementById('performancePanel');
+    const pill = document.getElementById('filter-performance');
+    if (panel.style.display === 'none') {
+      panel.style.display = 'block';
+      if (pill) pill.classList.add('active');
+      loadPerformanceMetrics();
+    } else {
+      panel.style.display = 'none';
+      if (pill) pill.classList.remove('active');
+    }
+  }
+  async function loadPerformanceMetrics() {
+    const content = document.getElementById('performanceContent');
+    if (!content) return;
+    content.textContent = 'Loading...';
+    try {
+      const days = document.getElementById('perfDays')?.value || 30;
+      const res = await fetch(`/api/recommendations/performance?days=${days}`);
+      const data = await res.json();
+      if (!data.ok) {
+        content.innerHTML = '<span style="color:var(--text-secondary);">No performance data available.</span>';
+        return;
+      }
+      const t = data.total_closed;
+      if (t === 0) {
+        content.innerHTML = '<span style="color:var(--text-secondary);">No closed recommendations yet. Create bots from recommendations and close deals to see accuracy metrics.</span>';
+        return;
+      }
+      const wr = data.win_rate_pct || 0;
+      const avg = data.avg_profit_per_recommendation || 0;
+      const avgClr = avg >= 0 ? 'var(--color-up)' : 'var(--color-down)';
+      let html = `<span style="color:var(--text-primary);">${t} closed</span> &nbsp;|&nbsp; ` +
+        `<span style="color:var(--color-up);">${data.wins || 0} wins</span> &nbsp;|&nbsp; ` +
+        `<span style="color:var(--color-down);">${data.losses || 0} losses</span> &nbsp;|&nbsp; ` +
+        `Win rate: <strong>${wr.toFixed(1)}%</strong> &nbsp;|&nbsp; ` +
+        `Avg PnL: <strong style="color:${avgClr}">$${avg.toFixed(2)}</strong>`;
+      if (data.by_score_range && data.by_score_range.length) {
+        html += '<br><span style="font-size:11px; color:var(--text-secondary);">By score: ';
+        html += data.by_score_range.map(r => `${r.range}: ${r.win_rate.toFixed(0)}% (n=${r.total})`).join(' &nbsp;|&nbsp; ');
+        html += '</span>';
+      }
+      content.innerHTML = html;
+    } catch (e) {
+      content.innerHTML = '<span style="color:var(--color-down);">Failed to load metrics.</span>';
+    }
+  }
+  async function runCalibration() {
+    const btn = document.getElementById('btn-calibrate');
+    if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+    try {
+      const days = document.getElementById('perfDays')?.value || 30;
+      const res = await fetch(`/api/recommendations/calibrate?window_days=${days}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        loadPerformanceMetrics();
+        if (btn) { btn.textContent = 'Done'; setTimeout(() => { btn.disabled = false; btn.textContent = 'Calibrate'; }, 2000); }
+      } else {
+        alert(data.reason || data.error || 'Calibration failed');
+        if (btn) { btn.disabled = false; btn.textContent = 'Calibrate'; }
+      }
+    } catch (e) {
+      alert('Calibration failed: ' + (e.message || e));
+      if (btn) { btn.disabled = false; btn.textContent = 'Calibrate'; }
+    }
+  }
+  function sortBy(col) {
+    if (currentSortCol === col) currentSortDesc = !currentSortDesc;
+    else { currentSortCol = col; currentSortDesc = col === 'score' || col === 'chg' || col === 'volume'; }
+    document.querySelectorAll('.sort-ind').forEach(s => s.textContent = '');
+    const ind = document.getElementById('sort-' + col);
+    if (ind) ind.textContent = currentSortDesc ? '▼' : '▲';
+    renderTable(false);
+  }
+
+  // Modal Functions
+  async function openBotModal(symbol) {
+    selectedSymbol = symbol;
+    document.getElementById('modalSymbol').innerText = symbol;
+    const isStock = symbol && symbol.length < 6 && !symbol.includes('/');
+    const alpacaRow = document.getElementById('alpacaModeRow');
+    if (alpacaRow) alpacaRow.style.display = isStock ? 'block' : 'none';
+
+    // Reset defaults
+    document.getElementById('baseOrder').value = 20;
+    document.getElementById('profitTarget').value = 1.5;
+    setMode('dry');
+    document.getElementById('chkEnabled').checked = true;
+
+    // Fetch recommendation data to auto-configure settings
+    try {
+      const [resS, resL] = await Promise.all([
+        fetch(`/api/recommendations/${encodeURIComponent(symbol)}?horizon=short`),
+        fetch(`/api/recommendations/${encodeURIComponent(symbol)}?horizon=long`)
+      ]);
+      
+      let reco = null;
+      if (resS.ok) {
+        const dataS = await resS.json();
+        if (dataS.ok && dataS.item) reco = dataS.item;
+      }
+      if (!reco && resL.ok) {
+        const dataL = await resL.json();
+        if (dataL.ok && dataL.item) reco = dataL.item;
+      }
+      
+      if (reco) {
+        // Auto-configure based on recommendation
+        const volatility = reco.volatility || 0.02;
+        const score = reco.score || 50;
+        const strategy = reco.recommended_strategy || reco.suggested_strategy || 'smart_dca';
+        
+        // Adjust profit target based on volatility (higher vol = higher target)
+        const suggestedTP = Math.max(1.0, Math.min(5.0, volatility * 100 * 1.5));
+        document.getElementById('profitTarget').value = suggestedTP.toFixed(1);
+        
+        // Store recommendation data for bot creation
+        window._currentReco = reco;
+      }
+    } catch (e) {
+      console.warn("Could not fetch recommendation:", e);
+      window._currentReco = null;
+    }
+
+    document.getElementById('botModal').style.display = 'flex';
+  }
+
+  function closeBotModal() {
+    document.getElementById('botModal').style.display = 'none';
+  }
+
+  async function fetchWithRetry(url, opts, maxRetries = 3, baseDelayMs = 1000) {
+    let lastErr;
+    for (let r = 0; r < maxRetries; r++) {
+      try {
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), (opts && opts.timeoutMs) || 10000);
+        const res = await fetch(url, { ...opts, signal: ctrl.signal });
+        clearTimeout(tid);
+        return res;
+      } catch (e) {
+        lastErr = e;
+        if (r < maxRetries - 1) {
+          const delay = baseDelayMs * Math.pow(2, r);
+          await new Promise(ok => setTimeout(ok, delay));
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  function setMode(mode) {
+    selectedMode = mode;
+    const btnDry = document.getElementById('btnDry');
+    const btnLive = document.getElementById('btnLive');
+
+    if (mode === 'dry') {
+      btnDry.style.background = '#2a2e39';
+      btnDry.style.color = '#089981';
+      btnDry.style.borderColor = '#089981';
+
+      btnLive.style.background = '#131722';
+      btnLive.style.color = '#787b86';
+      btnLive.style.borderColor = '#2a2e39';
+    } else {
+      btnLive.style.background = '#2a2e39';
+      btnLive.style.color = '#f23645'; // Warning color for live
+      btnLive.style.borderColor = '#f23645';
+
+      btnDry.style.background = '#131722';
+      btnDry.style.color = '#787b86';
+      btnDry.style.borderColor = '#2a2e39';
+    }
+  }
+
+  async function confirmLaunch() {
+    const amount = parseFloat(document.getElementById('baseOrder').value) || 20;
+    const profitTarget = parseFloat(document.getElementById('profitTarget').value) || 1.5;
+    const enabled = document.getElementById('chkEnabled').checked;
+    const reco = window._currentReco || {};
+
+    if (amount < 5) {
+      alert('Investment amount must be at least $5');
+      return;
+    }
+
+    // Auto-configure based on recommendation data
+    const volatility = reco.volatility || 0.02;
+    const strategy = reco.recommended_strategy || reco.suggested_strategy || 'smart_dca';
+    const isStock = reco.market_type === 'stocks' || (selectedSymbol.length < 6 && !selectedSymbol.includes('/'));
+    
+    // CRITICAL: For DCA strategies, base_quote should be SMALL (not the full amount)
+    // The full amount is max_spend_quote (total budget)
+    // Base order should be 10-20% of total, not 100%
+    const baseAmount = Math.max(5, Math.min(amount * 0.15, 100)); // Max 15% or $100, whichever is smaller
+    const safetyAmount = Math.max(5, Math.min(amount * 0.10, 75)); // Max 10% or $75 per safety order
+    const maxSafety = volatility > 0.05 ? 5 : (volatility > 0.03 ? 4 : 3); // More safety orders for volatile assets
+    const firstDev = Math.max(0.01, Math.min(0.03, volatility * 1.5)); // Deviation based on volatility
+    const stepMult = volatility > 0.04 ? 1.3 : 1.2; // Wider spacing for volatile assets
+    const tp = profitTarget / 100; // Convert percentage to decimal
+
+    // Calculate max spend (base + safety orders) - this is the TOTAL budget
+    const maxSpend = amount;
+
+    const alpacaModeEl = document.getElementById('modalAlpacaMode');
+    const alpacaMode = (alpacaModeEl && isStock) ? alpacaModeEl.value : 'paper';
+
+    try {
+      const response = await fetch('/api/bots', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: "Smart " + (selectedMode === 'dry' ? "(Paper) " : "") + selectedSymbol,
+          symbol: selectedSymbol,
+          strategy_mode: strategy,
+          base_quote: baseAmount,
+          safety_quote: safetyAmount,
+          max_safety: maxSafety,
+          tp: tp,
+          market_type: isStock ? 'stocks' : 'crypto',
+          alpaca_mode: isStock ? alpacaMode : 'paper',
+
+          // Auto-configured params based on recommendation
+          first_dev: firstDev,
+          step_mult: stepMult,
+          max_spend_quote: maxSpend,
+
+          // Custom fields
+          dry_run: selectedMode === 'dry' ? 1 : 0,
+          enabled: enabled ? 1 : 0
+        })
+      });
+      
+      const d = await response.json();
+      if (d.ok) {
+        window.location.href = '/bots/' + d.bot.id;
+      } else {
+        alert('Error: ' + (d.detail || d.error || 'Failed to create bot'));
+      }
+    } catch (e) {
+      alert('Error creating bot: ' + (e.message || String(e)));
+    }
+  }
+
+  function setFilter(filter) {
+    currentFilter = filter;
+    // Update pill active states
+    document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+    const pill = document.getElementById(`filter-${filter}`);
+    if (pill) pill.classList.add('active');
+    // Reset pagination when filter changes
+    currentOffset = 0;
+    applyFilters();
+  }
+  
+  let currentSort = 'score';
+  let currentVolatility = 'all';
+  let currentRegime = 'all';
+  let currentSector = 'all';
+  let currentMinScore = 0;
+  
+  function applyFilters() {
+    // Get current filter values
+    const horizonSelect = document.getElementById('filter-horizon');
+    const signalSelect = document.getElementById('filter-signal');
+    const limitSelect = document.getElementById('filter-limit');
+    const sortSelect = document.getElementById('filter-sort');
+    const volatilitySelect = document.getElementById('filter-volatility');
+    const regimeSelect = document.getElementById('filter-regime');
+    const sectorSelect = document.getElementById('filter-sector');
+    const minScoreSelect = document.getElementById('filter-min-score');
+    
+    currentHorizon = horizonSelect ? horizonSelect.value : 'short';
+    currentSignal = signalSelect ? signalSelect.value : 'buy';
+    currentLimit = limitSelect ? parseInt(limitSelect.value) : 10;
+    currentSort = sortSelect ? sortSelect.value : 'score';
+    currentVolatility = volatilitySelect ? volatilitySelect.value : 'all';
+    currentRegime = regimeSelect ? regimeSelect.value : 'all';
+    currentSector = sectorSelect ? sectorSelect.value : 'all';
+    currentMinScore = minScoreSelect ? parseInt(minScoreSelect.value) || 0 : 0;
+    currentOffset = 0; // Reset offset when filters change
+    relaxedSignal = false;
+    const sigBanner = document.getElementById('exploreSignalBanner');
+    if (sigBanner) sigBanner.style.display = 'none';
+    
+    // Update horizon description banner
+    const horizonBanner = document.getElementById('horizonDesc');
+    if (horizonBanner) {
+      if (currentHorizon === 'long') {
+        horizonBanner.textContent = 'Long Term: Stable trends with 180+ days of data (52 weeks). Scans every 60 minutes. Lower exposure per trade (5%).';
+      } else {
+        horizonBanner.textContent = 'Short Term: Quick trades with 90+ days of data. Scans every 15 minutes. Higher exposure per trade (10%).';
+      }
+    }
+    
+    saveFilterPrefs();
+    loadScreener();
+  }
+  
+  function loadMore() {
+    currentOffset += currentLimit;
+    loadScreener(true); // append = true
+  }
+  
+  function resetFilters() {
+    currentFilter = 'all';
+    document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+    const pillAll = document.getElementById('filter-all');
+    if (pillAll) pillAll.classList.add('active');
+    const searchEl = document.getElementById('filter-search');
+    if (searchEl) searchEl.value = '';
+    const horizon = document.getElementById('filter-horizon');
+    if (horizon) horizon.value = 'short';
+    const signal = document.getElementById('filter-signal');
+    if (signal) signal.value = 'buy';
+    const sort = document.getElementById('filter-sort');
+    if (sort) sort.value = 'score';
+    const limit = document.getElementById('filter-limit');
+    if (limit) limit.value = '50';
+    const volatility = document.getElementById('filter-volatility');
+    if (volatility) volatility.value = 'all';
+    const regime = document.getElementById('filter-regime');
+    if (regime) regime.value = 'all';
+    const sector = document.getElementById('filter-sector');
+    if (sector) sector.value = 'all';
+    const minScore = document.getElementById('filter-min-score');
+    if (minScore) minScore.value = '0';
+    currentSortCol = 'score';
+    currentSortDesc = true;
+    document.querySelectorAll('.sort-ind').forEach(s => s.textContent = '');
+    const sortInd = document.getElementById('sort-score');
+    if (sortInd) sortInd.textContent = '▼';
+    currentOffset = 0;
+    applyFilters();
+  }
+  
+  async function triggerRescan() {
+    const btn = document.getElementById('btn-rescan');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const orig = btn.textContent;
+    const tbody = document.getElementById("screenerBody");
+    let progressInterval = null;
+    function updateProgress() {
+      fetch('/api/recommendations/scan_status').then(r => r.json()).then(data => {
+        if (data.ok && tbody) {
+          const s = data.short || {};
+          const l = data.long || {};
+          const scanning = s.scanning || l.scanning;
+          let msg = 'Full scan started (crypto + stocks, short & long term).';
+          if (scanning && (s.total > 0 || l.total > 0)) {
+            const short = s.total ? `${s.scanned || 0}/${s.total}` : '-';
+            const long = l.total ? `${l.scanned || 0}/${l.total}` : '-';
+            msg = `Scanning… Short: ${short} | Long: ${long}`;
+          }
+          tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary); line-height:1.6;">
+            ${msg}<br>
+            <small>This may take a few minutes. Reload or switch filters to see new data.</small>
+          </td></tr>`;
+        }
+      }).catch(() => {});
+    }
+    if (tbody) { updateProgress(); progressInterval = setInterval(updateProgress, 3000); }
+    try {
+      await Promise.all([
+        fetch('/api/recommendations/scan?horizon=short', { method: 'POST' }),
+        fetch('/api/recommendations/scan?horizon=long', { method: 'POST' }),
+        fetch('/api/recommendations/scan_stocks?horizon=short', { method: 'POST' }),
+        fetch('/api/recommendations/scan_stocks?horizon=long', { method: 'POST' })
+      ]);
+    } catch (e) { console.warn('Rescan request failed:', e); }
+    if (progressInterval) clearInterval(progressInterval);
+    btn.textContent = orig;
+    btn.disabled = false;
+    setTimeout(() => loadScreener(false), 5000);
+  }
+  
+  async function loadScreener(append = false) {
+    const tbody = document.getElementById("screenerBody");
+    if (!append && tbody) {
+      tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>`;
+    }
+    
+    // Build market_type filter
+    let marketTypeParam = 'all';
+    if (currentFilter === 'crypto') marketTypeParam = 'crypto';
+    else if (currentFilter === 'stocks') marketTypeParam = 'stocks';
+    
+    try {
+      const url = `/api/recommendations?horizon=${currentHorizon}&market_type=${marketTypeParam}&signal=${currentSignal}&limit=${currentLimit}&offset=${currentOffset}&sort=${currentSort}&volatility=${currentVolatility}&regime=${currentRegime}&sector=${encodeURIComponent(currentSector)}&min_score=${currentMinScore}`;
+      const res = await fetchWithRetry(url, { headers: { 'Accept': 'application/json' }, timeoutMs: 12000 }, 3, 1000);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      // Check for structured status responses
+      const status = data.status || (data.ok ? "ready" : "error");
+      
+      // Handle warming_up status - show message and auto-retry
+      if (status === "warming_up") {
+        const message = data.message || "Generating recommendations...";
+        if (tbody && !append) {
+          tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary)">
+            ${message}<br><small>Auto-refreshing in 10 seconds...</small>
+          </td></tr>`;
+        }
+        // Auto-retry after 10 seconds
+        setTimeout(() => loadScreener(false), 10000);
+        return;
+      }
+      
+      // Handle error status - show specific error message
+      if (status === "error") {
+        const errorMsg = data.message || "Failed to load recommendations";
+        const reason = data.reason || "unknown";
+        if (tbody && !append) {
+          let displayMsg = errorMsg;
+          if (reason === "kraken_not_ready") {
+            displayMsg = "Kraken API not configured. Cannot load crypto recommendations.";
+          } else if (reason === "alpaca_not_ready") {
+            displayMsg = "Alpaca API not configured. Cannot load stock recommendations.";
+          } else if (reason === "scan_failed") {
+            displayMsg = `Scan failed: ${errorMsg}. Check server logs.`;
+          }
+          tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${displayMsg}</td></tr>`;
+        }
+        return;
+      }
+
+      // Update last scan timestamp (relative + absolute)
+      const freshnessEl = document.getElementById('dataFreshness');
+      if (freshnessEl) {
+        const age = data.scan_age_sec;
+        const lastTs = data.last_scan_ts;
+        if (age != null && age >= 0 && lastTs) {
+          const mins = Math.floor(age / 60);
+          const secs = Math.floor(age % 60);
+          let rel = mins > 0 ? (mins >= 60 ? `${Math.floor(mins/60)}h ago` : `${mins}m ago`) : `${secs}s ago`;
+          const d = new Date(lastTs * 1000);
+          const abs = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          freshnessEl.textContent = `Last scan: ${rel}`;
+          freshnessEl.title = `Last scan: ${rel} (${abs})`;
+        } else if (age != null && age >= 0) {
+          const mins = Math.floor(age / 60);
+          const secs = Math.floor(age % 60);
+          freshnessEl.textContent = mins > 0 ? `Data: ${mins}m ago` : `Data: ${secs}s ago`;
+          freshnessEl.title = '';
+        } else {
+          freshnessEl.textContent = '';
+          freshnessEl.title = '';
+        }
+      }
+
+      // Get items from response
+      const newItems = data.items || [];
+      
+      if (append) {
+        // Append to existing data
+        allData = allData.concat(newItems);
+      } else {
+        // Replace data
+        allData = newItems;
+      }
+      
+      // Update has_more flag
+      hasMoreData = data.has_more || false;
+      const btnShowMore = document.getElementById('btn-show-more');
+      if (btnShowMore) {
+        btnShowMore.style.display = hasMoreData ? 'inline-block' : 'none';
+      }
+      
+      // If no items but status is ready, show message
+      if (allData.length === 0 && status === "ready") {
+        const reason = data.reason || "no_matches";
+        let message = "No recommendations match your filters.";
+        if (reason === "no_scan_yet") {
+          message = "No scan has run yet. Recommendations will appear after the first scan completes.";
+        } else if (reason === "no_matches") {
+          message = "No recommendations match your current filters. Try adjusting filters or wait for new scans.";
+        }
+        if (currentSignal === "buy" && !relaxedSignal) {
+          relaxedSignal = true;
+          currentSignal = "watch";
+          const signalSelect = document.getElementById('filter-signal');
+          if (signalSelect) signalSelect.value = "watch";
+          const sigBanner = document.getElementById('exploreSignalBanner');
+          if (sigBanner) {
+            sigBanner.textContent = "No buy signals found. Showing Buy + Watch.";
+            sigBanner.style.display = 'block';
+          }
+          setTimeout(() => loadScreener(false), 200);
+          return;
+        }
+        if (tbody && !append) {
+          tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${message}</td></tr>`;
+        }
+        return;
+      }
+      
+      // Render table first with available data (uses metrics price if no live fetch yet)
+      renderTable(append);
+      
+      // Fetch live prices with retry; fallback to metrics-derived prices on failure
+      const allSymbols = allData.map(item => item.symbol);
+      let pricesOk = false;
+      if (allSymbols.length > 0) {
+        const priceUrl = `/api/prices?symbols=${encodeURIComponent(allSymbols.join(','))}&market_type=all`;
+        try {
+          const priceRes = await fetchWithRetry(priceUrl, { timeoutMs: 8000 }, 2, 800);
+          if (priceRes.ok) {
+            const priceData = await priceRes.json();
+            if (priceData.ok && (priceData.prices || priceData.changes || priceData.volumes)) {
+              allData.forEach(item => {
+                if (priceData.prices && priceData.prices[item.symbol] != null && priceData.prices[item.symbol] > 0)
+                  item.price = priceData.prices[item.symbol];
+                if (priceData.changes && priceData.changes[item.symbol] !== undefined && priceData.changes[item.symbol] !== null)
+                  item.change_pct = priceData.changes[item.symbol];
+                if (priceData.volumes && priceData.volumes[item.symbol] !== undefined)
+                  item.volume = priceData.volumes[item.symbol];
+              });
+              pricesOk = true;
+              renderTable(false);
+            }
+          }
+        } catch (e) {
+          console.warn("Price fetch failed, using cached/metrics prices:", e);
+        }
+        if (!pricesOk) {
+          // Keep metrics-derived prices; optionally show subtle banner
+          const banner = document.getElementById('explorePricesBanner');
+          if (banner) {
+            banner.textContent = 'Live prices temporarily unavailable. Showing last known.';
+            banner.style.display = 'block';
+          }
+        } else {
+          const banner = document.getElementById('explorePricesBanner');
+          if (banner) banner.style.display = 'none';
+        }
+      }
+
+      const sigBanner = document.getElementById('exploreSignalBanner');
+      if (sigBanner) {
+        sigBanner.style.display = relaxedSignal ? 'block' : 'none';
+      }
+
+    } catch (e) {
+      console.error("Screener fetch failed:", e);
+      const tbody = document.getElementById("screenerBody");
+      if (tbody && !append) {
+        let errorMsg = "Failed to load market data. ";
+        if (e.name === "AbortError") errorMsg += "Request timed out. ";
+        else errorMsg += (e.message || String(e)) + ". ";
+        errorMsg += "Retrying in 5s…";
+        tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${errorMsg}</td></tr>`;
+        setTimeout(() => loadScreener(false), 5000);
+      }
+    }
+  }
+
+  function renderTable(append = false) {
+    const tbody = document.getElementById("screenerBody");
+    if (!tbody) return;
+    
+    const searchQ = (document.getElementById('filter-search')?.value || '').trim().toUpperCase();
+    const filtered = allData.filter(item => {
+      const mt = (item.market_type || '').toLowerCase();
+      const isCrypto = mt === 'crypto' || (item.symbol && item.symbol.includes('/'));
+      if (currentFilter === 'crypto') if (!isCrypto) return false;
+      if (currentFilter === 'stocks') if (isCrypto) return false;
+      if (searchQ && (!item.symbol || !item.symbol.toUpperCase().includes(searchQ))) return false;
+      return true;
+    });
+
+    // Client-side sort when user clicked column
+    const key = currentSortCol;
+    const desc = currentSortDesc;
+    filtered.sort((a, b) => {
+      let va = key === 'symbol' ? (a.symbol || '') : (key === 'score' ? (a.score ?? 0) : (key === 'price' ? (a.price ?? 0) : (key === 'chg' ? (a.change_pct ?? 0) : (key === 'volume' ? (a.volume ?? 0) : 0))));
+      let vb = key === 'symbol' ? (b.symbol || '') : (key === 'score' ? (b.score ?? 0) : (key === 'price' ? (b.price ?? 0) : (key === 'chg' ? (b.change_pct ?? 0) : (key === 'volume' ? (b.volume ?? 0) : 0))));
+      if (key === 'symbol') return desc ? vb.localeCompare(va) : va.localeCompare(vb);
+      return desc ? (vb - va) : (va - vb);
+    });
+
+    if (filtered.length === 0) {
+      let msg = `No assets found for filter: ${currentFilter}`;
+      if (searchQ && allData.length > 0) {
+        msg = "No symbols match your search. Try a different term or clear the search box.";
+      } else if (currentFilter === "stocks") {
+        msg = "No stock recommendations available. This bot primarily supports crypto trading. Stock support may be limited.";
+      } else if (currentFilter === "crypto") {
+        msg = "No crypto recommendations available. Ensure the worker is running and scanning markets.";
+      } else if (allData.length === 0) {
+        msg = "No market data available. Ensure the worker is running and recommendations are being generated.";
+      }
+      if (!append) {
+        tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px; line-height:1.6">${msg}<br><small style="opacity:0.8">Try adjusting filters, lowering Min Score, or switching to "Buy + Watch"</small></td></tr>`;
+      }
+      return;
+    }
+
+    // If appending, append rows; otherwise replace (each item = main row + breakdown row)
+    if (append) {
+      const existingTr = tbody.querySelectorAll('tr').length;
+      const itemsPerRow = 2; // main + breakdown
+      const existingItems = Math.floor(existingTr / itemsPerRow);
+      const newRows = filtered.slice(existingItems).map(item => {
+        return createTableRow(item);
+      }).join('');
+      tbody.insertAdjacentHTML('beforeend', newRows);
+    } else {
+      tbody.innerHTML = filtered.map(item => {
+        return createTableRow(item);
+      }).join('');
+    }
+    
+    // Draw sparklines after table is rendered (use setTimeout to ensure DOM is ready)
+    setTimeout(() => {
+      filtered.forEach(item => {
+        const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
+        if (item.sparkline && item.sparkline.length > 0) {
+          const hasChange = item.change_pct !== null && item.change_pct !== undefined;
+          drawSparkline(rid, item.sparkline, hasChange ? item.change_pct >= 0 : true);
+        } else {
+          // Show placeholder if no sparkline data
+          const canvas = document.getElementById(rid);
+          if (canvas) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = 'rgba(148, 163, 184, 0.3)';
+            ctx.font = '10px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('No data', canvas.width / 2, canvas.height / 2);
+          }
+        }
+      });
+    }, 100);
+  }
+  
+  function createTableRow(item) {
+    const hasChange = item.change_pct !== null && item.change_pct !== undefined;
+    const isUp = hasChange ? item.change_pct >= 0 : true;
+    const colorClass = hasChange ? (isUp ? 'price-up' : 'price-down') : 'price-na';
+    const sign = hasChange && isUp ? '+' : '';
+    const ratingClass = 'rating-' + (item.rating || 'Neutral').toLowerCase().replace(' ', '-');
+    const hasPrice = item.price !== null && item.price !== undefined && item.price > 0;
+    const price = hasPrice ? ((item.price || 0) < 10 ? (item.price || 0).toFixed(4) : (item.price || 0).toFixed(2)) : '—';
+    const chg = (hasPrice && hasChange) ? ((item.price || 0) * ((item.change_pct || 0) / 100)).toFixed(2) : '—';
+    const isCrypto = item.market_type === 'crypto' || item.symbol.includes('/');
+    const typeLabel = isCrypto ? 'CRYPTO' : 'STOCK';
+    const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
+    const regime = item.regime_1d || item.regime_4h || '';
+    const reasons = (item.reasons || []).concat(item.risk_flags || []);
+    const tooltip = reasons.length ? `${(item.rating || 'Neutral')} (${item.score ?? '—'}) | ${reasons.join(' • ')}` : `${item.rating || 'Neutral'} | Score: ${item.score ?? '—'}`;
+    const score = item.score ?? 0;
+    const scoreClass = score >= 70 ? 'score-high' : (score >= 50 ? 'score-mid' : 'score-low');
+    
+    return `
+      <tr onclick="openBotModal('${item.symbol}')" style="cursor:pointer">
+        <td class="symbol-cell">
+          <div class="symbol-icon">${item.symbol.substring(0, 1)}</div>
+          <div class="symbol-info">
+            <span class="symbol-ticker">${item.symbol}</span>
+            <span class="symbol-name">${typeLabel} • ${item.recommended_strategy || 'DCA'}</span>
+          </div>
+        </td>
+        <td class="right ${colorClass}" style="font-weight:500">${price}</td>
+        <td class="right ${colorClass}">${hasChange ? `${sign}${(item.change_pct || 0).toFixed(2)}%` : '—'}</td>
+        <td class="right ${colorClass}">${hasChange ? `${sign}${chg}` : '—'}</td>
+        <td class="center" onclick="event.stopPropagation()">
+          <div style="display:flex; align-items:center; justify-content:center; gap:6px; flex-wrap:wrap;">
+            <button onclick="openBotModal('${(item.symbol || '').replace(/'/g, "\\'")}'); event.stopPropagation();" style="padding:4px 10px; background:#089981; border:none; border-radius:6px; color:#fff; font-size:11px; font-weight:600; cursor:pointer;" title="Create bot from recommendation">Trade</button>
+            <span class="expand-icon" onclick="toggleScoreBreakdown('${(item.symbol || '').replace(/'/g, "\\'")}', event)" title="Show score breakdown">&#9432;</span>
+            <span class="score-badge ${scoreClass}" title="Score">${score}</span>
+            <span class="rating-badge ${ratingClass}" title="${(tooltip || '').replace(/"/g, '&quot;')}">${item.rating || 'Neutral'}</span>
+          </div>
+        </td>
+        <td class="right">${formatNumber(item.volume)}</td>
+        <td class="right">${formatNumber(item.market_cap)}</td>
+        <td style="padding:0 10px" onclick="event.stopPropagation()">
+          <canvas id="${rid}" class="sparkline" width="100" height="30"></canvas>
+        </td>
+        <td onclick="event.stopPropagation()">
+          <div style="font-size:11px; color:var(--text-secondary);">
+            ${item.suggested_strategy || item.recommended_strategy || 'DCA'}
+          </div>
+          ${regime ? `<div style="font-size:10px; color:var(--text-secondary); opacity:0.8;">${regime}</div>` : ''}
+        </td>
+      </tr>
+      <tr id="breakdown-${(item.symbol || '').replace(/[^a-zA-Z0-9]/g, '_')}" class="breakdown-row" style="display:none">
+        <td colspan="9" class="breakdown-cell">
+          <div class="breakdown-section">
+            <div class="breakdown-label">Score breakdown — ${item.symbol}</div>
+            <div class="breakdown-items">
+              <strong>Score:</strong> ${score} &nbsp;|&nbsp; <strong>Rating:</strong> ${item.rating || 'Neutral'} &nbsp;|&nbsp; <strong>Strategy:</strong> ${item.recommended_strategy || item.suggested_strategy || 'DCA'} ${item.volatility != null ? ' | Vol: ' + (typeof item.volatility === 'number' ? (item.volatility * 100).toFixed(2) + '%' : item.volatility) : ''}
+            </div>
+          </div>
+          ${(item.reasons || []).length ? `<div class="breakdown-section"><div class="breakdown-label">Reasons</div><div class="breakdown-items"><ul>${(item.reasons || []).map(r => '<li>' + (r || '').replace(/</g, '&lt;') + '</li>').join('')}</ul></div></div>` : ''}
+          ${(item.risk_flags || []).length ? `<div class="breakdown-section"><div class="breakdown-label">Risk flags</div><div class="breakdown-items"><ul>${(item.risk_flags || []).map(f => '<li style="color:#c9a227">' + (f || '').replace(/</g, '&lt;') + '</li>').join('')}</ul></div></div>` : ''}
+        </td>
+      </tr>
+    `;
+  }
+
+  function showChart(symbol) {
+    openBotModal(symbol);
+  }
+
+  function drawSparkline(id, data, isUp) {
+    const canvas = document.getElementById(id);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    const min = Math.min(...data);
+    const max = Math.max(...data);
+    const range = max - min || 1;
+    const color = isUp ? '#089981' : '#f23645';
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+
+    data.forEach((val, i) => {
+      const x = (i / (data.length - 1)) * w;
+      const y = h - ((val - min) / range) * (h - 4) - 2;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  function formatNumber(num) {
+    if (!num) return "—";
+    if (num >= 1e9) return (num / 1e9).toFixed(2) + "B";
+    if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
+    if (num >= 1e3) return (num / 1e3).toFixed(2) + "K";
+    return num.toFixed(0);
+  }
+
+  function exportToCsv(e) {
+    e.stopPropagation();
+    const searchQ = (document.getElementById('filter-search')?.value || '').trim().toUpperCase();
+    const filtered = allData.filter(item => {
+      const mt = (item.market_type || '').toLowerCase();
+      const isCrypto = mt === 'crypto' || (item.symbol && item.symbol.includes('/'));
+      if (currentFilter === 'crypto' && !isCrypto) return false;
+      if (currentFilter === 'stocks' && isCrypto) return false;
+      if (searchQ && (!item.symbol || !item.symbol.toUpperCase().includes(searchQ))) return false;
+      return true;
+    });
+    if (filtered.length === 0) { alert('No data to export.'); return; }
+    const headers = ['Symbol', 'Market Type', 'Price', 'Chg %', 'Volume', 'Market Cap', 'Score', 'Rating', 'Strategy', 'Regime', 'Reasons', 'Risk Flags'];
+    const rows = filtered.map(item => {
+      const reasons = (item.reasons || []).join('; ');
+      const flags = (item.risk_flags || []).join('; ');
+      const hasChange = item.change_pct != null;
+      const chg = hasChange ? (item.change_pct || 0).toFixed(2) : '';
+      const price = (item.price != null && item.price > 0) ? String(item.price) : '';
+      return [
+        item.symbol || '',
+        item.market_type || '',
+        price,
+        chg,
+        item.volume != null ? String(item.volume) : '',
+        item.market_cap != null ? String(item.market_cap) : '',
+        item.score != null ? String(item.score) : '',
+        item.rating || '',
+        item.recommended_strategy || item.suggested_strategy || '',
+        (item.regime_1d || item.regime_4h || '').replace(/,/g, ';'),
+        '"' + (reasons || '').replace(/"/g, '""') + '"',
+        '"' + (flags || '').replace(/"/g, '""') + '"'
+      ].join(',');
+    });
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'explore_recommendations_' + new Date().toISOString().slice(0,10) + '.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function toggleScoreBreakdown(symbol, e) {
+    e.stopPropagation();
+    const row = document.getElementById('breakdown-' + symbol.replace(/[^a-zA-Z0-9]/g, '_'));
+    if (!row) return;
+    const isShown = row.style.display !== 'none';
+    document.querySelectorAll('[id^="breakdown-"]').forEach(el => el.style.display = 'none');
+    row.style.display = isShown ? 'none' : 'table-row';
+  }
+
+  // Initial load: restore saved prefs then apply
+  loadFilterPrefs();
+  applyFilters();
+</script>
+{% endblock %}

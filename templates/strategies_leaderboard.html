@@ -1,0 +1,77 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Strategy Leaderboard</div>
+      <div class="muted">Compare strategies by win rate, profit factor, drawdown, Sharpe</div>
+    </div>
+    <div class="row gap-8">
+      <select id="windowSelect" onchange="loadLeaderboard()" style="padding:8px 14px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:14px;">
+        <option value="30">Last 30 days</option>
+        <option value="90" selected>Last 90 days</option>
+        <option value="180">Last 180 days</option>
+      </select>
+      <button class="btn" onclick="loadLeaderboard()">Refresh</button>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Performance by Strategy</div>
+      <div class="muted">Sorted by composite score (win rate + profit factor + drawdown + Sharpe)</div>
+    </div>
+    <div id="leaderboardBody" style="padding:20px; text-align:center; color:var(--text-secondary);">
+      Loading…
+    </div>
+  </div>
+</div>
+
+<script>
+  async function loadLeaderboard() {
+    const el = document.getElementById('leaderboardBody');
+    el.innerHTML = 'Loading…';
+    const windowDays = parseInt(document.getElementById('windowSelect').value) || 90;
+    try {
+      const res = await fetch(`/api/strategies/leaderboard?window_days=${windowDays}`);
+      const data = await res.json();
+      if (!data.ok || !data.strategies) {
+        el.innerHTML = '<div class="muted">No strategy data yet. Run some bots and close deals to build history.</div>';
+        return;
+      }
+      const rows = data.strategies;
+      if (rows.length === 0) {
+        el.innerHTML = '<div class="muted">No trades recorded in the selected window. Strategy stats appear after closed deals.</div>';
+        return;
+      }
+      let html = '<table class="tv-table"><thead><tr>';
+      html += '<th>Strategy</th><th class="right">Trades</th><th class="right">Win Rate %</th><th class="right">Profit Factor</th>';
+      html += '<th class="right">Total PnL</th><th class="right">Max DD</th><th class="right">Sharpe</th><th class="right">Score</th></tr></thead><tbody>';
+      rows.forEach(r => {
+        const pnlClass = (r.total_pnl || 0) > 0 ? 'pos' : (r.total_pnl || 0) < 0 ? 'neg' : 'muted';
+        html += `<tr>
+          <td><strong>${escapeHtml(r.strategy || 'unknown')}</strong></td>
+          <td class="right">${r.trades || 0}</td>
+          <td class="right">${(r.win_rate || 0).toFixed(1)}%</td>
+          <td class="right">${(r.profit_factor || 0).toFixed(2)}</td>
+          <td class="right ${pnlClass}">${(r.total_pnl || 0).toFixed(2)}</td>
+          <td class="right">${(r.max_drawdown || 0).toFixed(2)}</td>
+          <td class="right">${(r.sharpe_approx || 0).toFixed(2)}</td>
+          <td class="right"><span class="tag tag-pos">${(r.score || 0).toFixed(0)}</span></td>
+        </tr>`;
+      });
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    } catch (e) {
+      el.innerHTML = '<div class="muted">Failed to load: ' + (e.message || String(e)) + '</div>';
+    }
+  }
+  function escapeHtml(s) {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+  loadLeaderboard();
+</script>
+{% endblock %}

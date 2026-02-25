@@ -1,0 +1,30 @@
+{
+  "workbench.colorTheme": "Default Light+",
+  "files.watcherExclude": {
+    "**/venv/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/node_modules/**": true,
+    "**/.git/**": true,
+    "**/data/**": true,
+    "**/logs/**": true,
+    "**/.cache/**": true
+  },
+  "search.exclude": {
+    "**/venv/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/node_modules/**": true,
+    "**/.git/**": true,
+    "**/data/**": true,
+    "**/logs/**": true,
+    "**/.cache/**": true
+  },
+  "python.envFile": "${workspaceFolder}/.env",
+  "files.associations": {
+    ".env": "properties",
+    ".env.*": "properties"
+  },
+  "python.terminal.activateEnvironment": true,
+  "python.terminal.activateEnvInCurrentTerminal": true
+}

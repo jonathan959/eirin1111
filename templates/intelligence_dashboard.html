@@ -1,0 +1,374 @@
+{% extends "layout.html" %}
+
+{% block title %}Explore Market{% endblock %}
+
+{% block content %}
+<style>
+  /* TradingView-like Dark Theme overrides */
+  :root {
+    --bg-dark: #131722;
+    --bg-card: #1e222d;
+    --text-primary: #d1d4dc;
+    --text-secondary: #787b86;
+    --border-color: #2a2e39;
+    --color-up: #089981;
+    --color-down: #f23645;
+    --color-rating-buy: #089981;
+    --color-rating-sell: #f23645;
+    --color-rating-neutral: #787b86;
+  }
+
+  body {
+    background-color: var(--bg-dark) !important;
+    color: var(--text-primary) !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+  }
+
+  .screener-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 1px;
+  }
+
+  .screener-title {
+    font-size: 20px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .market-status {
+    font-size: 13px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .market-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-up);
+  }
+
+  .filters-bar {
+    display: flex;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    overflow-x: auto;
+  }
+
+  .pill {
+    padding: 6px 12px;
+    border-radius: 12px;
+    background: #2a2e39;
+    color: var(--text-secondary);
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+
+  .pill:hover,
+  .pill.active {
+    background: #363a45;
+    color: var(--text-primary);
+  }
+
+  .screener-table-container {
+    background: var(--bg-card);
+    overflow-x: auto;
+    min-height: 80vh;
+  }
+
+  .tv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  .tv-table th {
+    text-align: left;
+    padding: 12px;
+    color: var(--text-secondary);
+    font-weight: normal;
+    border-bottom: 1px solid var(--border-color);
+    position: sticky;
+    top: 0;
+    background: var(--bg-card);
+    z-index: 10;
+    cursor: pointer;
+  }
+
+  .tv-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-primary);
+    vertical-align: middle;
+  }
+
+  .tv-table tr:hover td {
+    background-color: #2a2e39;
+  }
+
+  .symbol-cell {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .symbol-icon {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #363a45;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: bold;
+    color: var(--text-primary);
+  }
+
+  .symbol-info {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .symbol-ticker {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .symbol-name {
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .price-up {
+    color: var(--color-up);
+  }
+
+  .price-down {
+    color: var(--color-down);
+  }
+
+  .rating-badge {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+
+  .rating-strong-buy {
+    color: var(--color-rating-buy);
+  }
+
+  .rating-buy {
+    color: var(--color-rating-buy);
+    opacity: 0.8;
+  }
+
+  .rating-neutral {
+    color: var(--color-rating-neutral);
+  }
+
+  .rating-sell {
+    color: var(--color-rating-sell);
+    opacity: 0.8;
+  }
+
+  .rating-strong-sell {
+    color: var(--color-rating-sell);
+  }
+
+  /* Sparkline canvas */
+  .sparkline {
+    width: 100px;
+    height: 30px;
+    display: block;
+  }
+</style>
+
+<div class="screener-header">
+  <div class="screener-title">
+    Explore <span style="font-weight:400; color:var(--text-secondary)">Market Screener</span>
+  </div>
+  <div class="market-status">
+    <div class="market-dot"></div> Market Open
+  </div>
+</div>
+
+<div class="filters-bar">
+  <div class="pill active" onclick="setFilter('all')">All Assets</div>
+  <div class="pill" onclick="setFilter('crypto')">Crypto</div>
+  <div class="pill" onclick="setFilter('stocks')">Stocks</div>
+  <div class="pill" onclick="setFilter('strong_buy')">Strong Buy</div>
+  <div class="pill" onclick="setFilter('high_vol')">High Volatility</div>
+</div>
+
+<div class="screener-table-container">
+  <table class="tv-table">
+    <thead>
+      <tr>
+        <th width="250">Symbol</th>
+        <th width="100" class="right">Last</th>
+        <th width="80" class="right">Chg %</th>
+        <th width="80" class="right">Chg</th>
+        <th width="120" class="center">Rating</th>
+        <th width="100" class="right">Vol</th>
+        <th width="120" class="right">Mkt Cap</th>
+        <th width="150">7d Trend</th>
+        <th>Sector / Strategy</th>
+      </tr>
+    </thead>
+    <tbody id="screenerBody">
+      <tr>
+        <td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary)">Loading market data...</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+  let allData = [];
+  let currentFilter = 'all';
+
+  async function loadScreener() {
+    try {
+      // We combine both short/long horizons to get max coverage
+      // In a real app we might need a dedicated screener endpoint
+      const [resS, resL] = await Promise.all([
+        fetch("/api/recommendations?horizon=short&include_all=1&limit=50"),
+        fetch("/api/recommendations?horizon=long&include_all=1&limit=50")
+      ]);
+
+      const dataS = await resS.json();
+      const dataL = await resL.json();
+
+      // De-duplicate by symbol
+      const map = new Map();
+      [...(dataS.items || []), ...(dataL.items || [])].forEach(item => {
+        if (!map.has(item.symbol) || item.score > map.get(item.symbol).score) {
+          map.set(item.symbol, item);
+        }
+      });
+
+      allData = Array.from(map.values());
+      renderTable();
+
+    } catch (e) {
+      console.error("Screener fetch failed:", e);
+    }
+  }
+
+  function renderTable() {
+    const tbody = document.getElementById("screenerBody");
+    const filtered = allData.filter(item => {
+      if (currentFilter === 'strong_buy') return item.rating === 'Strong Buy';
+      if (currentFilter === 'high_vol') return item.volatility > 0.05;
+      if (currentFilter === 'crypto') return item.symbol.includes('/'); // simple check
+      if (currentFilter === 'stocks') return !item.symbol.includes('/');
+      return true;
+    });
+
+    // Sort by Score descending
+    filtered.sort((a, b) => b.score - a.score);
+
+    tbody.innerHTML = filtered.map(item => {
+      const isUp = item.change_pct >= 0;
+      const colorClass = isUp ? 'price-up' : 'price-down';
+      const sign = isUp ? '+' : '';
+      const ratingClass = 'rating-' + item.rating.toLowerCase().replace(' ', '-');
+      const price = item.price < 10 ? item.price.toFixed(4) : item.price.toFixed(2);
+      const chg = (item.price * (item.change_pct / 100)).toFixed(2);
+
+      // Sparkline ID
+      const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
+
+      return `
+      <tr>
+        <td class="symbol-cell">
+          <div class="symbol-icon">${item.symbol.substring(0, 1)}</div>
+          <div class="symbol-info">
+            <span class="symbol-ticker">${item.symbol}</span>
+            <span class="symbol-name">Market Data</span>
+          </div>
+        </td>
+        <td class="right ${colorClass}" style="font-weight:500">${price}</td>
+        <td class="right ${colorClass}">${sign}${item.change_pct.toFixed(2)}%</td>
+        <td class="right ${colorClass}">${sign}${chg}</td>
+        <td class="center">
+          <span class="rating-badge ${ratingClass}">${item.rating}</span>
+        </td>
+        <td class="right">${formatNumber(item.volume)}</td>
+        <td class="right">${formatNumber(item.market_cap)}</td>
+        <td style="padding:0 10px">
+          <canvas id="${rid}" class="sparkline" width="100" height="30"></canvas>
+        </td>
+        <td class="muted">${item.suggested_strategy || 'Unknown'}</td>
+      </tr>
+    `;
+    }).join("");
+
+    // Draw sparklines
+    filtered.forEach(item => {
+      if (item.sparkline && item.sparkline.length > 0) {
+        const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
+        drawSparkline(rid, item.sparkline, item.change_pct >= 0);
+      }
+    });
+  }
+
+  function drawSparkline(id, data, isUp) {
+    const canvas = document.getElementById(id);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+
+    const min = Math.min(...data);
+    const max = Math.max(...data);
+    const range = max - min || 1;
+    const color = isUp ? '#089981' : '#f23645';
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+
+    data.forEach((val, i) => {
+      const x = (i / (data.length - 1)) * w;
+      const y = h - ((val - min) / range) * (h - 4) - 2; // padding
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  function formatNumber(num) {
+    if (!num) return "—";
+    if (num >= 1e9) return (num / 1e9).toFixed(2) + "B";
+    if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
+    if (num >= 1e3) return (num / 1e3).toFixed(2) + "K";
+    return num.toFixed(0);
+  }
+
+  function setFilter(f) {
+    currentFilter = f;
+    document.querySelectorAll('.pill').forEach(el => el.classList.remove('active'));
+    event.target.classList.add('active');
+    renderTable();
+  }
+
+  loadScreener();
+  setInterval(loadScreener, 30000); // refresh every 30s
+</script>
+{% endblock %}

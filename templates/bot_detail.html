@@ -1,0 +1,209 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">{{ bot.name }}</div>
+      <div class="muted mono">{{ bot.symbol }} • Bot ID {{ bot.id }}</div>
+    </div>
+    <div class="row gap-8 row-wrap row-end">
+      <form action="/bots/{{ bot.id }}/start" method="post">
+        <button class="btn btn-purple">Start</button>
+      </form>
+      <form action="/bots/{{ bot.id }}/stop" method="post">
+        <button class="btn">Stop</button>
+      </form>
+      <form action="/bots/{{ bot.id }}/delete" method="post">
+        <button class="btn btn-neg">Delete</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="grid bot-layout section">
+    <div class="bot-main">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="h2">Price Chart</div>
+            <div class="muted">Auto-refresh</div>
+          </div>
+        </div>
+        <canvas id="priceChart" height="140"></canvas>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Settings</div>
+            <div class="muted">Update bot configuration</div>
+          </div>
+        </div>
+        <form action="/bots/{{ bot.id }}/update" method="post" class="grid grid-2">
+          <div>
+            <div class="label">Name</div>
+            <input name="name" value="{{ bot.name }}" class="input" />
+          </div>
+          <div>
+            <div class="label">Symbol (USD pairs)</div>
+            <select name="symbol" class="input">
+              {% for s in symbols %}
+                <option value="{{ s }}" {% if s==bot.symbol %}selected{% endif %}>{{ s }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div>
+            <div class="label">Base (quote)</div>
+            <input name="base_quote" value="{{ bot.base_quote }}" class="input" />
+          </div>
+          <div>
+            <div class="label">Safety (quote)</div>
+            <input name="safety_quote" value="{{ bot.safety_quote }}" class="input" />
+          </div>
+
+          <div>
+            <div class="label">Max safety</div>
+            <input name="max_safety" value="{{ bot.max_safety }}" class="input" />
+          </div>
+          <div>
+            <div class="label">Max spend (quote)</div>
+            <input name="max_spend_quote" value="{{ bot.max_spend_quote }}" class="input" />
+          </div>
+
+          <div>
+            <div class="label">1st deviation</div>
+            <input name="first_dev" value="{{ bot.first_dev }}" class="input" />
+          </div>
+          <div>
+            <div class="label">Step multiplier</div>
+            <input name="step_mult" value="{{ bot.step_mult }}" class="input" />
+          </div>
+
+          <div>
+            <div class="label">Take profit</div>
+            <input name="tp" value="{{ bot.tp }}" class="input" />
+          </div>
+          <div>
+            <div class="label">Poll seconds</div>
+            <input name="poll_seconds" value="{{ bot.poll_seconds }}" class="input" />
+          </div>
+
+          <div class="row gap-8">
+            <input type="checkbox" name="dry_run" {% if bot.dry_run %}checked{% endif %} />
+            <span class="muted">Dry run</span>
+          </div>
+          <div class="row gap-8">
+            <input type="checkbox" name="trend_filter" {% if bot.trend_filter %}checked{% endif %} />
+            <span class="muted">Trend filter</span>
+          </div>
+
+          <div>
+            <div class="label">Trend SMA</div>
+            <input name="trend_sma" value="{{ bot.trend_sma }}" class="input" />
+          </div>
+          <div class="row row-end items-end">
+            <button class="btn btn-purple">Save Settings</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Logs</div>
+            <div class="muted">Recent activity</div>
+          </div>
+        </div>
+        <div class="logbox">
+          {% for l in logs %}
+            <div class="log-line">
+              <div class="muted">{{ l.ts }} • {{ l.level }}</div>
+              <div>{{ l.message }}</div>
+            </div>
+          {% endfor %}
+          {% if logs|length == 0 %}
+            <div class="log-line log-muted">(no logs)</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="bot-side">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="h2">Live Snapshot</div>
+            <div class="muted">Current runtime state</div>
+          </div>
+        </div>
+        <div class="grid gap-8">
+          <div class="card-label">Running</div>
+          <div class="mono">{{ snap.running }}</div>
+          <div class="card-label">Last price</div>
+          <div class="mono">{{ snap.last_price }}</div>
+          <div class="card-label">Avg entry</div>
+          <div class="mono">{{ snap.avg_entry }}</div>
+          <div class="card-label">Position (base)</div>
+          <div class="mono">{{ snap.base_pos }}</div>
+          <div class="card-label">Safeties used</div>
+          <div class="mono">{{ snap.safety_used }}</div>
+          <div class="card-label">TP price</div>
+          <div class="mono">{{ snap.tp_price }}</div>
+        </div>
+        <div class="card-sub muted mt-10">Last event</div>
+        <div class="mono">{{ snap.last_event }}</div>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Safety Notes</div>
+            <div class="muted">Operational tips</div>
+          </div>
+        </div>
+        <div class="muted">
+          Keep withdrawals OFF on Kraken API. Use Dry run when changing settings.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let chart;
+
+async function refreshChart() {
+  const res = await fetch(`/api/bots/{{ bot.id }}/chart?timeframe=5m&limit=120`);
+  const data = await res.json();
+  const ohlcv = data.ohlcv || [];
+  const labels = ohlcv.map(x => new Date(x[0]).toLocaleTimeString());
+  const closes = ohlcv.map(x => x[4]);
+
+  const ctx = document.getElementById("priceChart").getContext("2d");
+  if (chart) chart.destroy();
+
+  chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: data.symbol,
+        data: closes,
+        tension: 0.2
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: "#94a3b8" } } },
+      scales: {
+        x: { ticks: { color: "#94a3b8" } },
+        y: { ticks: { color: "#94a3b8" } }
+      }
+    }
+  });
+}
+
+refreshChart();
+setInterval(refreshChart, 15000);
+</script>
+{% endblock %}

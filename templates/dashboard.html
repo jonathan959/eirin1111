@@ -1,0 +1,452 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+
+  <div class="page-head">
+    <div>
+      <div class="h1">Dashboard</div>
+      <div class="muted">Portfolio overview + bots</div>
+
+      {% if not kraken_ready %}
+        <div class="muted mt-6">
+          <span class="tag tag-neg">Kraken not ready</span>
+          <span class="mono text-xs">{{ kraken_error }}</span>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="row gap-8 row-wrap row-end">
+      <span class="tag">Live UI</span>
+      <a class="btn btn-purple" href="/bots">Open Bots</a>
+    </div>
+  </div>
+
+  <!-- Top stats -->
+  <div class="grid grid-3">
+    <div class="card card-stat">
+      <div class="card-label">Portfolio value</div>
+      <div class="card-value" id="portValue">
+        ${{ "%.2f"|format(portfolio.total_usd) }}
+      </div>
+      <div class="card-sub muted" id="portSub">
+        {% if portfolio.error %}
+          Kraken error: {{ portfolio.error }}
+        {% else %}
+          Estimated from balances
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card card-stat">
+      <div class="card-label">Today PnL</div>
+      {% set today_pct = (pnl.today / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
+      <div class="card-value {% if pnl.today >= 0 %}pos{% else %}neg{% endif %}" id="pnlToday">
+        {{ "%.2f"|format(pnl.today) }} USD
+      </div>
+      <div class="card-sub">
+        <span class="tag {% if pnl.today >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTodayPct">
+          {% if pnl.today >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(today_pct) }}%
+        </span>
+        <span class="muted">since midnight</span>
+      </div>
+    </div>
+
+    <div class="card card-stat">
+      <div class="card-label">Total realized PnL</div>
+      {% set total_pct = (pnl.total / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
+      <div class="card-value {% if pnl.total >= 0 %}pos{% else %}neg{% endif %}" id="pnlTotal">
+        {{ "%.2f"|format(pnl.total) }} USD
+      </div>
+      <div class="card-sub">
+        <span class="tag {% if pnl.total >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTotalPct">
+          {% if pnl.total >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(total_pct) }}%
+        </span>
+        <span class="muted">realized only</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Now opportunities radar -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Now opportunities (radar)</div>
+        <div class="muted">Best stock &amp; crypto ideas right now from your intelligence layer.</div>
+      </div>
+      <div class="row gap-8">
+        <button class="btn btn-secondary" type="button" onclick="refreshNowOpps()">Refresh</button>
+      </div>
+    </div>
+    <div class="row gap-8 row-wrap" style="margin-bottom: 8px;">
+      <div class="chip-group">
+        <button class="chip chip-active" id="nowFilterAll" onclick="setNowFilter('both')">All</button>
+        <button class="chip" id="nowFilterStocks" onclick="setNowFilter('stocks')">Stocks</button>
+        <button class="chip" id="nowFilterCrypto" onclick="setNowFilter('crypto')">Crypto</button>
+      </div>
+      <div class="muted" id="nowConfigInfo"></div>
+    </div>
+    <div id="nowOppsBody">
+      <div class="muted">Loading opportunities...</div>
+    </div>
+  </div>
+
+  <!-- Account summary -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Account summary</div>
+        <div class="muted">Balance, free, locked, positions</div>
+      </div>
+    </div>
+    {% set exposure_pct = (portfolio.positions_usd / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
+    <div class="grid grid-3">
+      <div>
+        <div class="card-label">Total balance</div>
+        <div class="card-value">${{ "%.2f"|format(portfolio.total_usd or 0) }}</div>
+      </div>
+      <div>
+        <div class="card-label">Free balance</div>
+        <div class="card-value">${{ "%.2f"|format(portfolio.free_usd or 0) }}</div>
+      </div>
+      <div>
+        <div class="card-label">Locked funds</div>
+        <div class="card-value">${{ "%.2f"|format(portfolio.used_usd or 0) }}</div>
+      </div>
+      <div>
+        <div class="card-label">Positions value</div>
+        <div class="card-value">${{ "%.2f"|format(portfolio.positions_usd or 0) }}</div>
+      </div>
+      <div>
+        <div class="card-label">Exposure ratio</div>
+        <div class="card-value">{{ "%.1f"|format(exposure_pct) }}%</div>
+      </div>
+      <div>
+        <div class="card-label">Circuit breaker</div>
+        {% if pause_state %}
+          <div class="card-value tag tag-neg">Paused</div>
+          <div class="muted text-xs mt-6">Until {{ pause_until }}</div>
+        {% else %}
+          <div class="card-value tag">Active</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Holdings -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Holdings</div>
+        <div class="muted">Assets detected in your Kraken balance</div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th class="right">Total</th>
+            <th class="right">Free</th>
+            <th class="right">Locked</th>
+            <th class="right">USD value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for h in portfolio.holdings %}
+          <tr>
+            <td class="mono">{{ h.asset }}</td>
+            <td class="right mono">
+              {{ "%.8f"|format(h.amount) if h.amount < 1000 else "%.2f"|format(h.amount) }}
+            </td>
+            <td class="right mono">
+              {% if h.free is defined and h.free is not none %}
+                {{ "%.8f"|format(h.free) if h.free < 1000 else "%.2f"|format(h.free) }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="right mono">
+              {% if h.used is defined and h.used is not none %}
+                {{ "%.8f"|format(h.used) if h.used < 1000 else "%.2f"|format(h.used) }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="right mono">
+              {% if h.usd_value is not none %}
+                ${{ "%.2f"|format(h.usd_value) }}
+              {% else %}
+                <span class="muted">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if portfolio.holdings|length == 0 %}
+          <tr>
+            <td colspan="5" class="muted">No holdings found (or Kraken API error).</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Performance by strategy/regime -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Performance by strategy/regime</div>
+        <div class="muted">Closed deals grouped by entry conditions.</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Regime</th>
+            <th class="right">Deals</th>
+            <th class="right">Realized PnL</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if perf_by_strat_regime and perf_by_strat_regime|length > 0 %}
+            {% for key, stats in perf_by_strat_regime.items() %}
+              <tr>
+                <td class="mono">{{ key[0] }}</td>
+                <td class="mono">{{ key[1] }}</td>
+                <td class="right mono">{{ stats.count }}</td>
+                <td class="right mono">{{ "%.2f"|format(stats.pnl) }}</td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr><td colspan="4" class="muted">No closed deal stats yet.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Bots -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Bots</div>
+        <div class="muted">Open bots and control them from the Bots page</div>
+      </div>
+      <a class="btn btn-purple" href="/bots">Open Bots</a>
+    </div>
+
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Symbol</th>
+            <th class="right">Mode</th>
+            <th class="right">State</th>
+            <th class="right">Strategy</th>
+            <th class="right">Regime</th>
+            <th class="right">Risk</th>
+            <th class="right">Enabled</th>
+            <th class="right">Open</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for b in bot_rows %}
+          <tr>
+            <td class="mono">{{ b.name }}</td>
+            <td class="mono">{{ b.symbol }}</td>
+            <td class="right">
+              {% if b.dry_run %}
+                <span class="tag">DRY</span>
+              {% else %}
+                <span class="tag tag-pos">LIVE</span>
+              {% endif %}
+            </td>
+            <td class="right">
+              {% if b.runtime and b.runtime.running %}
+                <span class="tag tag-pos">RUNNING</span>
+              {% else %}
+                <span class="tag tag-neg">STOPPED</span>
+              {% endif %}
+            </td>
+            <td class="right mono">{{ b.runtime.active_strategy if b.runtime else "—" }}</td>
+            <td class="right mono">
+              {% if b.runtime and b.runtime.regime_label %}
+                {{ b.runtime.regime_label }} ({{ (b.runtime.regime_confidence or 0) * 100 | round(0) }}%)
+              {% else %}
+                —
+              {% endif %}
+            </td>
+            <td class="right mono">{{ b.runtime.risk_state if b.runtime else "—" }}</td>
+            <td class="right">
+              {% if b.enabled %}
+                <span class="tag tag-pos">ON</span>
+              {% else %}
+                <span class="tag tag-neg">OFF</span>
+              {% endif %}
+            </td>
+            <td class="right">
+              <a class="btn" href="/bots/{{ b.id }}">View</a>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if bots|length == 0 %}
+          <tr>
+            <td colspan="9" class="muted">No bots yet.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  async function getJSON(url){
+    const r = await fetch(url);
+    const data = await r.json().catch(async () => {
+      const t = await r.text();
+      throw new Error(url + " -> " + r.status + " " + t);
+    });
+    if(!r.ok){
+      throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+    }
+    return data;
+  }
+
+  function formatPrice(v){
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    const n = Number(v);
+    return "$" + (n >= 100 ? n.toFixed(2) : n.toFixed(4));
+  }
+
+  const SYMBOL_NAMES = {
+    "XBT": "Bitcoin",
+    "BTC": "Bitcoin",
+    "ETH": "Ethereum",
+    "SOL": "Solana",
+    "ADA": "Cardano",
+    "XRP": "XRP",
+    "DOGE": "Dogecoin",
+    "AVAX": "Avalanche",
+    "LINK": "Chainlink",
+    "AIOZ": "AIOZ Network",
+    "ACX": "Across Protocol",
+  };
+
+  function formatSymbol(sym){
+    const parts = String(sym || "").split("/");
+    const base = parts[0] || sym;
+    const quote = parts[1] || "";
+    const name = SYMBOL_NAMES[base] || base;
+    const display = (quote === "USD") ? base : sym;
+    return { base, name, display };
+  }
+
+  let NOW_FILTER = "both";
+
+  function setNowFilter(f){
+    NOW_FILTER = f;
+    document.getElementById("nowFilterAll").classList.toggle("chip-active", f === "both");
+    document.getElementById("nowFilterStocks").classList.toggle("chip-active", f === "stocks");
+    document.getElementById("nowFilterCrypto").classList.toggle("chip-active", f === "crypto");
+    refreshNowOpps();
+  }
+
+  function renderNowOpps(items, cfg){
+    const body = document.getElementById("nowOppsBody");
+    const info = document.getElementById("nowConfigInfo");
+    if(!body) return;
+    info.textContent = items && items.length
+      ? `Min score ${cfg?.min_score || ""}, filter: ${cfg?.asset_filter || "both"}`
+      : "";
+    if(!items || !items.length){
+      body.innerHTML = '<div class="muted">No high-score opportunities right now. Explore or wait for the next scan.</div>';
+      return;
+    }
+    const rows = items.map(function(it){
+      const sym = formatSymbol(it.symbol);
+      const score = (it.score != null) ? Number(it.score).toFixed(1) : "—";
+      const market = (it.market_type || "").toString();
+      const reason = (it.reason || it.strategy || "").toString();
+      const horizon = (it.horizon || "").toUpperCase();
+      const badge = market === "stocks" ? "Stocks" : "Crypto";
+      return `
+        <div class="now-card">
+          <div class="row row-between row-wrap">
+            <div>
+              <div class="h3 mono">${sym.display}</div>
+              <div class="muted text-xs">${sym.name} • ${badge} • ${horizon}</div>
+            </div>
+            <div class="text-right">
+              <div class="card-label">Score</div>
+              <div class="card-value">${score}</div>
+            </div>
+          </div>
+          <div class="muted mt-6">${reason || "High conviction signal"}</div>
+          <div class="row gap-8 mt-8 row-wrap">
+            <button class="btn btn-purple" type="button" onclick="createNowBot('${encodeURIComponent(it.symbol)}', '${horizon}')">Open bot (dry)</button>
+            <a class="btn btn-secondary" href="/explore?symbol=${encodeURIComponent(it.symbol)}">View in Explore</a>
+          </div>
+        </div>
+      `;
+    }).join("");
+    body.innerHTML = rows;
+  }
+
+  async function refreshNowOpps(){
+    const body = document.getElementById("nowOppsBody");
+    if(!body) return;
+    body.innerHTML = '<div class="muted">Loading opportunities...</div>';
+    try{
+      const params = new URLSearchParams({ max_count: "3", asset_filter: NOW_FILTER });
+      const d = await getJSON("/api/opportunities/now?" + params.toString());
+      if(!d.ok){
+        body.innerHTML = '<div class="muted">Could not load opportunities: ' + (d.error || 'error') + '</div>';
+        return;
+      }
+      renderNowOpps(d.items || [], d.config || {});
+    }catch(e){
+      body.innerHTML = '<div class="muted">Error loading opportunities: ' + e.message + '</div>';
+    }
+  }
+
+  async function createNowBot(symbolEnc, horizon){
+    try{
+      const sym = decodeURIComponent(symbolEnc);
+      const payload = {
+        horizon: (horizon || "short").toLowerCase().startsWith("l") ? "long" : "short",
+        enabled: true,
+        dry_run: true,
+        auto_restart: true,
+        start_now: true,
+      };
+      const r = await fetch("/api/recommendations/" + encodeURIComponent(sym) + "/create_bot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json().catch(() => ({}));
+      if(!r.ok || !data.ok){
+        alert("Failed to create bot: " + (data.error || r.statusText));
+        return;
+      }
+      alert("Bot created from opportunity (ID " + data.bot_id + "). You can manage it from the Bots page.");
+    }catch(e){
+      alert("Error creating bot: " + e.message);
+    }
+  }
+
+  // Initial load
+  document.addEventListener("DOMContentLoaded", function(){
+    refreshNowOpps();
+  });
+
+</script>
+
+{% endblock %}

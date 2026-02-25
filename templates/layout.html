@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="{{ language or 'en' }}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#4f46e5" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>{% block title %}Eirin Bot{% endblock %}</title>
+  <link rel="icon" href="data:,">
+  {% if enable_pwa %}
+  <link rel="manifest" href="/static/manifest.json" />
+  {% endif %}
+
+  <script>
+    (function(){
+      try{
+        const def = "{{ default_theme or 'auto' }}";
+        const saved = localStorage.getItem("theme");
+        if(saved){ document.documentElement.setAttribute("data-theme", saved); }
+        else if(def && def !== "auto"){ document.documentElement.setAttribute("data-theme", def); }
+        else if(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches){ document.documentElement.setAttribute("data-theme", "dark"); }
+      }catch(_){}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/css/design-system.css" />
+  {% if enable_voice_alerts %}
+  <script src="/static/voice_alerts.js"></script>
+  {% endif %}
+
+  {% if enable_pwa %}
+  <script>
+    window.__ENABLE_PWA = true;
+    window.__DEFER_SW = true;
+  </script>
+  {% endif %}
+</head>
+
+<body>
+  <div class="app">
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <div class="brand-badge">EB</div>
+          <div class="brand-text">
+            <div class="brand-name">Eirin Bot</div>
+            <div class="brand-sub">Local trading dashboard</div>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <div class="sidebar-group">
+            <div class="sidebar-label">Main</div>
+            <a class="navlink navlink-vert" href="/dashboard">Dashboard</a>
+            <a class="navlink navlink-vert" href="/dca">DCA Dashboard</a>
+            <a class="navlink navlink-vert" href="/explore">Explore</a>
+          </div>
+          <div class="sidebar-group">
+            <div class="sidebar-label">Tools</div>
+            <a class="navlink navlink-vert" href="/strategies">Strategy Leaderboard</a>
+            <a class="navlink navlink-vert" href="/journal">Trade Journal</a>
+            <a class="navlink navlink-vert" href="/analytics">Analytics</a>
+            <a class="navlink navlink-vert" href="/scenario-simulator">Scenario Simulator</a>
+            <a class="navlink navlink-vert" href="/safety">Safety</a>
+            <a class="navlink navlink-vert" href="/bots">Bots</a>
+          </div>
+          <div class="sidebar-group">
+            <div class="sidebar-label">Autopilot</div>
+            <a class="navlink navlink-vert" href="/autopilot" title="Dashboard: run automation, manage positions">Autopilot</a>
+            <a class="navlink navlink-vert" href="/setup-autopilot" title="One-time setup: capital &amp; rules">Setup Autopilot</a>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button id="themeToggle" class="btn btn-ghost w-full" type="button" title="Toggle dark/light mode">☀️ Dark</button>
+          <select id="langSelect" class="input input-sm w-full" style="font-size:12px; padding:6px 8px;" title="Language">
+            <option value="en" {% if (language or 'en') == 'en' %}selected{% endif %}>English</option>
+            <option value="es" {% if (language or 'en') == 'es' %}selected{% endif %}>Español</option>
+            <option value="zh" {% if (language or 'en') == 'zh' %}selected{% endif %}>中文</option>
+            <option value="ko" {% if (language or 'en') == 'ko' %}selected{% endif %}>한국어</option>
+            <option value="ja" {% if (language or 'en') == 'ja' %}selected{% endif %}>日本語</option>
+          </select>
+          <div id="installPwaBanner" class="pwa-install-banner hidden">
+            <button id="installPwaBtn" class="btn btn-purple w-full">📲 Install App</button>
+          </div>
+          <div id="botSummary" class="status-pill w-full">Bots: —</div>
+          <button id="pauseAllBtn" class="btn btn-neg w-full">Pause all</button>
+          {% if request.state.user %}
+            <a class="navlink navlink-vert" href="/logout">Logout</a>
+          {% endif %}
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="container">
+          {% block content %}{% endblock %}
+        </div>
+        <footer class="footer">
+          <div class="footer-inner">
+            <div>Local UI • FastAPI</div>
+            <div>Tip: use <span class="kbd">CTRL</span> + <span class="kbd">R</span> if styles don’t update</div>
+          </div>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    window.__API_TOKEN = {{ (api_token or "") | tojson }};
+    (function(){
+      const _f = window.fetch;
+      window.fetch = function(u, o){
+        o = o || {};
+        o.headers = o.headers || {};
+        if (window.__API_TOKEN) o.headers["X-API-Key"] = window.__API_TOKEN;
+        return _f.call(this, u, o);
+      };
+    })();
+    function _authHeaders(opts){ opts=opts||{}; opts.headers=opts.headers||{}; if(window.__API_TOKEN)opts.headers["X-API-Key"]=window.__API_TOKEN; return opts; }
+    async function _getJSON(url, opts){
+      const r = await fetch(url, opts);
+      const data = await r.json().catch(async () => {
+        const t = await r.text();
+        throw new Error(url + " -> " + r.status + " " + t);
+      });
+      if(!r.ok){
+        throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+      }
+      return data;
+    }
+
+    async function refreshBotSummary(){
+      try{
+        // Add timeout protection
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        let data;
+        try {
+          const response = await fetch("/api/bots/summary", _authHeaders({ signal: controller.signal }));
+          clearTimeout(timeoutId);
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          data = await response.json();
+        } catch (err) {
+          clearTimeout(timeoutId);
+          if (err.name === "AbortError") {
+            console.warn("Bot summary fetch timed out");
+            return; // Keep existing summary
+          }
+          throw err;
+        }
+        const total = data.total || 0;
+        const running = data.running || 0;
+        const paused = !!data.paused;
+        const pill = document.getElementById("botSummary");
+        const btn = document.getElementById("pauseAllBtn");
+        if (pill){
+          pill.textContent = paused ? `Bots paused • ${running}/${total}` : `Bots running: ${running}/${total}`;
+          pill.classList.toggle("status-warn", paused);
+        }
+        if (btn){
+          btn.textContent = paused ? "Resume all" : "Pause all";
+        }
+      }catch(e){
+        console.warn("bot summary failed", e);
+      }
+    }
+
+    async function togglePause(){
+      try{
+        const status = await _getJSON("/api/pause");
+        const next = !status.paused;
+        await _getJSON("/api/pause", {
+          method:"POST",
+          headers: { "Content-Type":"application/json" },
+          body: JSON.stringify({paused: next})
+        });
+        refreshBotSummary();
+      }catch(e){
+        console.warn("pause toggle failed", e);
+      }
+    }
+
+    function updateThemeLabel(){
+      const btn = document.getElementById("themeToggle");
+      if(!btn) return;
+      const theme = document.documentElement.getAttribute("data-theme") || "light";
+      btn.textContent = theme === "dark" ? "🌙 Light" : "☀️ Dark";
+    }
+    async function toggleTheme(){
+      try{
+        const html = document.documentElement;
+        const current = html.getAttribute("data-theme") || "light";
+        const next = current === "dark" ? "light" : "dark";
+        html.setAttribute("data-theme", next);
+        localStorage.setItem("theme", next);
+        updateThemeLabel();
+        window.dispatchEvent(new Event("themechange"));
+      }catch(_){}
+    }
+    updateThemeLabel();
+
+    function updateLanguage(){
+      const sel = document.getElementById("langSelect");
+      if(!sel) return;
+      const lang = sel.value;
+      document.cookie = "lang=" + lang + "; path=/; max-age=31536000";
+      window.location.reload();
+    }
+    const langSel = document.getElementById("langSelect");
+    if(langSel) langSel.addEventListener("change", updateLanguage);
+
+    {% if enable_pwa %}
+    (function(){
+      let deferredPrompt;
+      window.addEventListener("beforeinstallprompt", function(e){
+        e.preventDefault();
+        deferredPrompt = e;
+        const banner = document.getElementById("installPwaBanner");
+        if(banner) banner.classList.remove("hidden");
+      });
+      document.getElementById("installPwaBtn")?.addEventListener("click", async function(){
+        if(!deferredPrompt) return;
+        deferredPrompt.prompt();
+        const {outcome} = await deferredPrompt.userChoice;
+        if(outcome === "accepted" && document.getElementById("installPwaBanner"))
+          document.getElementById("installPwaBanner").classList.add("hidden");
+      });
+      if("serviceWorker" in navigator && window.__ENABLE_PWA){
+        navigator.serviceWorker.register("/static/sw.js").catch(function(){});
+      }
+    })();
+    {% endif %}
+
+    {% if enable_voice_alerts %}
+    window.__ENABLE_VOICE_ALERTS = true;
+    {% endif %}
+
+    const pauseBtn = document.getElementById("pauseAllBtn");
+    if (pauseBtn) pauseBtn.addEventListener("click", togglePause);
+
+    const themeBtn = document.getElementById("themeToggle");
+    if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
+
+    refreshBotSummary();
+    setInterval(refreshBotSummary, 8000);
+  </script>
+</body>
+</html>

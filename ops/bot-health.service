@@ -1,0 +1,9 @@
+[Unit]
+Description=Bot Worker Health Watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/ubuntu/local_3comas_clone_v2
+ExecStart=/home/ubuntu/local_3comas_clone_v2/scripts/health_watchdog.sh

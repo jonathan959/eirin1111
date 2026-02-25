@@ -1,0 +1,36 @@
+[Unit]
+Description=Bot Worker API
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/local_3comas_clone_v2
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/home/ubuntu/local_3comas_clone_v2/.env
+
+# Keys check (never prints secrets):
+ExecStartPre=/bin/bash -c '/home/ubuntu/local_3comas_clone_v2/scripts/keys_check.sh /home/ubuntu/local_3comas_clone_v2 || true'
+
+# Fail-fast before starting:
+ExecStartPre=/home/ubuntu/local_3comas_clone_v2/venv/bin/python /home/ubuntu/local_3comas_clone_v2/scripts/preflight.py
+
+# Prevent port conflicts (kill old listener on 9001 if stuck):
+ExecStartPre=/bin/bash -c 'fuser -k 9001/tcp 2>/dev/null || true'
+
+ExecStart=/home/ubuntu/local_3comas_clone_v2/venv/bin/python worker.py
+
+Restart=always
+RestartSec=3
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,134 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Safety</div>
+      <div class="muted">Global risk controls, kill switch, and live-trading checklist.</div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="h2" style="margin-bottom: 12px;">Live trading checklist</div>
+    <div id="liveChecklist" class="muted">Loading…</div>
+    <ul id="blockingList" style="margin-top: 8px; color: var(--danger); list-style: disc; padding-left: 20px;"></ul>
+  </div>
+
+  <div class="card section">
+    <div class="h2" style="margin-bottom: 8px;">Notifications</div>
+    <div class="muted" style="margin-bottom: 8px;">Notify when autopilot opens or closes a position (Discord). Set DISCORD_WEBHOOK_URL in .env.</div>
+    <div class="row gap-8" style="align-items: center;">
+      <label><input type="checkbox" id="notifEnabled" onchange="saveNotifPrefs()" /> Notifications enabled</label>
+      <label><input type="checkbox" id="notifDiscord" onchange="saveNotifPrefs()" /> Use Discord</label>
+      <span id="notifDiscordStatus" class="muted"></span>
+    </div>
+    <div id="notifSaveResult" class="muted" style="margin-top: 8px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="grid grid-3">
+      <div>
+        <div class="card-label">Global pause</div>
+        <div class="row gap-8">
+          <button class="btn" onclick="setPause(true)">Pause all</button>
+          <button class="btn" onclick="setPause(false)">Resume</button>
+        </div>
+        <div class="muted" id="pauseState">—</div>
+      </div>
+      <div>
+        <div class="card-label">Kill switch</div>
+        <div class="row gap-8">
+          <button class="btn btn-neg" onclick="setKill(true)">Enable</button>
+          <button class="btn" onclick="setKill(false)">Disable</button>
+        </div>
+        <div class="muted" id="killState">—</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  async function getJSON(url, opts){
+    const r = await fetch(url, opts || {});
+    const data = await r.json().catch(async () => {
+      const t = await r.text();
+      throw new Error(url + " -> " + r.status + " " + t);
+    });
+    if(!r.ok){
+      throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+    }
+    return data;
+  }
+
+  async function refreshLiveChecklist(){
+    try {
+      const d = await getJSON("/api/safety_check");
+      const el = document.getElementById("liveChecklist");
+      const listEl = document.getElementById("blockingList");
+      listEl.innerHTML = "";
+      const items = [];
+      items.push("API token: " + (d.api_auth_enabled ? "✓ Set" : "✗ Missing (set WORKER_API_TOKEN)"));
+      items.push("Allow live (ALLOW_LIVE_TRADING): " + (d.allow_live_trading ? "✓ Yes" : "✗ No (set in .env)"));
+      items.push("Live trading enabled (LIVE_TRADING_ENABLED): " + (d.live_trading_enabled ? "✓ Yes" : "✗ No"));
+      items.push("Kill switch: " + (d.kill_switch ? "⚠ Enabled" : "✓ Disabled"));
+      items.push("Kraken: " + (d.kraken_ready ? "✓ Ready" : "—"));
+      items.push("Alpaca paper: " + (d.alpaca_paper_ready ? "✓ Ready" : "—"));
+      items.push("Alpaca live: " + (d.alpaca_live_ready ? "✓ Ready" : "—"));
+      items.push("Bots in live mode: " + (d.any_live_bots ? "Yes" : "None"));
+      el.innerHTML = items.join("<br/>");
+      if (d.blocking_issues && d.blocking_issues.length) {
+        d.blocking_issues.forEach(function(msg) { listEl.appendChild(document.createElement("li")).textContent = msg; });
+      }
+      el.innerHTML += "<br/><strong>Live ready:</strong> " + (d.live_ready ? "✓ Yes" : "✗ No");
+    } catch (e) {
+      document.getElementById("liveChecklist").innerHTML = "Error: " + (e.message || e);
+    }
+  }
+
+  async function refreshNotifPrefs(){
+    try {
+      const d = await getJSON("/api/notification/prefs");
+      document.getElementById("notifEnabled").checked = d.prefs && d.prefs.enabled !== false;
+      document.getElementById("notifDiscord").checked = d.prefs && d.prefs.discord !== false;
+      document.getElementById("notifDiscordStatus").textContent = d.discord_configured ? "Webhook set" : "Set DISCORD_WEBHOOK_URL in .env";
+    } catch (e) { document.getElementById("notifDiscordStatus").textContent = "Error loading"; }
+  }
+
+  function saveNotifPrefs(){
+    const enabled = document.getElementById("notifEnabled").checked;
+    const discord = document.getElementById("notifDiscord").checked;
+    fetch("/api/notification/prefs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: enabled, discord: discord }) })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        document.getElementById("notifSaveResult").textContent = d.ok ? "Saved." : (d.error || "Failed");
+      })
+      .catch(function(e) { document.getElementById("notifSaveResult").textContent = "Error: " + e.message; });
+  }
+
+  async function refreshStates(){
+    try{
+      const p = await getJSON("/api/pause");
+      document.getElementById("pauseState").textContent = p.paused ? "Paused" : "Running";
+      const k = await getJSON("/api/risk/kill");
+      document.getElementById("killState").textContent = k.kill_switch ? "Enabled" : "Disabled";
+      refreshLiveChecklist();
+      refreshNotifPrefs();
+    }catch(e){
+      console.error(e);
+    }
+  }
+
+  async function setPause(val){
+    await getJSON("/api/pause", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({paused: val}) });
+    refreshStates();
+  }
+
+  async function setKill(val){
+    await getJSON("/api/risk/kill", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({enabled: val}) });
+    refreshStates();
+  }
+
+  refreshStates();
+</script>
+{% endblock %}

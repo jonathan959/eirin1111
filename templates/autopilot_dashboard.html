@@ -1,0 +1,776 @@
+{% extends "layout.html" %}
+{% block title %}Autopilot Dashboard{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Autopilot Dashboard</div>
+      <div class="muted" style="max-width: 560px;">Run automation: enable/disable autopilot, run cycles, and manage positions. New bots are created automatically from top recommendations when a cycle runs. To change capital or rules, use <a href="/setup-autopilot">Setup Autopilot</a> or edit below. Bots only place real orders when <strong>enabled</strong>, not in <strong>Dry run</strong>, and when the strategy allows entry — check the <a href="/bots">Bots</a> page for each bot’s status.</div>
+    </div>
+    <div class="row gap-8" style="align-items: center;">
+      <span id="modeBadge" class="badge-mode badge-manual" title="Current mode">Manual</span>
+      <a class="btn btn-ghost" href="/setup-autopilot">Setup</a>
+      <button id="toggleBtn" class="btn btn-purple" onclick="toggleAutopilot()" title="Start: enable ALL autopilot bots. Stop: disable ALL autopilot bots.">—</button>
+    </div>
+  </div>
+
+  <!-- Metric Cards (stack on small screens) -->
+  <div id="metricCards" class="autopilot-metrics grid grid-4" style="margin-bottom: 20px;">
+    <div class="metric-card"><div class="metric-label">Portfolio Value</div><div class="metric-value" id="metricPortfolio">—</div><div class="metric-change" id="metricPortfolioSub">—</div></div>
+    <div class="metric-card"><div class="metric-label">Active Positions</div><div class="metric-value" id="metricPositions">—</div><div class="metric-change" id="metricPositionsSub">—</div></div>
+    <div class="metric-card"><div class="metric-label">Total P&L</div><div class="metric-value" id="metricPnl">—</div><div class="metric-change" id="metricPnlSub">—</div></div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="row gap-12" style="align-items: center;">
+          <span class="h2">Status</span>
+          <span id="statusPill" class="status-pill">—</span>
+        </div>
+        <div id="statusSub" class="muted" style="margin-top: 6px;">Loading… If this stays loading, click Refresh and ensure the server is running.</div>
+        <div id="statusCountdown" class="muted" style="margin-top: 4px; font-size: 0.9rem;"></div>
+        <div id="statusHeartbeat" class="muted" style="margin-top: 2px; font-size: 0.85rem;" title="Last time the autopilot cycle finished. If this is old, run a cycle or check that the server is running."></div>
+      </div>
+      <div class="row gap-8" style="flex-wrap: wrap;">
+        <button class="btn" id="runBtn" onclick="runCycleNow()" title="Manually run one autopilot cycle">Run Cycle Now</button>
+        <button class="btn btn-ghost" id="refreshBtn" onclick="refreshAll()" title="Reload all">Refresh</button>
+        <span id="lastRefreshed" class="muted" style="font-size: 0.8rem;"></span>
+      </div>
+    </div>
+    <details id="configDetails" class="autopilot-config-details" style="margin-top: 12px;">
+      <summary class="btn btn-ghost" style="cursor: pointer; list-style: none; display: inline-block;">Edit automation settings</summary>
+      <div id="configGrid" class="grid grid-4 autopilot-config-grid" style="margin-top: 16px;"></div>
+      <div class="row gap-8" style="margin-top: 12px; flex-wrap: wrap; align-items: center;">
+        <button type="button" class="btn btn-purple" id="saveConfigBtn" onclick="saveConfig()" style="display: none;">Save config</button>
+        <span id="saveConfigStatus" class="muted" style="font-size: 0.9rem;" aria-live="polite"></span>
+      </div>
+    </details>
+  </div>
+
+  <!-- View Toggle: Positions | Recommendations | Activity -->
+  <div class="row gap-8" style="margin-bottom: 16px; align-items: center; flex-wrap: wrap;">
+    <button id="viewPositionsBtn" class="btn btn-purple" onclick="setView('positions')">Positions (<span id="positionsCount">0</span>)</button>
+    <button id="viewRecosBtn" class="btn btn-ghost" onclick="setView('recommendations')">Recommendations</button>
+    <button id="viewActivityBtn" class="btn btn-ghost" onclick="setView('activity')">Activity</button>
+  </div>
+
+  <!-- Active Positions (shown when view=positions) -->
+  <div id="positionsSection" class="card section">
+    <div class="card-head">
+      <div class="h2">Active Positions</div>
+      <div class="muted">Each bot runs its strategy (e.g. trend_follow) and places orders when signals match. Use Edit to change size or params; Disable to stop new orders but keep the position.</div>
+    </div>
+    <div id="positionsList"></div>
+  </div>
+
+  <!-- Activity log (shown when view=activity) -->
+  <div id="activitySection" class="card section" style="display: none;">
+    <div class="card-head">
+      <div class="h2">Activity</div>
+      <div class="muted">Recent autopilot decisions: creates, closes, skips</div>
+    </div>
+    <div id="activityList"></div>
+  </div>
+
+  <!-- Portfolio Chart (always visible) -->
+  <div class="chart-container section">
+    <div class="chart-header">
+      <h3 class="chart-title">Portfolio Performance</h3>
+      <div class="timeframe-selector" id="timeframeSelector">
+        <button class="timeframe-btn active" data-tf="1D">1D</button>
+        <button class="timeframe-btn" data-tf="1W">1W</button>
+        <button class="timeframe-btn" data-tf="1M">1M</button>
+        <button class="timeframe-btn" data-tf="3M">3M</button>
+      </div>
+    </div>
+    <canvas id="perfChart" height="200"></canvas>
+  </div>
+
+  <!-- Recommendations (shown when view=recommendations) -->
+  <div id="recosSection" class="section" style="display: none; min-height: 280px;">
+  <div class="card section">
+    <div class="card-head" style="flex-wrap: wrap; gap: 12px;">
+      <div class="h2">Top Recommendations (Score ≥ 75)</div>
+      <button type="button" class="btn btn-ghost" id="scanRecosBtn" onclick="scanRecommendations()">Scan recommendations</button>
+    </div>
+    <div id="topRecos" class="reco-list"></div>
+    <div id="topRecosEmpty" class="muted" style="padding: 24px; text-align: center; display: none;">No top recommendations. Run “Scan recommendations” or wait for the next cycle.</div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Watchlist (Score 65–74)</div>
+      <div class="muted">Monitor only; auto-promote when score ≥ 75</div>
+    </div>
+    <div id="watchlist" class="reco-list"></div>
+    <div id="watchlistEmpty" class="muted" style="padding: 24px; text-align: center; display: none;">No watchlist items. Run a scan first.</div>
+  </div>
+  </div>
+
+  <!-- Capital management: add money to bots -->
+  <div class="card section" style="margin-top: 20px;">
+    <div class="card-head">
+      <div class="h2">Add capital to bots</div>
+      <div class="muted">Increase allocation after setup: add to all autopilot bots, one bot, or a % to each. Added capital is not spent immediately — each bot uses the extra budget on its next good entry signal (when the strategy sees a smart entry point).</div>
+    </div>
+    <div class="row gap-12" style="flex-wrap: wrap; align-items: flex-end;">
+      <div>
+        <label class="muted" style="display:block; margin-bottom:4px;">Amount ($)</label>
+        <input type="number" id="addCapitalAmount" min="1" step="1" value="100" style="width:100px; padding:8px; border-radius:8px; border:1px solid var(--border); background: var(--bg); color: var(--text);">
+      </div>
+      <div>
+        <label class="muted" style="display:block; margin-bottom:4px;">Apply to</label>
+        <select id="addCapitalMode" style="padding:8px 12px; border-radius:8px; border:1px solid var(--border); background: var(--bg); color: var(--text);">
+          <option value="all">All autopilot bots (split equally)</option>
+          <option value="all_enabled">All enabled bots (split equally)</option>
+          <option value="percentage">Each bot: add X% of current base</option>
+          <option value="single">Single bot (choose below)</option>
+        </select>
+      </div>
+      <div id="addCapitalSingleWrap" style="display:none;">
+        <label class="muted" style="display:block; margin-bottom:4px;">Bot</label>
+        <select id="addCapitalBotId" style="padding:8px 12px; border-radius:8px; border:1px solid var(--border); background: var(--bg); color: var(--text); min-width:180px;"></select>
+      </div>
+      <div id="addCapitalPctWrap" style="display:none;">
+        <label class="muted" style="display:block; margin-bottom:4px;">% per bot</label>
+        <input type="number" id="addCapitalPct" min="1" max="100" value="10" style="width:70px; padding:8px; border-radius:8px; border:1px solid var(--border); background: var(--bg); color: var(--text);"> %
+      </div>
+      <button type="button" class="btn btn-purple" id="addCapitalBtn" onclick="addCapital()">Add capital</button>
+    </div>
+    <div id="addCapitalResult" role="status" style="margin-top:12px; min-height:1.5em; font-weight:500;"></div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+  var perfChart = null;
+  var currentTimeframe = '1D';
+  var STORAGE_KEY = 'autopilot_dashboard_view';
+  var currentView = localStorage.getItem(STORAGE_KEY) || 'positions';
+
+  function formatNum(n) { return Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+  function formatCountdown(sec) {
+    if (sec <= 0) return 'now';
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    var parts = [];
+    if (h > 0) parts.push(h + 'h');
+    if (m > 0) parts.push(m + 'm');
+    parts.push(s + 's');
+    return parts.join(' ');
+  }
+  function _elVal(id, def) {
+    var el = document.getElementById(id);
+    return el ? (el.value != null ? el.value : def) : def;
+  }
+  async function saveConfig() {
+    var btn = document.getElementById('saveConfigBtn');
+    var statusEl = document.getElementById('saveConfigStatus');
+    function setStatus(msg, isError) {
+      if (statusEl) {
+        statusEl.textContent = msg || '';
+        statusEl.style.color = isError ? 'var(--danger)' : 'var(--success, green)';
+      }
+    }
+    if (btn) btn.disabled = true;
+    setStatus('Saving…', false);
+    try {
+      var totalCapEl = document.getElementById('cfgTotalCapital');
+      var totalCap = totalCapEl ? Math.max(0, parseFloat(totalCapEl.value) || 0) : undefined;
+      var maxPos = parseInt(_elVal('cfgMaxPositions', '6'), 10) || 6;
+      var minScoreEl = document.getElementById('cfgMinScore');
+      var minScore = minScoreEl ? Math.max(50, Math.min(95, parseFloat(minScoreEl.value) || 75)) : 75;
+      var assetTypes = _elVal('cfgAssetTypes', 'both');
+      var risk = _elVal('cfgRisk', 'moderate');
+      var dryRun = parseInt(_elVal('cfgDryRun', '1'), 10) || 1;
+      var scanHours = parseInt(_elVal('cfgScanHours', '4'), 10) || 4;
+      var payload = { max_positions: maxPos, min_score: minScore, asset_types: assetTypes, risk_tolerance: risk, dry_run: dryRun, scan_interval_hours: scanHours };
+      if (!isNaN(totalCap) && totalCap >= 0) { payload.total_capital = totalCap; }
+      var budgetEl = document.getElementById('cfgBudgetPerBot');
+      var budgetPerBot = budgetEl ? parseFloat(budgetEl.value) : NaN;
+      if (!isNaN(budgetPerBot) && budgetPerBot >= 0.5) { payload.capital_per_bot = budgetPerBot; }
+      else { payload.capital_per_bot = 0; }
+      var res = await fetch('/api/autopilot/config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      var d = await res.json().catch(function() { return {}; });
+      if (res.ok && d.ok) {
+        setStatus('Saved.', false);
+        if (window._autopilotCfg) {
+          window._autopilotCfg.max_positions = maxPos;
+          window._autopilotCfg.min_score = minScore;
+          window._autopilotCfg.asset_types = assetTypes;
+          window._autopilotCfg.risk_tolerance = risk;
+          window._autopilotCfg.dry_run = dryRun;
+          window._autopilotCfg.scan_interval_hours = scanHours;
+          window._autopilotCfg.total_capital = totalCap;
+          window._autopilotCfg.capital_per_bot = (!isNaN(budgetPerBot) && budgetPerBot >= 0.5) ? budgetPerBot : 0;
+        }
+        loadStatus();
+        setTimeout(function() { setStatus(''); }, 3000);
+      } else {
+        setStatus(d.error || d.detail || 'Save failed (check server).', true);
+      }
+    } catch (e) {
+      setStatus('Error: ' + (e.message || String(e)), true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+  async function loadActivity() {
+    var listEl = document.getElementById('activityList');
+    if (!listEl) return;
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/activity?limit=50');
+      var d = await res.json().catch(function() { return {}; });
+      var items = d.items || [];
+      if (items.length === 0) {
+        listEl.innerHTML = '<div class="muted" style="padding: 24px; text-align: center;">No activity yet. Runs will appear here.</div>';
+        return;
+      }
+      listEl.innerHTML = items.map(function(a) {
+        var ts = a.ts ? new Date(a.ts * 1000).toLocaleString() : '—';
+        var sym = a.symbol ? ' ' + a.symbol : '';
+        var reason = (a.reason || '').substring(0, 80);
+        if (a.reason && a.reason.length > 80) reason += '…';
+        return '<div class="row gap-12" style="padding: 10px 0; border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap;">' +
+          '<span class="muted" style="font-size: 0.85rem;">' + ts + '</span>' +
+          '<span class="tag">' + (a.action || '—') + '</span>' +
+          '<span class="mono" style="font-weight: 600;">' + sym + '</span>' +
+          '<span class="muted" style="font-size: 0.9rem;">' + reason + '</span>' +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      listEl.innerHTML = '<div class="muted" style="padding: 16px;">Could not load activity. ' + (e.message || '') + '</div>';
+    }
+  }
+  async function disableBot(id, symbol) {
+    if (!confirm('Disable bot for ' + symbol + '? The bot will stop opening new orders; existing position stays.')) return;
+    try {
+      await fetch('/api/bots/' + id + '/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      await fetch('/api/bots/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: 0 }) });
+      loadPositions();
+      loadStatus();
+    } catch (e) {
+      alert('Error: ' + e.message);
+    }
+  }
+
+  function setView(v) {
+    currentView = v;
+    localStorage.setItem(STORAGE_KEY, v);
+    var elPos = document.getElementById('positionsSection');
+    var elRecos = document.getElementById('recosSection');
+    var elActivity = document.getElementById('activitySection');
+    var btnPos = document.getElementById('viewPositionsBtn');
+    var btnRecos = document.getElementById('viewRecosBtn');
+    var btnActivity = document.getElementById('viewActivityBtn');
+    if (elPos) elPos.style.display = v === 'positions' ? 'block' : 'none';
+    if (elRecos) elRecos.style.display = v === 'recommendations' ? 'block' : 'none';
+    if (elActivity) elActivity.style.display = v === 'activity' ? 'block' : 'none';
+    if (btnPos) btnPos.className = 'btn ' + (v === 'positions' ? 'btn-purple' : 'btn-ghost');
+    if (btnRecos) btnRecos.className = 'btn ' + (v === 'recommendations' ? 'btn-purple' : 'btn-ghost');
+    if (btnActivity) btnActivity.className = 'btn ' + (v === 'activity' ? 'btn-purple' : 'btn-ghost');
+    if (v === 'recommendations') { loadTopRecos(); loadWatchlist(); }
+    if (v === 'activity') loadActivity();
+  }
+  function fetchWithTimeout(url, opts, timeoutMs) {
+    timeoutMs = timeoutMs || 15000;
+    var ctrl = new AbortController();
+    var id = setTimeout(function() { ctrl.abort(); }, timeoutMs);
+    return fetch(url, Object.assign({}, opts, { signal: ctrl.signal })).then(function(r) {
+      clearTimeout(id);
+      return r;
+    });
+  }
+  function refreshAll() {
+    var sub = document.getElementById('statusSub');
+    if (sub) sub.textContent = 'Loading...';
+    var grid = document.getElementById('configGrid');
+    if (grid) grid.innerHTML = '';
+    loadStatus();
+    loadPositions();
+    loadTopRecos();
+    loadWatchlist();
+    loadPerformanceChart();
+    refreshAddCapitalBots();
+    if (currentView === 'activity') loadActivity();
+    var el = document.getElementById('lastRefreshed');
+    if (el) el.textContent = 'Last refreshed: ' + new Date().toLocaleTimeString();
+  }
+
+  async function loadPositions() {
+    var listEl = document.getElementById('positionsList');
+    var countEl = document.getElementById('positionsCount');
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/positions');
+      var d = await res.json().catch(function() { return {}; });
+      var positions = d.positions || [];
+      if (countEl) countEl.textContent = positions.length;
+
+      var html;
+      if (positions.length > 0) {
+        html = positions.map(function(p) {
+          var pnl = p.unrealized_pnl || 0;
+          var pnlPct = p.unrealized_pnl_pct || 0;
+          var pos = pnl >= 0;
+          var tp = p.take_profit_price != null && p.take_profit_price > 0 ? '$' + formatNum(p.take_profit_price) : '—';
+          var sl = p.stop_loss_price != null && p.stop_loss_price > 0 ? '$' + formatNum(p.stop_loss_price) : '—';
+          return '<div class="position-row row gap-12" style="padding: 16px 0; border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap;">' +
+            '<div style="min-width: 120px;"><span class="mono" style="font-weight: 700; font-size: 1.1rem;">' + (p.symbol || '—') + '</span><br><span class="muted" style="font-size: 0.8rem;">' + (p.strategy || 'classic') + '</span></div>' +
+            '<div><span class="muted">Entry:</span> $' + formatNum(p.avg_entry_price) + '</div>' +
+            '<div><span class="muted">Current:</span> $' + formatNum(p.current_price) + '</div>' +
+            '<div><span class="muted">Position:</span> $' + formatNum(p.position_value) + '</div>' +
+            '<div><span class="muted">TP:</span> ' + tp + ' <span class="muted">SL:</span> ' + sl + '</div>' +
+            '<div style="font-weight: 700; ' + (pos ? 'color: var(--success)' : 'color: var(--danger)') + ';">' + (pos ? '+' : '') + '$' + formatNum(pnl) + ' (' + (pos ? '+' : '') + pnlPct.toFixed(2) + '%)</div>' +
+            '<a href="/bots/' + p.id + '" class="btn btn-purple" style="padding: 6px 12px;">Edit bot</a>' +
+            '<button type="button" class="btn btn-ghost" style="padding: 6px 12px; color: var(--danger);" onclick="disableBot(' + p.id + ', \'' + (p.symbol || '').replace(/'/g, "\\'") + '\')" title="Disable this bot (stops new orders, keeps position)">Disable</button>' +
+            '</div>';
+        }).join('');
+      } else {
+        var botsRes = await fetchWithTimeout('/api/bots').catch(function() { return null; });
+        var botsData = botsRes ? await botsRes.json().catch(function() { return {}; }) : {};
+        var bots = botsData.bots || botsData || [];
+        if (Array.isArray(bots) && bots.length > 0) {
+          if (countEl) countEl.textContent = bots.length;
+          html = '<div class="muted" style="padding: 16px 0;">No position data yet for ' + bots.length + ' bot(s). Listed below — enable on Bots page and ensure they are running for P&L.</div>' +
+            bots.map(function(b) {
+              var bid = b.id || b.bot_id;
+              var sym = (b.symbol || '').toString().toUpperCase();
+              var en = b.enabled ? 'enabled' : 'disabled';
+              return '<div class="row gap-12" style="padding: 12px 0; border-bottom: 1px solid var(--border); align-items: center;">' +
+                '<span class="mono" style="font-weight: 600;">' + sym + '</span>' +
+                '<span class="muted">' + en + '</span>' +
+                '<a href="/bots/' + bid + '" class="btn btn-ghost" style="padding: 6px 12px;">Open</a></div>';
+            }).join('');
+        } else {
+          html = '<div class="muted" style="padding: 32px; text-align: center;">No bots yet. Enable autopilot and run a cycle, or create bots from Setup Autopilot or the Bots page.</div>';
+        }
+      }
+      if (listEl) listEl.innerHTML = html;
+    } catch (e) {
+      if (countEl) countEl.textContent = '0';
+      if (listEl) listEl.innerHTML = '<div class="muted" style="padding: 16px;">Could not load positions. Click Refresh or check server. ' + (e.message || '') + '</div>';
+    }
+  }
+
+  function renderConfigGridOnce(d, cfg) {
+    var grid = document.getElementById('configGrid');
+    if (!grid) return;
+    var maxPos = cfg.max_positions ?? 6;
+    var minScore = cfg.min_score != null ? Math.max(50, Math.min(95, Number(cfg.min_score))) : 75;
+    var dryRun = (cfg.dry_run === 1 || cfg.dry_run === true);
+    var scanHours = cfg.scan_interval_hours != null ? cfg.scan_interval_hours : 4;
+    var totalCap = Number(cfg.total_capital || cfg.total_capital_allocated || 0);
+    var lastRunStr = (d.last_run_ts && d.last_run_ts > 0) ? new Date(d.last_run_ts * 1000).toLocaleString() : 'Never';
+    var savedCapPerBot = Number(cfg.capital_per_bot);
+    if (isNaN(savedCapPerBot)) savedCapPerBot = 0;
+    var derivedPerBot = (totalCap > 0 && maxPos > 0) ? Math.max(1, (totalCap / maxPos)) : 0;
+    var budgetInputValue = (savedCapPerBot >= 0.5) ? savedCapPerBot : '';
+    var capForOrder = (savedCapPerBot >= 0.5) ? savedCapPerBot : derivedPerBot;
+    var baseOrder = Number(cfg.base_quote) || Math.max(0.5, Math.floor(capForOrder * 15) / 100);
+    var baseOrderStr = baseOrder >= 1 ? '$' + baseOrder.toLocaleString() : '$' + baseOrder.toFixed(2);
+    grid.innerHTML =
+      '<div class="card card-stat" style="min-width: 160px;"><div class="card-label">Total capital</div><div class="card-value" style="font-size: 14px;">' +
+        '<span style="margin-right:4px;">$</span><input type="number" id="cfgTotalCapital" min="0" step="1" value="' + (totalCap || 0) + '" style="width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);">' +
+      '</div><div class="muted" style="font-size:0.8em;margin-top:4px;">Capital pool for autopilot bots.</div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Max positions</div><div class="card-value"><input type="number" id="cfgMaxPositions" min="1" max="20" value="' + maxPos + '" style="width:60px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Min score</div><div class="card-value"><input type="number" id="cfgMinScore" min="65" max="95" value="' + minScore + '" style="width:50px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"></div></div>' +
+      '<div class="card card-stat" style="min-width: 160px;"><div class="card-label">Budget per bot ($)</div><div class="card-value" style="font-size: 14px;">' +
+        '<input type="number" id="cfgBudgetPerBot" min="0" step="0.5" value="' + budgetInputValue + '" placeholder="auto" style="width:80px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);" title="Per-bot budget. Empty or 0 = auto (Total capital ÷ Max positions).">' +
+      '</div><div class="muted" style="font-size:0.75em;">Order size: <span id="cfgBaseOrder">' + baseOrderStr + '</span> (auto uses ~$' + (derivedPerBot ? derivedPerBot.toFixed(0) : '—') + '/bot)</div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Asset types</div><div class="card-value"><select id="cfgAssetTypes" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"><option value="both"' + (cfg.asset_types === 'both' ? ' selected' : '') + '>Both</option><option value="stocks"' + (cfg.asset_types === 'stocks' ? ' selected' : '') + '>Stocks</option><option value="crypto"' + (cfg.asset_types === 'crypto' ? ' selected' : '') + '>Crypto</option></select></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Risk</div><div class="card-value"><select id="cfgRisk" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"><option value="conservative"' + (cfg.risk_tolerance === 'conservative' ? ' selected' : '') + '>Conservative</option><option value="moderate"' + (cfg.risk_tolerance === 'moderate' ? ' selected' : '') + '>Moderate</option><option value="aggressive"' + (cfg.risk_tolerance === 'aggressive' ? ' selected' : '') + '>Aggressive</option></select></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Dry run</div><div class="card-value"><select id="cfgDryRun" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"><option value="1"' + (dryRun ? ' selected' : '') + '>Yes</option><option value="0"' + (!dryRun ? ' selected' : '') + '>No</option></select></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Scan interval</div><div class="card-value"><select id="cfgScanHours" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"><option value="1"' + (scanHours === 1 ? ' selected' : '') + '>1 hour</option><option value="4"' + (scanHours === 4 ? ' selected' : '') + '>4 hours</option><option value="12"' + (scanHours === 12 ? ' selected' : '') + '>12 hours</option><option value="24"' + (scanHours === 24 ? ' selected' : '') + '>24 hours</option></select></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Last run</div><div class="card-value" style="font-size: 14px;" id="cfgLastRun">' + lastRunStr + '</div></div>';
+    var saveBtn = document.getElementById('saveConfigBtn');
+    if (saveBtn) saveBtn.style.display = 'block';
+  }
+  function updateStatusOnly(d) {
+    var pill = document.getElementById('statusPill');
+    var sub = document.getElementById('statusSub');
+    var toggleBtn = document.getElementById('toggleBtn');
+    var cfg = d.config || {};
+    if (d.enabled) {
+      if (pill) { pill.textContent = 'Enabled'; pill.className = 'status-pill status-running'; }
+      var sec = d.next_scan_in_sec;
+      if (sub) sub.textContent = sec > 0 ? 'Next scan in ' + sec + 's' : 'Autopilot active. Run cycle to scan now.';
+      if (toggleBtn) {
+        toggleBtn.textContent = 'Disable Autopilot';
+        toggleBtn.classList.remove('btn-purple');
+        toggleBtn.style.background = 'var(--danger-soft)';
+        toggleBtn.style.color = 'var(--danger)';
+      }
+    } else {
+      if (pill) { pill.textContent = 'Disabled'; pill.className = 'status-pill status-paused'; }
+      var scanH = (cfg.scan_interval_hours) ? cfg.scan_interval_hours : 4;
+      if (sub) sub.textContent = 'Click Enable to start. Autopilot scans every ' + scanH + ' hour(s) and manages bots from top recommendations.';
+      if (toggleBtn) {
+        toggleBtn.textContent = 'Enable Autopilot';
+        toggleBtn.className = 'btn btn-purple';
+        toggleBtn.style.background = '';
+        toggleBtn.style.color = '';
+      }
+    }
+    var countEl = document.getElementById('statusCountdown');
+    var heartEl = document.getElementById('statusHeartbeat');
+    if (countEl) {
+      var sec = d.next_scan_in_sec || 0;
+      if (d.enabled && sec > 0) {
+        window._autopilotNextSec = sec;
+        countEl.textContent = 'Next scan in ' + formatCountdown(sec);
+      } else {
+        countEl.textContent = '';
+        window._autopilotNextSec = 0;
+      }
+    }
+    if (heartEl && d.last_autopilot_heartbeat_ts) {
+      var ago = Math.floor((Date.now() / 1000) - d.last_autopilot_heartbeat_ts);
+      if (ago < 60) heartEl.textContent = 'Last cycle: just now';
+      else if (ago < 3600) heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 60) + ' min ago';
+      else heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 3600) + 'h ago';
+      if (ago > 900) heartEl.innerHTML = '<span style="color: var(--warning, #b45309);">Last cycle was ' + Math.floor(ago / 60) + ' min ago. Run a cycle below to scan now.</span>';
+    } else if (heartEl) heartEl.textContent = '';
+    var pv = Number(d.portfolio_value) || 0;
+    var ap = Number(d.active_positions) || 0;
+    var mp = Number(cfg.max_positions || d.max_positions || 6) || 6;
+    var pnl = Number(d.total_pnl) || 0;
+    var mPort = document.getElementById('metricPortfolio');
+    var mPos = document.getElementById('metricPositions');
+    var mPnl = document.getElementById('metricPnl');
+    if (mPort) mPort.textContent = pv > 0 ? '$' + formatNum(pv) : '—';
+    var mPortSub = document.getElementById('metricPortfolioSub');
+    if (mPortSub) mPortSub.textContent = pv > 0 ? 'Live' : 'Run scan or connect worker';
+    if (mPos) mPos.textContent = ap + '/' + mp;
+    var mPosSub = document.getElementById('metricPositionsSub');
+    if (mPosSub) mPosSub.textContent = mp > 0 ? Math.round(ap/mp*100) + '% utilized' : '—';
+    if (mPnl) {
+      mPnl.textContent = '$' + formatNum(pnl);
+      mPnl.className = 'metric-value ' + (pnl >= 0 ? 'pos' : 'neg');
+    }
+    var mPnlSub = document.getElementById('metricPnlSub');
+    if (mPnlSub) { mPnlSub.textContent = 'Realized'; mPnlSub.className = 'metric-change ' + (pnl >= 0 ? 'positive' : 'negative'); }
+    var badge = document.getElementById('modeBadge');
+    if (badge) {
+      badge.textContent = d.enabled ? 'Autopilot' : 'Manual';
+      badge.className = 'badge-mode ' + (d.enabled ? 'badge-autopilot' : 'badge-manual');
+    }
+    if (toggleBtn) toggleBtn.textContent = d.enabled ? 'Stop Autopilot' : 'Start Autopilot';
+    var el = document.getElementById('cfgLastRun');
+    if (el) el.textContent = (d.last_run_ts && d.last_run_ts > 0) ? new Date(d.last_run_ts * 1000).toLocaleString() : 'Never';
+    var capPerBot = Number(cfg.capital_per_bot) || 0;
+    var totalCap = Number(cfg.total_capital || cfg.total_capital_allocated || 0);
+    var maxPos = Number(cfg.max_positions || 6) || 6;
+    if (capPerBot < 0.5 && totalCap > 0 && maxPos > 0) capPerBot = Math.max(1, totalCap / maxPos);
+    var baseOrderVal = Number(cfg.base_quote) || Math.max(0.5, (capPerBot * 0.15));
+    el = document.getElementById('cfgBaseOrder');
+    if (el) el.textContent = baseOrderVal >= 1 ? '$' + baseOrderVal.toLocaleString() : '$' + baseOrderVal.toFixed(2);
+  }
+  async function loadStatus() {
+    var pill = document.getElementById('statusPill');
+    var sub = document.getElementById('statusSub');
+    var toggleBtn = document.getElementById('toggleBtn');
+    var isFirstLoad = !document.getElementById('cfgTotalCapital');
+    if (sub && isFirstLoad) sub.textContent = 'Loading...';
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/status');
+      var d = await res.json().catch(function() { return {}; });
+      if (d.ok === false) {
+        if (sub) sub.textContent = 'Server: ' + (d.error || d.detail || 'error');
+        if (pill) { pill.textContent = 'Error'; pill.className = 'status-pill status-error'; }
+        var e1 = document.getElementById('metricPortfolio'); if (e1) e1.textContent = '—';
+        var e2 = document.getElementById('metricPortfolioSub'); if (e2) e2.textContent = 'Worker unreachable? Click Refresh.';
+        var e3 = document.getElementById('metricPositions'); if (e3) e3.textContent = '—';
+        var e4 = document.getElementById('metricPnl'); if (e4) e4.textContent = '—';
+        return;
+      }
+      if (!res.ok) { throw new Error(res.status + ' ' + res.statusText); }
+
+      const cfg = d.config || {};
+      window._autopilotCfg = cfg;
+
+      if (isFirstLoad) {
+        renderConfigGridOnce(d, cfg);
+        updateStatusOnly(d);
+      } else {
+        updateStatusOnly(d);
+      }
+    } catch (e) {
+      if (sub) sub.textContent = 'Error: ' + (e.message || e);
+      if (pill) { pill.textContent = 'Error'; pill.className = 'status-pill status-error'; }
+      var m = document.getElementById('metricPortfolio');
+      if (m) m.textContent = '—';
+      m = document.getElementById('metricPortfolioSub');
+      if (m) m.textContent = 'Request failed. Click Refresh.';
+    }
+  }
+  async function toggleAutopilot() {
+    const btn = document.getElementById('toggleBtn');
+    if (!btn) return;
+    var isStart = btn.textContent.indexOf('Start') >= 0;
+    var msg = isStart
+      ? 'Enable Autopilot? Bots will run on the next cycle and can open new positions per your config.'
+      : 'Disable Autopilot? All autopilot bots will be disabled. Existing positions stay open.';
+    if (!confirm(msg)) return;
+    btn.disabled = true;
+    btn.textContent = '...';
+    try {
+      const endpoint = isStart ? '/api/autopilot/start' : '/api/autopilot/stop';
+      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const d = await res.json();
+      if (!d.ok) { alert(d.error || 'Failed'); return; }
+      await loadStatus();
+    } catch (e) {
+      alert('Error: ' + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  async function runCycleNow() {
+    const runBtn = document.getElementById('runBtn');
+    const sub = document.getElementById('statusSub');
+    if (!runBtn || !sub) return;
+    runBtn.disabled = true;
+    sub.textContent = 'Running cycle...';
+    try {
+      const res = await fetch('/api/autopilot/run', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const d = await res.json();
+      sub.textContent = 'Cycle done. Created: ' + (d.created || 0) + ', Closed: ' + (d.closed || 0) + (d.errors?.length ? '. ' + d.errors.length + ' error(s)' : '');
+      await loadStatus();
+    } catch (e) {
+      sub.textContent = 'Error: ' + e.message;
+      loadStatus();
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+  async function loadTopRecos() {
+    var listEl = document.getElementById('topRecos');
+    var emptyEl = document.getElementById('topRecosEmpty');
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/top');
+      if (!res.ok) throw new Error(res.statusText);
+      var d = await res.json();
+      var items = (d.items || []).slice(0, 10);
+      if (items.length) {
+        if (emptyEl) emptyEl.style.display = 'none';
+        if (listEl) listEl.innerHTML = items.map(function(r) {
+          var sym = r.symbol || '—';
+          var sc = r.score != null ? r.score.toFixed(1) : '-';
+          var reason = r.reason ? '<div class="muted" style="font-size: 0.85rem; margin-top: 4px;">' + (r.reason.substring(0, 120) + (r.reason.length > 120 ? '…' : '')) + '</div>' : '';
+          return '<div style="padding: 10px 0; border-bottom: 1px solid var(--border);">' +
+            '<div class="row gap-12" style="align-items: center; justify-content: space-between; flex-wrap: wrap;">' +
+            '<a href="/explore" class="mono" style="font-weight: 600; color: var(--accent);">' + sym + '</a>' +
+            '<span class="tag tag-pos">' + sc + '</span>' +
+            '</div>' + reason + '</div>';
+        }).join('');
+      } else {
+        if (listEl) listEl.innerHTML = '';
+        if (emptyEl) emptyEl.style.display = 'block';
+      }
+    } catch (e) {
+      if (listEl) listEl.innerHTML = '<div class="muted" style="padding: 16px 0;">Error loading</div>';
+      if (emptyEl) emptyEl.style.display = 'none';
+    }
+  }
+  async function loadWatchlist() {
+    var listEl = document.getElementById('watchlist');
+    var emptyEl = document.getElementById('watchlistEmpty');
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/watchlist');
+      if (!res.ok) throw new Error(res.statusText);
+      var d = await res.json();
+      var items = (d.items || []).slice(0, 15);
+      if (items.length) {
+        if (emptyEl) emptyEl.style.display = 'none';
+        if (listEl) listEl.innerHTML = items.map(function(r) {
+          var sym = r.symbol || '—';
+          var sc = r.score != null ? r.score.toFixed(1) : '-';
+          var reason = r.reason ? '<div class="muted" style="font-size: 0.85rem; margin-top: 4px;">' + (r.reason.substring(0, 120) + (r.reason.length > 120 ? '…' : '')) + '</div>' : '';
+          return '<div style="padding: 10px 0; border-bottom: 1px solid var(--border);">' +
+            '<div class="row gap-12" style="align-items: center; justify-content: space-between; flex-wrap: wrap;">' +
+            '<a href="/explore" class="mono" style="font-weight: 600; color: var(--accent);">' + sym + '</a>' +
+            '<span class="tag" style="opacity: 0.9;">Watch ' + sc + '</span>' +
+            '</div>' + reason + '</div>';
+        }).join('');
+      } else {
+        if (listEl) listEl.innerHTML = '';
+        if (emptyEl) emptyEl.style.display = 'block';
+      }
+    } catch (e) {
+      if (listEl) listEl.innerHTML = '<div class="muted" style="padding: 16px 0;">Error loading</div>';
+      if (emptyEl) emptyEl.style.display = 'none';
+    }
+  }
+  async function scanRecommendations() {
+    var btn = document.getElementById('scanRecosBtn');
+    if (btn) btn.disabled = true;
+    try {
+      // Autopilot uses LONG-horizon recommendations only. Scan long so Top Recs / Watchlist match what autopilot will trade.
+      const res = await fetch('/api/recommendations/scan?horizon=long', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const d = await res.json().catch(function() { return {}; });
+      if (d.ok !== true && !res.ok) throw new Error(d.error || res.statusText);
+      await loadTopRecos();
+      await loadWatchlist();
+      if (btn) btn.disabled = false;
+    } catch (e) {
+      alert('Scan failed: ' + e.message);
+      if (btn) btn.disabled = false;
+    }
+  }
+  function refreshAddCapitalBots() {
+    var sel = document.getElementById('addCapitalBotId');
+    if (!sel) return;
+    Promise.all([
+      fetchWithTimeout('/api/autopilot/positions').then(function(r) { return r.json().catch(function() { return {}; }); }),
+      fetchWithTimeout('/api/bots').then(function(r) { return r.json().catch(function() { return {}; }); })
+    ]).then(function(arr) {
+      var positions = (arr[0].positions || []);
+      var botsData = arr[1];
+      var bots = botsData.bots || [];
+      var options = positions.length ? positions.map(function(p) {
+        return '<option value="' + p.id + '">' + (p.symbol || 'Bot #' + p.id) + '</option>';
+      }) : (Array.isArray(bots) && bots.length ? bots.map(function(b) {
+        var id = b.id || b.bot_id;
+        var sym = (b.symbol || '').toString().toUpperCase() || ('Bot #' + id);
+        return '<option value="' + id + '">' + sym + '</option>';
+      }) : []);
+      sel.innerHTML = options.length ? options.join('') : '<option value="">No bots</option>';
+    }).catch(function() { sel.innerHTML = '<option value="">Error loading</option>'; });
+  }
+    var addModeEl = document.getElementById('addCapitalMode');
+    if (addModeEl) addModeEl.addEventListener('change', function() {
+      var wrap = document.getElementById('addCapitalSingleWrap');
+      var pctWrap = document.getElementById('addCapitalPctWrap');
+      if (wrap) wrap.style.display = this.value === 'single' ? 'block' : 'none';
+      if (pctWrap) pctWrap.style.display = this.value === 'percentage' ? 'block' : 'none';
+      if (this.value === 'single') refreshAddCapitalBots();
+    });
+  async function addCapital() {
+    var amountEl = document.getElementById('addCapitalAmount');
+    var modeEl = document.getElementById('addCapitalMode');
+    var amount = amountEl ? parseFloat(amountEl.value) : NaN;
+    var mode = modeEl ? modeEl.value : 'all';
+    var addCapitalBotIdEl = document.getElementById('addCapitalBotId');
+    var botId = mode === 'single' && addCapitalBotIdEl ? addCapitalBotIdEl.value : null;
+    var pctEl = document.getElementById('addCapitalPct');
+    var pct = mode === 'percentage' && pctEl ? parseFloat(pctEl.value) : null;
+    var out = document.getElementById('addCapitalResult');
+    if (!amount || amount <= 0) { if (out) { out.textContent = 'Enter a valid amount.'; out.style.color = 'var(--danger)'; } return; }
+    if (mode === 'single' && !botId) { if (out) { out.textContent = 'Choose a bot from the dropdown.'; out.style.color = 'var(--danger)'; } return; }
+    var confirmMsg = 'Add $' + amount + ' to ';
+    if (mode === 'all') confirmMsg += 'all autopilot bots (split equally)';
+    else if (mode === 'all_enabled') confirmMsg += 'all enabled bots (split equally)';
+    else if (mode === 'percentage') confirmMsg += 'each bot: ' + pct + '% of current base';
+    else confirmMsg += 'bot #' + botId;
+    confirmMsg += '. Continue?';
+    if (!confirm(confirmMsg)) return;
+    var btn = document.getElementById('addCapitalBtn');
+    if (btn) btn.disabled = true;
+    if (out) { out.textContent = 'Applying...'; out.style.color = ''; }
+    try {
+      var res = await fetchWithTimeout('/api/autopilot/capital/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount_usd: amount, mode: mode, bot_id: botId ? parseInt(botId, 10) : null, pct_per_bot: pct })
+      }, 10000);
+      var d = await res.json().catch(function() { return {}; });
+      if (d.ok) {
+        if (out) { out.textContent = d.message || 'Capital updated.'; out.style.color = 'var(--success)'; }
+        loadStatus();
+        loadPositions();
+        refreshAddCapitalBots();
+      } else {
+        if (out) { out.textContent = d.error || 'Failed.'; out.style.color = 'var(--danger)'; }
+      }
+    } catch (e) {
+      if (out) { out.textContent = 'Error: ' + (e.message || e); out.style.color = 'var(--danger)'; }
+    }
+    if (btn) btn.disabled = false;
+  }
+  async function loadPerformanceChart() {
+    try {
+      var res = await fetch('/api/portfolio/performance?timeframe=' + currentTimeframe);
+      var d = await res.json();
+      var series = d.series || [];
+      if (perfChart) perfChart.destroy();
+      var ctx = document.getElementById('perfChart');
+      if (!ctx) return;
+      perfChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: series.map(function(s) { return s.timestamp || ''; }),
+          datasets: [{
+            label: 'Portfolio Value',
+            data: series.map(function(s) { return s.value || 0; }),
+            borderColor: 'rgba(99, 102, 241, 0.9)',
+            borderWidth: 2,
+            backgroundColor: function(ctx) {
+              var g = ctx.chart.ctx.createLinearGradient(0, 0, 0, ctx.chart.height);
+              g.addColorStop(0, 'rgba(99, 102, 241, 0.4)');
+              g.addColorStop(0.5, 'rgba(99, 102, 241, 0.15)');
+              g.addColorStop(1, 'rgba(99, 102, 241, 0.02)');
+              return g;
+            },
+            fill: true,
+            tension: 0.3
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { display: series.length < 20, ticks: { maxTicksLimit: 8 } },
+            y: { beginAtZero: false }
+          }
+        }
+      });
+    } catch (e) { console.warn('Chart load failed:', e); }
+  }
+
+  document.getElementById('timeframeSelector')?.addEventListener('click', function(ev) {
+    var btn = ev.target.closest('.timeframe-btn');
+    if (!btn) return;
+    document.querySelectorAll('.timeframe-selector .timeframe-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+    currentTimeframe = btn.dataset.tf || '1D';
+    loadPerformanceChart();
+  });
+
+  setView(currentView);
+  loadStatus().then(function() {
+    loadPositions();
+    loadTopRecos();
+    loadWatchlist();
+    loadPerformanceChart();
+    refreshAddCapitalBots();
+    if (currentView === 'activity') loadActivity();
+  });
+  var pollPositionsInterval = 15000;
+  var pollStatusInterval = 20000;
+  setTimeout(function startPolling() {
+    setInterval(loadPositions, pollPositionsInterval);
+    setInterval(loadStatus, pollStatusInterval);
+  }, 2000);
+  setInterval(function() {
+    if (window._autopilotNextSec > 0) {
+      window._autopilotNextSec--;
+      var el = document.getElementById('statusCountdown');
+      if (el) el.textContent = 'Next scan in ' + formatCountdown(window._autopilotNextSec);
+    }
+  }, 1000);
+</script>
+<style>
+  @media (max-width: 768px) {
+    .autopilot-metrics.grid-4 { grid-template-columns: 1fr 1fr; }
+    .autopilot-config-grid { grid-template-columns: 1fr 1fr !important; }
+    .position-row { flex-direction: column; align-items: flex-start !important; }
+  }
+  @media (max-width: 480px) {
+    .autopilot-metrics.grid-4 { grid-template-columns: 1fr; }
+    .autopilot-config-grid { grid-template-columns: 1fr !important; }
+  }
+</style>
+{% endblock %}

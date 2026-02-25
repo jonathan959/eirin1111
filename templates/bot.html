@@ -1,0 +1,1189 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">{{ bot.name }}</div>
+      <div class="muted mono">ID {{ bot.id }} • {{ bot.symbol }} • Dry run: {{ "ON" if bot.dry_run else "OFF" }}</div>
+      {% if not kraken_ready %}
+        <div class="muted mt-6">
+          <span class="tag tag-neg">Kraken not ready</span>
+          <span class="mono text-xs">{{ kraken_error }}</span>
+        </div>
+      {% endif %}
+    </div>
+
+  <div class="row gap-8 row-wrap row-end">
+    <button id="btnStart" class="btn btn-purple" onclick="startBot({{ bot.id }})">Start</button>
+    <button id="btnStop" class="btn" onclick="stopBot({{ bot.id }})">Stop</button>
+    <a class="btn" href="/bots?edit_id={{ bot.id }}">Edit</a>
+    <a class="btn" href="/bots">Back</a>
+  </div>
+  </div>
+
+  <!-- Top stats -->
+  <div class="grid grid-3">
+    <div class="card">
+      <div class="card-label">Status</div>
+      <div id="statusBox" class="card-value">Loading…</div>
+      <div class="card-sub muted" id="statusSub">—</div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Last price</div>
+      <div id="priceBox" class="card-value">—</div>
+      <div class="card-sub muted">Live from snapshot</div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Symbol</div>
+      <div id="symbolBox" class="card-value mono">{{ bot.symbol }}</div>
+      <div class="card-sub muted" id="symbolSub">Validated via Kraken markets</div>
+    </div>
+  </div>
+
+  <!-- Data Health card: shows why a bot may be blocked (0 candles, provider, etc.) -->
+  <div id="dataHealthCard" class="card section" style="display:none;">
+    <div class="card-head">
+      <div>
+        <div class="h2">Data Health</div>
+        <div class="muted">Candle counts, provider, symbol. Explains data-related blocks.</div>
+      </div>
+    </div>
+    <div id="dataHealthContent" class="muted text-sm">—</div>
+  </div>
+
+  <div class="card section">
+    <div class="row gap-12 row-wrap">
+      <span id="statusTag" class="tag">Loading…</span>
+      <span class="muted">Next: <span class="mono" id="nextActionHeader">—</span></span>
+      <span class="muted">Cooldown: <span class="mono" id="cooldownHeader">—</span></span>
+    </div>
+    <div class="status-row section-sm">
+      <span class="tag" id="strategyTag">Strategy: —</span>
+      <span class="tag" id="regimeTag">Regime: —</span>
+      <span class="tag" id="riskTag">Risk: —</span>
+    </div>
+  </div>
+
+  <div class="grid bot-layout bot-layout-narrow section">
+    <div class="bot-main">
+      <!-- Chart -->
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="h2">Live Candlestick Chart</div>
+            <div class="muted">
+              Candles: <span class="mono">/api/bots/{{ bot.id }}/ohlc</span> •
+              Markers: <span class="mono">/api/bots/{{ bot.id }}/markers</span>
+            </div>
+          </div>
+
+          <div class="row gap-8 row-wrap row-end">
+            <select id="tf" class="input input-sm w-140">
+              <option value="1m">1min</option>
+              <option value="5m" selected>5min</option>
+              <option value="15m">15min</option>
+              <option value="30m">30min</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+              <option value="1d">1d</option>
+            </select>
+            <button id="chartRefresh" class="btn">Refresh</button>
+          </div>
+        </div>
+
+        <div id="tvChart" class="chart-candle"></div>
+
+        <div class="muted text-xs mt-8">
+          Green/Red markers = live, Purple = dry run. If Kraken isn’t ready, chart will show an error instead of staying blank.
+        </div>
+
+        <div id="chartErr" class="text-xs mt-8 text-danger hidden"></div>
+      </div>
+
+      <!-- Bot stats -->
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Bot stats</div>
+            <div class="muted">Live runtime snapshot</div>
+          </div>
+        </div>
+        <div class="grid grid-3">
+          <div>
+            <div class="card-label">Current action</div>
+            <div class="card-value" id="botAction">—</div>
+          </div>
+          <div>
+            <div class="card-label">Next action</div>
+            <div class="card-value" id="nextActionBox">—</div>
+            <div class="card-sub muted" id="nextReasonBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Cooldown</div>
+            <div class="card-value mono" id="cooldownBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Avg entry</div>
+            <div class="card-value mono" id="avgEntryBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">TP target</div>
+            <div class="card-value mono" id="tpTargetBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Next safety trigger</div>
+            <div class="card-value mono" id="nextSafetyBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Spent (quote)</div>
+            <div class="card-value mono" id="spentQuoteBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Safeties used</div>
+            <div class="card-value mono" id="safetyUsedBox">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Analytics -->
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Analytics</div>
+            <div class="muted">Performance + drawdown</div>
+          </div>
+          <button class="btn" id="metricsRefresh">Refresh</button>
+        </div>
+        <div class="grid grid-3">
+          <div>
+            <div class="card-label">Win rate</div>
+            <div class="card-value" id="winRateBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Avg deal duration</div>
+            <div class="card-value mono" id="avgDurationBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Deals (W/L)</div>
+            <div class="card-value mono" id="dealCountBox">—</div>
+          </div>
+        </div>
+        <div class="section">
+          <div class="card-label">Drawdown (realized)</div>
+          <div id="drawdownChart" class="chart-drawdown"></div>
+        </div>
+      </div>
+
+      <!-- PnL chart -->
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">PnL History</div>
+            <div class="muted">Cumulative realized PnL</div>
+          </div>
+          <button class="btn" id="pnlRefresh">Refresh</button>
+        </div>
+        <div id="pnlChart" class="chart-pnl"></div>
+      </div>
+
+      <!-- Deals + Logs -->
+      <div class="grid grid-2 section">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="h2">Deals</div>
+              <div class="muted">Open/closed</div>
+            </div>
+            <button class="btn" onclick="loadDeals()">Refresh</button>
+          </div>
+
+          <div class="table-wrap minw-0">
+            <table class="table minw-520">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>State</th>
+                  <th class="right">PnL</th>
+                  <th class="right">Open</th>
+                </tr>
+              </thead>
+              <tbody id="dealsBody">
+                <tr><td colspan="4" class="muted">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <div class="h2">Logs</div>
+              <div class="muted">Live feed</div>
+            </div>
+            <div class="row gap-8 row-wrap row-end">
+              <label class="row gap-8">
+                <input type="checkbox" id="showStrategy" />
+                <span class="muted">Show strategy/debug</span>
+              </label>
+              <label class="row gap-8">
+                <input type="checkbox" id="pauseLogs" />
+                <span class="muted">Pause live</span>
+              </label>
+              <button class="btn" onclick="loadLogs()">Refresh</button>
+            </div>
+          </div>
+
+          <div id="logsBox" class="logbox logbox-large">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bot-side">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="h2">Control Panel</div>
+            <div class="muted">Quick actions</div>
+          </div>
+        </div>
+        <div class="grid gap-10">
+          <button class="btn btn-purple" onclick="startBot({{ bot.id }})">Start Bot</button>
+          <button class="btn" onclick="stopBot({{ bot.id }})">Stop Bot</button>
+          <button class="btn btn-neg" id="btnClosePosition" onclick="closePosition({{ bot.id }})" title="Sell full position and close deal">Close Position</button>
+          <a class="btn" href="/dca">DCA Dashboard</a>
+          <a class="btn" href="/bots">All Bots</a>
+        </div>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Strategy Status</div>
+            <div class="muted">Regime + overrides</div>
+          </div>
+        </div>
+        <div class="grid gap-8">
+          <div class="card-label">Active strategy</div>
+          <div class="mono" id="activeStrategyBox">—</div>
+          <div class="card-label">Regime</div>
+          <div class="mono" id="regimeBox">—</div>
+          <div class="card-label">Regime scores</div>
+          <div class="mono" id="regimeScoresBox">—</div>
+          <div class="card-label">Risk state</div>
+          <div class="mono" id="riskBox">—</div>
+          <div class="card-label">Suggested strategy</div>
+          <div class="mono" id="suggestStrategyBox">—</div>
+          <div class="card-label">Suggestion reason</div>
+          <div class="muted text-xs" id="suggestReasonBox">—</div>
+        </div>
+        <button class="btn mt-8" id="suggestRefresh">Refresh suggestion</button>
+        <div class="mt-10">
+          <div class="card-label">Strategy mode</div>
+          <select id="strategyMode" class="input mb-8">
+            <option value="classic_dca">Classic DCA</option>
+            <option value="smart_dca">Smart DCA</option>
+            <option value="trend_follow">Trend follow</option>
+            <option value="range_mean_reversion">Range mean reversion</option>
+            <option value="high_vol_defensive">High-vol defensive</option>
+            <option value="router">Strategy router (auto)</option>
+            <option value="grid">Grid (legacy)</option>
+            <option value="trend">Trend (legacy)</option>
+            <option value="breakout">Breakout (legacy)</option>
+            <option value="smart">Smart DCA (legacy)</option>
+            <option value="classic">Classic DCA (legacy)</option>
+            <option value="auto">Auto (legacy)</option>
+          </select>
+          <div class="card-label">Force strategy</div>
+          <select id="forceStrategy" class="input">
+            <option value="">Auto</option>
+            <option value="smart_dca">Smart DCA</option>
+            <option value="trend_follow">Trend follow</option>
+            <option value="range_mean_reversion">Range mean reversion</option>
+            <option value="high_vol_defensive">High-vol defensive</option>
+            <option value="grid">Grid (legacy)</option>
+            <option value="trend">Trend (legacy)</option>
+            <option value="breakout">Breakout (legacy)</option>
+            <option value="smart">Smart DCA (legacy)</option>
+          </select>
+          <button class="btn btn-purple mt-8" onclick="saveStrategy()">Save</button>
+        </div>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Deal Summary</div>
+            <div class="muted">Live snapshot</div>
+          </div>
+        </div>
+        <div class="grid gap-8">
+          <div class="card-label">Deal ID</div>
+          <div class="mono" id="dealIdBox">—</div>
+          <div class="card-label">TP price</div>
+          <div class="mono" id="tpPriceBox">—</div>
+          <div class="card-label">Position</div>
+          <div class="mono" id="posBox">—</div>
+        </div>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Manual Orders</div>
+            <div class="muted">Advanced order types</div>
+          </div>
+        </div>
+        <div class="grid gap-8">
+          <div class="card-label">Order type</div>
+          <select id="manualOrderType" class="input">
+            <option value="market_buy">Market buy (quote)</option>
+            <option value="market_sell">Market sell (base)</option>
+            <option value="limit_buy">Limit buy (base)</option>
+            <option value="limit_sell">Limit sell (base)</option>
+          </select>
+          <div class="card-label">Size (quote)</div>
+          <input id="manualQuote" class="input" type="number" step="0.01" placeholder="25.00">
+          <div class="card-label">Size (base)</div>
+          <input id="manualBase" class="input" type="number" step="0.0001" placeholder="0.001">
+          <div class="card-label">Limit price</div>
+          <input id="manualPrice" class="input" type="number" step="0.01" placeholder="Price">
+          <button class="btn btn-purple mt-8" onclick="submitManualOrder()">Place order</button>
+          <div id="manualOrderMsg" class="muted text-xs"></div>
+        </div>
+      </div>
+
+      <div class="card section">
+        <div class="card-head">
+          <div>
+            <div class="h2">Open Orders</div>
+            <div class="muted">Live from Kraken</div>
+          </div>
+          <div class="row gap-8 row-end">
+            <button class="btn" id="ordersRefresh">Refresh</button>
+            <button class="btn btn-neg" id="ordersCancelAll">Cancel all</button>
+          </div>
+        </div>
+        <div class="table-wrap minw-0">
+          <table class="table minw-520">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Side</th>
+                <th>Type</th>
+                <th class="right">Price</th>
+                <th class="right">Amount</th>
+                <th>Status</th>
+                <th class="right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="openOrdersBody">
+              <tr><td colspan="7" class="muted">(not loaded)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="ordersMsg" class="muted text-xs mt-8"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ===== Live status/deals/logs JS (kept). Chart JS is moved to /static/bot_chart.js ===== -->
+<script>
+  const BOT_ID = {{ bot.id }};
+  const BOT_CFG = {
+    max_safety: {{ bot.max_safety }},
+    first_dev: {{ bot.first_dev }},
+    step_mult: {{ bot.step_mult }},
+    tp: {{ bot.tp }},
+  };
+  let BOT_DATA = null;
+
+  function $(id){ return document.getElementById(id); }
+
+  async function getJSON(url, opts){
+    const r = await fetch(url, opts || {});
+    const data = await r.json().catch(async () => {
+      const t = await r.text();
+      throw new Error(url + " -> " + r.status + " " + t);
+    });
+    if(!r.ok){
+      throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+    }
+    return data;
+  }
+
+  function setButtonsBusy(busy){
+    $("btnStart").disabled = busy;
+    $("btnStop").disabled = busy;
+  }
+
+  function updateManualOrderFields(){
+    const type = $("manualOrderType")?.value || "market_buy";
+    const quoteEl = $("manualQuote");
+    const baseEl = $("manualBase");
+    const priceEl = $("manualPrice");
+    if (!quoteEl || !baseEl || !priceEl) return;
+    quoteEl.disabled = !(type === "market_buy");
+    baseEl.disabled = !(type === "market_sell" || type === "limit_buy" || type === "limit_sell");
+    priceEl.disabled = !(type === "limit_buy" || type === "limit_sell");
+  }
+
+  async function submitManualOrder(){
+    const msg = $("manualOrderMsg");
+    if (msg) msg.textContent = "Submitting…";
+    try{
+      const payload = {
+        action: $("manualOrderType").value,
+        size_quote: Number($("manualQuote").value || 0),
+        size_base: Number($("manualBase").value || 0),
+        price: Number($("manualPrice").value || 0),
+      };
+      const data = await getJSON(`/api/bots/${BOT_ID}/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (msg) msg.textContent = "Order submitted.";
+      await loadOpenOrders();
+      return data;
+    }catch(e){
+      if (msg) msg.textContent = "Order failed: " + (e.message || e);
+    }
+  }
+
+  async function loadOpenOrders(){
+    const body = $("openOrdersBody");
+    const msg = $("ordersMsg");
+    if (msg) msg.textContent = "Loading…";
+    try{
+      const data = await getJSON(`/api/bots/${BOT_ID}/orders`);
+      const orders = data.orders || [];
+      if (!orders.length){
+        body.innerHTML = `<tr><td colspan="7" class="muted">(no open orders)</td></tr>`;
+      }else{
+        body.innerHTML = orders.map(o => {
+          const price = o.price != null ? Number(o.price).toFixed(4) : "—";
+          const amount = o.amount != null ? Number(o.amount).toFixed(6) : "—";
+          return `
+            <tr>
+              <td class="mono">${o.id || "—"}</td>
+              <td class="mono">${(o.side || "").toUpperCase()}</td>
+              <td class="mono">${(o.type || "").toUpperCase()}</td>
+              <td class="right mono">${price}</td>
+              <td class="right mono">${amount}</td>
+              <td class="mono">${o.status || "—"}</td>
+              <td class="right">
+                ${o.id ? `<button class="btn" onclick="cancelOrder('${o.id}')">Cancel</button>` : "—"}
+              </td>
+            </tr>
+          `;
+        }).join("");
+      }
+      if (msg) msg.textContent = "";
+    }catch(e){
+      body.innerHTML = `<tr><td colspan="7" class="muted">(no data)</td></tr>`;
+      if (msg) msg.textContent = "Open orders failed: " + (e.message || e);
+    }
+  }
+
+  async function cancelOrder(orderId){
+    const msg = $("ordersMsg");
+    if (msg) msg.textContent = "Cancelling…";
+    try{
+      await getJSON(`/api/bots/${BOT_ID}/orders/${orderId}`, { method: "DELETE" });
+      if (msg) msg.textContent = "Order cancelled.";
+      await loadOpenOrders();
+    }catch(e){
+      if (msg) msg.textContent = "Cancel failed: " + (e.message || e);
+    }
+  }
+
+  async function cancelAllOrders(){
+    const msg = $("ordersMsg");
+    if (msg) msg.textContent = "Cancelling all…";
+    try{
+      await getJSON(`/api/bots/${BOT_ID}/orders/cancel_all`, { method: "POST" });
+      if (msg) msg.textContent = "All open orders cancelled.";
+      await loadOpenOrders();
+    }catch(e){
+      if (msg) msg.textContent = "Cancel-all failed: " + (e.message || e);
+    }
+  }
+
+  function setStatusUI(running, lastEvent, lastPrice){
+    const statusBox = $("statusBox");
+    const statusSub = $("statusSub");
+    const priceBox  = $("priceBox");
+    const statusTag = $("statusTag");
+
+    statusBox.textContent = running ? "RUNNING" : "STOPPED";
+    statusBox.className = "card-value " + (running ? "pos" : "muted");
+
+    if(lastPrice == null || Number.isNaN(Number(lastPrice))){
+      priceBox.textContent = "—";
+      priceBox.className = "card-value muted";
+    }else{
+      const p = Number(lastPrice);
+      priceBox.textContent = "$" + p.toFixed(2);
+      priceBox.className = "card-value";
+    }
+
+    statusSub.textContent = lastEvent ? lastEvent : "—";
+
+    if (statusTag) {
+      statusTag.textContent = running ? "LIVE" : "IDLE";
+      statusTag.className = "tag " + (running ? "tag-pos" : "tag");
+    }
+  }
+
+  function safetyLevels(entry, cfg){
+    const levels = [];
+    let dev = Number(cfg.first_dev || 0.01);
+    const step = Number(cfg.step_mult || 1.2);
+    for (let i = 0; i < Number(cfg.max_safety || 0); i += 1){
+      const lvl = entry * (1 - dev);
+      levels.push(lvl);
+      dev = dev * step;
+    }
+    return levels;
+  }
+
+  function setBotStats(snap){
+    const actionEl = $("botAction");
+    const avgEl = $("avgEntryBox");
+    const tpEl = $("tpTargetBox");
+    const nextEl = $("nextSafetyBox");
+    const spentEl = $("spentQuoteBox");
+    const usedEl = $("safetyUsedBox");
+    const nextActionBox = $("nextActionBox");
+    const nextReasonBox = $("nextReasonBox");
+    const cooldownBox = $("cooldownBox");
+    const nextActionHeader = $("nextActionHeader");
+    const cooldownHeader = $("cooldownHeader");
+    const now = Math.floor(Date.now() / 1000);
+
+    if (actionEl) actionEl.textContent = snap.last_event || "—";
+    const decisionAction = snap.decision_action || (snap.last_event ? "HOLD" : "—");
+    if (nextActionBox) nextActionBox.textContent = decisionAction;
+    if (nextReasonBox) nextReasonBox.textContent = snap.decision_reason || snap.last_event || "—";
+    const cdUntil = Number(snap.cooldown_until || 0);
+    const cdRemain = cdUntil > now ? (cdUntil - now) : 0;
+    const cdText = cdRemain > 0 ? `${cdRemain}s` : "—";
+    if (cooldownBox) cooldownBox.textContent = cdText;
+    if (nextActionHeader) nextActionHeader.textContent = decisionAction;
+    if (cooldownHeader) cooldownHeader.textContent = cdText;
+    if (avgEl) {
+      avgEl.textContent = snap.avg_entry ? Number(snap.avg_entry).toFixed(2) : "—";
+    }
+    if (tpEl) {
+      const avg = Number(snap.avg_entry || 0);
+      const tp = Number(BOT_CFG.tp || 0);
+      tpEl.textContent = avg > 0 ? (avg * (1 + tp)).toFixed(2) : "—";
+    }
+    if (spentEl) {
+      spentEl.textContent = snap.spent_quote != null ? Number(snap.spent_quote).toFixed(2) : "—";
+    }
+    if (usedEl) {
+      const used = Number(snap.safety_used || 0);
+      usedEl.textContent = `${used}/${BOT_CFG.max_safety}`;
+    }
+    if (nextEl) {
+      const entry = Number(snap.avg_entry || snap.last_price || 0);
+      const used = Number(snap.safety_used || 0);
+      const lvls = entry > 0 ? safetyLevels(entry, BOT_CFG) : [];
+      nextEl.textContent = (lvls[used] != null) ? Number(lvls[used]).toFixed(2) : "—";
+    }
+
+    const dealIdBox = $("dealIdBox");
+    const tpPriceBox = $("tpPriceBox");
+    const posBox = $("posBox");
+    if (dealIdBox) dealIdBox.textContent = snap.deal_id || "—";
+    if (tpPriceBox) tpPriceBox.textContent = snap.tp_price != null ? Number(snap.tp_price).toFixed(2) : "—";
+    if (posBox) posBox.textContent = snap.base_pos != null ? Number(snap.base_pos).toFixed(8) : "—";
+  }
+
+  function setDataHealthUI(dh){
+    const card = $("dataHealthCard");
+    const content = $("dataHealthContent");
+    if (!card || !content) return;
+    if (!dh) {
+      card.style.display = "none";
+      return;
+    }
+    card.style.display = "block";
+    const ok = dh.ok !== false;
+    const reason = dh.reason || "";
+    const provider = dh.provider || "?";
+    const sym = dh.normalized_symbol || "?";
+    const tfs = dh.timeframes || {};
+    const rows = [];
+    rows.push(`Provider: <span class="mono">${provider}</span> • Symbol: <span class="mono">${sym}</span>`);
+    if (reason && !ok) {
+      rows.push(`<span class="text-danger">Blocked: ${reason}</span>`);
+    }
+    for (const [tf, info] of Object.entries(tfs)) {
+      const c = info.count ?? 0;
+      const age = info.last_candle_age_sec != null ? `${Math.round(info.last_candle_age_sec)}s ago` : "?";
+      const sufficient = info.sufficient ? "✓" : "✗";
+      const stale = info.stale ? " (stale)" : "";
+      rows.push(`${tf}: ${c} candles, last ${age} ${sufficient}${stale}`);
+    }
+    content.innerHTML = rows.join("<br>");
+  }
+
+  function setStrategyUI(snap, bot){
+    const active = $("activeStrategyBox");
+    const regime = $("regimeBox");
+    const regimeScores = $("regimeScoresBox");
+    const risk = $("riskBox");
+    const suggest = $("suggestStrategyBox");
+    const suggestReason = $("suggestReasonBox");
+    const modeSel = $("strategyMode");
+    const forceSel = $("forceStrategy");
+    const strategyTag = $("strategyTag");
+    const regimeTag = $("regimeTag");
+    const riskTag = $("riskTag");
+
+    if (active) active.textContent = snap.active_strategy || "—";
+    if (regime) {
+      const rl = snap.regime_label;
+      const rc = snap.regime_confidence;
+      regime.textContent = rl ? `${rl} (${(Number(rc || 0) * 100).toFixed(0)}%)` : "—";
+    }
+    if (regimeScores) {
+      const scores = snap.regime_scores || {};
+      if (scores && Object.keys(scores).length > 0) {
+        const up = (Number(scores.uptrend_score || 0) * 100).toFixed(0);
+        const down = (Number(scores.downtrend_score || 0) * 100).toFixed(0);
+        const range = (Number(scores.range_score || 0) * 100).toFixed(0);
+        const hv = (Number(scores.high_vol_score || 0) * 100).toFixed(0);
+        regimeScores.textContent = `UP ${up}% • DN ${down}% • RNG ${range}% • HV ${hv}%`;
+      } else {
+        regimeScores.textContent = "—";
+      }
+    }
+    if (risk) risk.textContent = snap.risk_state || "—";
+    if (suggest) suggest.textContent = "—";
+    if (suggestReason) suggestReason.textContent = "—";
+    if (strategyTag) strategyTag.textContent = `Strategy: ${snap.active_strategy || "—"}`;
+    if (regimeTag) {
+      const rl = snap.regime_label;
+      const rc = snap.regime_confidence;
+      const conf = rl ? ` (${(Number(rc || 0) * 100).toFixed(0)}%)` : "";
+      regimeTag.textContent = `Regime: ${rl || "—"}${conf}`;
+    }
+    if (riskTag) {
+      const riskState = snap.risk_state || "—";
+      riskTag.textContent = `Risk: ${riskState}`;
+      riskTag.className = "tag" + ((riskState && riskState !== "OK") ? " tag-warn" : "");
+    }
+    if (modeSel && bot) modeSel.value = bot.strategy_mode || "classic";
+    if (forceSel && bot) forceSel.value = bot.forced_strategy || "";
+  }
+
+  async function loadRecommendation(){
+    const suggest = $("suggestStrategyBox");
+    const suggestReason = $("suggestReasonBox");
+    if (suggest) suggest.textContent = "Loading…";
+    if (suggestReason) suggestReason.textContent = "—";
+    try{
+      const data = await getJSON(`/api/bots/${BOT_ID}/recommendation`);
+      if (!data || !data.ok){
+        throw new Error(data?.error || "Recommendation failed");
+      }
+      const rec = data.recommended || "—";
+      const reg = data.regime?.label || "—";
+      const conf = data.regime?.confidence != null ? ` (${(Number(data.regime.confidence) * 100).toFixed(0)}%)` : "";
+      const note = data.note ? ` • ${data.note}` : "";
+      if (suggest) suggest.textContent = rec;
+      if (suggestReason) suggestReason.textContent = `${data.reason || "regime" } • ${reg}${conf}${note}`;
+    }catch(e){
+      if (suggest) suggest.textContent = "—";
+      if (suggestReason) suggestReason.textContent = (e.message || e);
+    }
+  }
+
+  async function saveStrategy(){
+    try{
+      const data = await getJSON(`/api/bots/${BOT_ID}/status`);
+      const bot = data.bot || BOT_DATA;
+      if(!bot){ throw new Error("Bot data unavailable"); }
+      const payload = { ...bot };
+      payload.strategy_mode = $("strategyMode").value;
+      payload.forced_strategy = $("forceStrategy").value;
+      await getJSON(`/api/bots/${BOT_ID}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      BOT_DATA = payload;
+    }catch(e){
+      console.error(e);
+      alert("Save strategy failed: " + (e.message || e));
+    }
+  }
+
+  function fmtDuration(sec){
+    if (!sec || sec <= 0) return "—";
+    const m = Math.floor(sec / 60);
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (d > 0) return `${d}d ${h % 24}h`;
+    if (h > 0) return `${h}h ${m % 60}m`;
+    return `${m}m`;
+  }
+
+  async function startBot(id){
+    setButtonsBusy(true);
+    try{
+      const data = await getJSON(`/api/bots/${id}/start`, { method:"POST" });
+      const snap = data.snap || {};
+      setStatusUI(!!snap.running, snap.last_event, snap.last_price);
+      await refreshLive();
+      // chart refresh (handled by bot_chart.js)
+      if (typeof window.__chartReload === "function") window.__chartReload();
+    }catch(e){
+      console.error(e);
+      $("statusSub").textContent = "Start failed: " + (e.message || e);
+    }finally{
+      setButtonsBusy(false);
+    }
+  }
+
+  async function stopBot(id){
+    setButtonsBusy(true);
+    try{
+      const data = await getJSON(`/api/bots/${id}/stop`, { method:"POST" });
+      const snap = data.snap || {};
+      setStatusUI(!!snap.running, snap.last_event, snap.last_price);
+      await refreshLive();
+    }catch(e){
+      console.error(e);
+      $("statusSub").textContent = "Stop failed: " + (e.message || e);
+    }finally{
+      setButtonsBusy(false);
+    }
+  }
+
+  async function closePosition(id){
+    const btn = $("btnClosePosition");
+    if(btn) btn.disabled = true;
+    try{
+      const data = await getJSON(`/api/bots/${id}/close_position`, { method:"POST" });
+      if(data.ok){
+        $("statusSub").textContent = data.message || "Position closed.";
+        await refreshLive();
+        await loadDeals();
+      }else{
+        $("statusSub").textContent = "Close failed: " + (data.error || "unknown");
+      }
+    }catch(e){
+      console.error(e);
+      $("statusSub").textContent = "Close failed: " + (e.message || e);
+    }finally{
+      if(btn) btn.disabled = false;
+    }
+  }
+
+  async function loadDeals(){
+    const data = await getJSON(`/api/bots/${BOT_ID}/deals?limit=50`);
+    const deals = data.deals || [];
+    const body = $("dealsBody");
+
+    if(!deals.length){
+      body.innerHTML = `<tr><td colspan="3" class="muted">(no deals yet)</td></tr>`;
+      return;
+    }
+
+    body.innerHTML = deals.map(d => {
+      const pnl = d.realized_pnl_quote == null ? null : Number(d.realized_pnl_quote);
+      const pnlClass = pnl == null ? "muted" : (pnl > 0 ? "pos" : pnl < 0 ? "neg" : "muted");
+      return `
+        <tr>
+          <td class="mono">${d.id}</td>
+          <td class="mono">${d.state}</td>
+          <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnl.toFixed(2)}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  let logStreamActive = false;
+  let logBuffer = [];
+  let lastLogId = 0;
+  let logsInitialized = false;
+  let autoScrollEnabled = false;
+  let logPaused = false;
+  const maxLogs = 400;
+
+  function shouldShowLog(x){
+    const category = String(x.category || "SYSTEM").toUpperCase();
+    const showStrategy = $("showStrategy")?.checked;
+    if (category === "STRATEGY" || category === "DATA") {
+      return !!showStrategy;
+    }
+    return true;
+  }
+
+  function logLevelClass(level, category){
+    const up = String(level || "").toUpperCase();
+    const cat = String(category || "").toUpperCase();
+    if (up === "ERROR") return "log-neg";
+    if (up === "WARN") return "log-warn";
+    if (cat === "ORDER") return "log-order";
+    if (cat === "RISK") return "log-risk";
+    if (cat === "DATA") return "log-data";
+    if (cat === "STRATEGY") return "log-muted";
+    return "log-muted";
+  }
+
+  function renderLogNode(x){
+    const ts = x.ts ? new Date(x.ts * 1000).toLocaleString() : "";
+    const level = String(x.level || "").toUpperCase();
+    const category = String(x.category || "GENERAL").toUpperCase();
+    const line = document.createElement("div");
+    line.className = `log-line ${logLevelClass(level, category)}`;
+    const count = Number(x.count || 1);
+    const suffix = count > 1 ? ` (x${count})` : "";
+    line.textContent = `[${ts}] ${level}/${category}: ${x.message || ""}${suffix}`;
+    return line;
+  }
+
+  function renderLogBuffer(){
+    const box = $("logsBox");
+    box.replaceChildren();
+    if (!logBuffer.length){
+      const empty = document.createElement("div");
+      empty.className = "log-line log-muted";
+      empty.textContent = "(no logs yet)";
+      box.appendChild(empty);
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    logBuffer.forEach(x => {
+      if (shouldShowLog(x)) frag.appendChild(renderLogNode(x));
+    });
+    if (frag.childNodes.length) {
+      box.appendChild(frag);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "log-line log-muted";
+      empty.textContent = "(no logs)";
+      box.appendChild(empty);
+    }
+    if (!logsInitialized) {
+      box.scrollTop = 0;
+      logsInitialized = true;
+    } else if (autoScrollEnabled) {
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+
+  async function loadLogs(){
+    const data = await getJSON(`/api/bots/${BOT_ID}/logs?limit=200`);
+    const logs = data.logs || [];
+    logBuffer = logs.slice(-maxLogs);
+    lastLogId = logBuffer.reduce((m, x) => Math.max(m, Number(x.id || 0)), 0);
+    renderLogBuffer();
+  }
+
+  async function refreshLive(){
+    // Add timeout protection
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    try {
+      const response = await fetch(`/api/bots/${BOT_ID}/live?logs_limit=200&deals_limit=50`, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      
+      const data = await response.json();
+      
+      // Handle error responses with proper messages
+      if (!response.ok || !data.ok) {
+        const errorMsg = data.error || `HTTP ${response.status}`;
+        throw new Error(errorMsg);
+      }
+      
+      BOT_DATA = data.bot || BOT_DATA;
+      const snap = data.snap || {};
+      setStatusUI(!!snap.running, snap.last_event, snap.last_price);
+      setBotStats(snap);
+      setStrategyUI(snap, BOT_DATA);
+      setDataHealthUI(data.data_health);
+
+      // Show price error if any (non-blocking warning)
+      if (data.price_error && !snap.last_price) {
+        console.warn("Price fetch warning:", data.price_error);
+      }
+
+      // logs
+      const logs = data.logs || [];
+      if (!logStreamActive){
+        logBuffer = logs.slice(-maxLogs);
+        lastLogId = logBuffer.reduce((m, x) => Math.max(m, Number(x.id || 0)), 0);
+        renderLogBuffer();
+      }
+
+      // deals
+      const deals = data.deals || [];
+      const body = $("dealsBody");
+      if(!deals.length){
+        body.innerHTML = `<tr><td colspan="4" class="muted">(no deals yet)</td></tr>`;
+      }else{
+        body.innerHTML = deals.map(d => {
+          const pnl = d.realized_pnl_quote == null ? null : Number(d.realized_pnl_quote);
+          const pnlClass = pnl == null ? "muted" : (pnl > 0 ? "pos" : pnl < 0 ? "neg" : "muted");
+          return `
+            <tr>
+              <td class="mono">${d.id}</td>
+              <td class="mono">${d.state}</td>
+              <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnl.toFixed(2)}</td>
+              <td class="right"><a class="btn" href="/deals/${d.id}">View</a></td>
+            </tr>
+          `;
+        }).join("");
+      }
+
+      return data;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err.name === "AbortError") {
+        console.warn("refreshLive timed out after 10s");
+        // Don't update UI on timeout - keep existing data
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // First paint
+  refreshLive().catch(e => {
+    console.error("refreshLive error:", e);
+    const errMsg = e.message || String(e);
+    $("statusSub").textContent = "Live refresh failed: " + errMsg;
+    $("statusSub").style.color = "#f23645";
+  });
+
+  // Prefer real-time streams (no refresh needed)
+  function startStatusStream(){
+    try{
+      const es = new EventSource(`/api/bots/${BOT_ID}/stream`);
+      es.onmessage = (ev) => {
+        try{
+          const payload = JSON.parse(ev.data || "{}");
+          const snap = payload.snap || {};
+          setStatusUI(!!snap.running, snap.last_event, snap.last_price);
+          setBotStats(snap);
+          setStrategyUI(snap, BOT_DATA);
+        }catch(_){}
+      };
+    }catch(e){
+      console.warn("Status stream not available:", e);
+    }
+  }
+
+  function startLogStream(){
+    const box = $("logsBox");
+
+    function isNearBottom(){
+      const threshold = 24;
+      return (box.scrollTop + box.clientHeight) >= (box.scrollHeight - threshold);
+    }
+
+    function addLine(x){
+      const id = Number(x.id || 0);
+      if (id && id <= lastLogId) return;
+      if (id) lastLogId = id;
+      logBuffer.push(x);
+      while (logBuffer.length > maxLogs) logBuffer.shift();
+
+      if (logPaused) return;
+      const stick = autoScrollEnabled && isNearBottom();
+      if (shouldShowLog(x)) {
+        const node = renderLogNode(x);
+        box.appendChild(node);
+        while (box.childNodes.length > maxLogs) {
+          box.removeChild(box.firstChild);
+        }
+        if (stick) box.scrollTop = box.scrollHeight;
+      }
+    }
+
+    // seed initial logs once
+    refreshLive().then(() => {
+      if (logBuffer.length) return;
+      // seed buffer if refresh populated
+      const maxId = logBuffer.reduce((m, x) => Math.max(m, Number(x.id || 0)), 0);
+      if (maxId) lastLogId = maxId;
+    }).catch(()=>{});
+
+    try{
+      const es = new EventSource(`/api/bots/${BOT_ID}/logstream`);
+      es.onopen = () => { logStreamActive = true; };
+      es.onmessage = (ev) => {
+        try{
+          const payload = JSON.parse(ev.data || "{}");
+          if(payload && payload.log) addLine(payload.log);
+        }catch(_){}
+      };
+    }catch(e){
+      console.warn("Log stream not available:", e);
+    }
+  }
+
+  $("logsBox").addEventListener("scroll", () => {
+    autoScrollEnabled = (Math.abs($("logsBox").scrollTop + $("logsBox").clientHeight - $("logsBox").scrollHeight) < 24);
+  });
+
+  $("showStrategy").addEventListener("change", () => {
+    renderLogBuffer();
+  });
+  $("pauseLogs").addEventListener("change", (ev) => {
+    logPaused = !!ev.target.checked;
+    if (!logPaused) renderLogBuffer();
+  });
+
+  startStatusStream();
+  startLogStream();
+
+  if ($("manualOrderType")) {
+    updateManualOrderFields();
+    $("manualOrderType").addEventListener("change", updateManualOrderFields);
+  }
+  if ($("ordersRefresh")) $("ordersRefresh").addEventListener("click", loadOpenOrders);
+  if ($("ordersCancelAll")) $("ordersCancelAll").addEventListener("click", cancelAllOrders);
+  loadOpenOrders();
+  if ($("suggestRefresh")) $("suggestRefresh").addEventListener("click", loadRecommendation);
+  loadRecommendation();
+
+  // PnL chart
+  let pnlChart;
+  let pnlSeries;
+  let drawdownChart;
+  let drawdownSeries;
+  function chartTheme(){
+    const styles = getComputedStyle(document.documentElement);
+    return {
+      text: styles.getPropertyValue("--text").trim() || "#0f172a",
+      border: styles.getPropertyValue("--border").trim() || "rgba(148, 163, 184, 0.12)",
+      success: styles.getPropertyValue("--success").trim() || "#16a34a",
+      danger: styles.getPropertyValue("--danger").trim() || "#dc2626",
+    };
+  }
+  function applyChartTheme(){
+    const theme = chartTheme();
+    if (pnlChart) {
+      pnlChart.applyOptions({
+        layout: { background: { type: "solid", color: "transparent" }, textColor: theme.text },
+        grid: { vertLines: { color: theme.border }, horzLines: { color: theme.border } },
+      });
+    }
+    if (pnlSeries) {
+      pnlSeries.applyOptions({ color: theme.success });
+    }
+    if (drawdownChart) {
+      drawdownChart.applyOptions({
+        layout: { background: { type: "solid", color: "transparent" }, textColor: theme.text },
+        grid: { vertLines: { color: theme.border }, horzLines: { color: theme.border } },
+      });
+    }
+    if (drawdownSeries) {
+      drawdownSeries.applyOptions({
+        topColor: "rgba(220,38,38,0.35)",
+        bottomColor: "rgba(220,38,38,0.05)",
+        lineColor: theme.danger,
+      });
+    }
+  }
+  async function loadPnlSeries(){
+    try{
+      const data = await getJSON(`/api/bots/${BOT_ID}/pnl_series?limit=500`);
+      const series = data.series || [];
+      if (!pnlChart && window.LightweightCharts && window.LightweightCharts.createChart) {
+        const el = document.getElementById("pnlChart");
+        const theme = chartTheme();
+        pnlChart = window.LightweightCharts.createChart(el, {
+          width: el.clientWidth || 600,
+          height: el.clientHeight || 220,
+          layout: { background: { type: "solid", color: "transparent" }, textColor: theme.text },
+          grid: {
+            vertLines: { color: theme.border },
+            horzLines: { color: theme.border },
+          },
+          timeScale: { timeVisible: true, secondsVisible: false },
+        });
+        pnlSeries = pnlChart.addLineSeries({ color: theme.success, lineWidth: 2 });
+      }
+      if (pnlSeries) {
+        pnlSeries.setData(series);
+        pnlChart.timeScale().fitContent();
+      }
+    }catch(e){
+      console.warn("PnL series failed:", e);
+    }
+  }
+  document.getElementById("pnlRefresh").addEventListener("click", loadPnlSeries);
+  loadPnlSeries();
+
+  async function loadMetrics(){
+    try{
+      const data = await getJSON(`/api/bots/${BOT_ID}/metrics?limit=500`);
+      const perf = data.perf || {};
+      const ddSeries = data.drawdown_series || [];
+      const winRate = perf.win_rate != null ? `${(Number(perf.win_rate) * 100).toFixed(1)}%` : "—";
+      const avgDur = fmtDuration(Number(perf.avg_duration_sec || 0));
+      const wins = Number(perf.wins || 0);
+      const losses = Number(perf.losses || 0);
+      $("winRateBox").textContent = winRate;
+      $("avgDurationBox").textContent = avgDur;
+      $("dealCountBox").textContent = `${wins}/${losses}`;
+
+      if (!drawdownChart && window.LightweightCharts && window.LightweightCharts.createChart) {
+        const el = document.getElementById("drawdownChart");
+        const theme = chartTheme();
+        drawdownChart = window.LightweightCharts.createChart(el, {
+          width: el.clientWidth || 600,
+          height: el.clientHeight || 160,
+          layout: { background: { type: "solid", color: "transparent" }, textColor: theme.text },
+          grid: {
+            vertLines: { color: theme.border },
+            horzLines: { color: theme.border },
+          },
+          timeScale: { timeVisible: true, secondsVisible: false },
+        });
+        drawdownSeries = drawdownChart.addAreaSeries({
+          topColor: "rgba(220,38,38,0.35)",
+          bottomColor: "rgba(220,38,38,0.05)",
+          lineColor: theme.danger,
+          lineWidth: 2,
+        });
+      }
+      if (drawdownSeries) {
+        drawdownSeries.setData(ddSeries);
+        drawdownChart.timeScale().fitContent();
+      }
+    }catch(e){
+      console.warn("Metrics failed:", e);
+    }
+  }
+  document.getElementById("metricsRefresh").addEventListener("click", loadMetrics);
+  loadMetrics();
+  window.addEventListener("themechange", applyChartTheme);
+
+  // Deals + snapshot fallback refresh (slower)
+  setInterval(() => {
+    refreshLive().catch(e => console.error(e));
+  }, 10000);
+</script>
+
+<!-- ===== Chart scripts (single include, single init) ===== -->
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+  window.__BOT_ID__ = {{ bot.id }};
+</script>
+<script src="/static/bot_chart.js"></script>
+
+{% endblock %}

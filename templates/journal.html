@@ -1,0 +1,148 @@
+{% extends "layout.html" %}
+{% block title %}Trade Journal{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Trade Journal</div>
+      <div class="muted">Entry/exit reasons, lessons learned</div>
+    </div>
+    <div class="row gap-8 row-wrap row-end">
+      <select id="daysFilter" class="input w-140">
+        <option value="30">Last 30 days</option>
+        <option value="90" selected>Last 90 days</option>
+        <option value="180">Last 180 days</option>
+      </select>
+      <select id="strategyFilter" class="input w-140">
+        <option value="">All strategies</option>
+      </select>
+      <input type="text" id="searchInput" class="input w-160" placeholder="Search symbol..." />
+      <button id="btnExportPdf" class="btn btn-ghost" title="Print or save as PDF">Export PDF</button>
+    </div>
+  </div>
+
+  <div id="journalList" class="card section">
+    <div class="card-head">
+      <div class="h2">Closed Trades</div>
+      <div class="muted" id="countLabel">—</div>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Symbol</th>
+            <th>Bot</th>
+            <th>Strategy</th>
+            <th class="right">PnL</th>
+            <th>Entry reason</th>
+            <th>Exit reason</th>
+            <th>Lessons</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="journalTableBody">
+          <tr><td colspan="8" class="muted">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="journalModal" class="modal-overlay hidden">
+    <div class="card modal-card">
+      <div class="card-head">
+        <div class="h2">Deal #<span id="modalDealId">—</span></div>
+        <button id="closeModal" class="btn btn-ghost">Close</button>
+      </div>
+      <div class="section-sm">
+        <label class="card-label">Entry reason</label>
+        <textarea id="modalEntryReason" class="input" rows="2"></textarea>
+      </div>
+      <div class="section-sm">
+        <label class="card-label">Exit reason</label>
+        <textarea id="modalExitReason" class="input" rows="2"></textarea>
+      </div>
+      <div class="section-sm">
+        <label class="card-label">Lessons learned</label>
+        <textarea id="modalLessons" class="input" rows="3"></textarea>
+      </div>
+      <div class="row gap-8 section-sm">
+        <button id="saveJournal" class="btn btn-purple">Save</button>
+        <a id="dealLink" href="#" class="btn">View deal</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let allDeals = [];
+  let currentDealId = null;
+  function fmtDate(ts){ return ts ? new Date(ts*1000).toLocaleDateString() : '—'; }
+  function fmtPnl(v){ if(v==null)return '—'; var n=Number(v),c=n>=0?'pos':'neg'; return '<span class="'+c+'">'+(n>=0?'+':'')+n.toFixed(2)+'</span>'; }
+  async function loadJournal(){
+    var days=document.getElementById('daysFilter').value;
+    var strat=document.getElementById('strategyFilter').value;
+    var url='/api/journal?days='+days;
+    if(strat) url+='&strategy='+encodeURIComponent(strat);
+    var r=await fetch(url,_authHeaders());
+    var data=await r.json();
+    if(!data.ok)throw new Error(data.error||'Failed');
+    allDeals=data.deals||[];
+    populateStrategyFilter();
+    renderTable();
+  }
+  function populateStrategyFilter(){
+    var stratSel=document.getElementById('strategyFilter');
+    if(!stratSel)return;
+    var strats=new Set();
+    allDeals.forEach(function(d){
+      var s=d.entry_strategy||d.exit_strategy;
+      if(s) strats.add(s);
+    });
+    var opts=stratSel.querySelectorAll('option');
+    for(var i=1;i<opts.length;i++) opts[i].remove();
+    strats.forEach(function(s){
+      var o=document.createElement('option');
+      o.value=s;
+      o.textContent=s;
+      stratSel.appendChild(o);
+    });
+  }
+  function renderTable(){
+    var search=(document.getElementById('searchInput').value||'').toUpperCase();
+    var filtered=allDeals.filter(function(d){return !search||(d.symbol||'').toUpperCase().indexOf(search)!==-1;});
+    document.getElementById('countLabel').textContent=filtered.length+' trades';
+    var tbody=document.getElementById('journalTableBody');
+    tbody.innerHTML=filtered.map(function(d){
+      var j=d.journal||{};
+      var strat=d.entry_strategy||d.exit_strategy||'—';
+      return '<tr><td>'+fmtDate(d.closed_at)+'</td><td class="mono">'+(d.symbol||'—')+'</td><td>'+(d.bot_name||d.bot_id)+'</td><td class="mono text-xs">'+strat+'</td><td class="right">'+fmtPnl(d.realized_pnl_quote)+'</td><td class="text-xs">'+(j.entry_reason||'—').substring(0,40)+'</td><td class="text-xs">'+(j.exit_reason||'—').substring(0,40)+'</td><td class="text-xs">'+(j.lessons_learned||'—').substring(0,40)+'</td><td><a href="/deals/'+d.id+'" class="btn btn-ghost" target="_blank">Chart</a> <button class="btn btn-ghost" onclick="openModal('+d.id+'); return false;">Edit</button></td></tr>';
+    }).join('')||'<tr><td colspan="9" class="muted">No closed trades</td></tr>';
+  }
+  function openModal(dealId){
+    currentDealId=dealId;
+    var d=allDeals.find(function(x){return x.id===dealId;});
+    if(!d)return;
+    document.getElementById('modalDealId').textContent=dealId;
+    document.getElementById('modalEntryReason').value=(d.journal||{}).entry_reason||'';
+    document.getElementById('modalExitReason').value=(d.journal||{}).exit_reason||'';
+    document.getElementById('modalLessons').value=(d.journal||{}).lessons_learned||'';
+    document.getElementById('dealLink').href='/deals/'+dealId;
+    document.getElementById('journalModal').classList.remove('hidden');
+  }
+  async function saveJournal(){
+    if(!currentDealId)return;
+    await fetch('/api/journal/'+currentDealId,_authHeaders({method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry_reason:document.getElementById('modalEntryReason').value,exit_reason:document.getElementById('modalExitReason').value,lessons_learned:document.getElementById('modalLessons').value})}));
+    document.getElementById('journalModal').classList.add('hidden');
+    loadJournal();
+  }
+  document.getElementById('daysFilter').addEventListener('change',loadJournal);
+  document.getElementById('strategyFilter').addEventListener('change',loadJournal);
+  document.getElementById('searchInput').addEventListener('input',renderTable);
+  document.getElementById('btnExportPdf').addEventListener('click',function(){ window.print(); });
+  document.getElementById('closeModal').addEventListener('click',function(){document.getElementById('journalModal').classList.add('hidden');});
+  document.getElementById('saveJournal').addEventListener('click',saveJournal);
+  loadJournal();
+</script>
+<style>.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:100}.modal-overlay.hidden{display:none}.modal-card{max-width:560px;width:100%;margin:16px}@media print{.sidebar,.footer,button,input,select,.navlink,#installPwaBanner,#themeToggle,#langSelect,#pauseAllBtn,#btnExportPdf{display:none!important}}</style>
+{% endblock %}

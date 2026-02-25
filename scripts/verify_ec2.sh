@@ -1,0 +1,23 @@
+#!/bin/bash
+# One-command EC2 verification: services, ports, health.
+# Run ON THE EC2 SERVER: ssh ubuntu@3.148.6.246 "cd /home/ubuntu/local_3comas_clone_v2 && bash scripts/verify_ec2.sh"
+# (No set -e: continue even if some checks fail)
+echo "=== EC2 Verification ==="
+echo ""
+echo "=== Services ==="
+systemctl is-active tradingserver 2>/dev/null || echo "tradingserver: not active"
+systemctl is-active bot-worker 2>/dev/null || echo "bot-worker: not active"
+systemctl is-active nginx 2>/dev/null || echo "nginx: not active"
+echo ""
+echo "=== Listening ports ==="
+ss -lntp 2>/dev/null | grep -E ':80|:443|:8000|:9001' || echo "(none found)"
+echo ""
+echo "=== Health checks ==="
+echo -n "127.0.0.1/health: "
+curl -sS -o /dev/null -w "%{http_code}\n" -m 5 http://127.0.0.1/health 2>/dev/null || echo "FAIL"
+echo -n "127.0.0.1/api/health: "
+curl -sS -o /dev/null -w "%{http_code}\n" -m 5 http://127.0.0.1/api/health 2>/dev/null || echo "FAIL"
+echo -n "127.0.0.1:8000/health: "
+curl -sS -o /dev/null -w "%{http_code}\n" -m 5 http://127.0.0.1:8000/health 2>/dev/null || echo "FAIL"
+echo ""
+echo "=== Done ==="

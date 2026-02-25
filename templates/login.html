@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="card auth-card">
+    <div class="card-head">
+      <div>
+        <div class="h2">Sign in</div>
+        <div class="muted">Enter your password to access the dashboard.</div>
+      </div>
+    </div>
+    {% if not auth_enabled %}
+      <div class="muted">Auth is disabled. Set <span class="mono">UI_PASSWORD</span> and <span class="mono">UI_SESSION_SECRET</span>.</div>
+    {% else %}
+      {% if error %}
+        <div class="tag tag-neg mb-10">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login">
+        <input type="hidden" name="next" value="{{ next or '/' }}">
+        <div class="mb-10">
+          <div class="card-label">Password</div>
+          <input class="input" type="password" name="password" placeholder="••••••••" required>
+        </div>
+        <label class="row gap-8 mb-12">
+          <input type="checkbox" name="remember" value="1">
+          <span class="muted">Keep me logged in</span>
+        </label>
+        <button class="btn btn-purple" type="submit">Sign in</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

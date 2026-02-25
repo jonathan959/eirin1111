@@ -1,0 +1,123 @@
+{% extends "layout.html" %}
+{% block title %}Scenario Simulator{% endblock %}
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Scenario Simulator</div>
+      <div class="muted">What-if: simulate price moves and portfolio impact</div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Scenario</div>
+    </div>
+    <div class="grid grid-2 gap-12">
+      <div>
+        <label class="card-label">Symbol / asset</label>
+        <input type="text" id="scenarioSymbol" class="input" placeholder="e.g. XBT/USD, AAPL" value="XBT/USD" />
+      </div>
+      <div>
+        <label class="card-label">Price change %</label>
+        <input type="number" id="scenarioPct" class="input" placeholder="-20" value="-20" step="1" />
+      </div>
+    </div>
+    <div class="section-sm">
+      <button id="runScenario" class="btn btn-purple">Simulate</button>
+    </div>
+  </div>
+
+  <div id="scenarioResult" class="card section hidden">
+    <div class="card-head">
+      <div class="h2">Impact</div>
+    </div>
+    <div class="grid grid-3">
+      <div class="card card-stat">
+        <div class="card-label">Current portfolio value</div>
+        <div class="card-value" id="currValue">—</div>
+      </div>
+      <div class="card card-stat">
+        <div class="card-label">Simulated value after move</div>
+        <div class="card-value" id="simValue">—</div>
+      </div>
+      <div class="card card-stat">
+        <div class="card-label">Delta</div>
+        <div class="card-value" id="simDelta">—</div>
+      </div>
+    </div>
+    <div id="stopsTriggered" class="section-sm" style="margin-top:12px;"></div>
+    <div class="section-sm muted">
+      <p>Estimates impact if the asset moves by the given %. Uses current positions. Trailing stops and TP would likely trigger on large moves.</p>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Example scenarios</div>
+    </div>
+    <div class="row gap-8 row-wrap">
+      <button class="btn btn-ghost" onclick="setScenario('XBT/USD', -20)">BTC -20%</button>
+      <button class="btn btn-ghost" onclick="setScenario('XBT/USD', -10)">BTC -10%</button>
+      <button class="btn btn-ghost" onclick="setScenario('XBT/USD', 10)">BTC +10%</button>
+      <button class="btn btn-ghost" onclick="setScenario('ETH/USD', -20)">ETH -20%</button>
+      <button class="btn btn-ghost" onclick="setScenario('SPY', -5)">SPY -5%</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function setScenario(sym, pct) {
+    document.getElementById('scenarioSymbol').value = sym;
+    document.getElementById('scenarioPct').value = pct;
+  }
+
+  async function runScenario() {
+    const symbol = (document.getElementById('scenarioSymbol').value || 'XBT/USD').trim();
+    const pct = parseFloat(document.getElementById('scenarioPct').value) || 0;
+    const pctMult = 1 + pct / 100;
+
+    let port = { total_usd: 0, holdings: [] };
+    try {
+      const r = await fetch('/api/portfolio', _authHeaders());
+      const data = await r.json();
+      if (data.ok && data.portfolio) port = data.portfolio;
+      else if (data.portfolio) port = data.portfolio;
+      else if (data.holdings) port.holdings = data.holdings;
+    } catch (e) { console.warn(e); }
+
+    const curr = parseFloat(port.total_usd) || 0;
+    let exposureToAsset = 0;
+    const symNorm = symbol.replace('/', '').toUpperCase();
+    for (const h of port.holdings || []) {
+      const a = (h.asset || '').toUpperCase();
+      if (a === symNorm || a === symbol.split('/')[0]) {
+        exposureToAsset = parseFloat(h.usd_value) || (parseFloat(h.amount) || 0) * (parseFloat(h.price) || 0);
+        break;
+      }
+    }
+    const delta = exposureToAsset * (pctMult - 1);
+    const simVal = curr + delta;
+
+    document.getElementById('currValue').textContent = '$' + curr.toFixed(2);
+    document.getElementById('simValue').textContent = '$' + simVal.toFixed(2);
+    const dEl = document.getElementById('simDelta');
+    dEl.textContent = (delta >= 0 ? '+' : '') + delta.toFixed(2);
+    dEl.className = 'card-value ' + (delta >= 0 ? 'pos' : 'neg');
+    document.getElementById('scenarioResult').classList.remove('hidden');
+
+    const stopsEl = document.getElementById('stopsTriggered');
+    if (stopsEl && exposureToAsset > 0) {
+      if (pct < -10) {
+        stopsEl.innerHTML = '<div class="tag tag-warn">⚠️ Large drop (' + pct + '%) would likely trigger trailing stops or stop-loss on ' + symbol + ' position</div>';
+      } else if (pct > 15) {
+        stopsEl.innerHTML = '<div class="tag tag-pos">📈 Move +' + pct + '% could hit take-profit targets on ' + symbol + '</div>';
+      } else {
+        stopsEl.innerHTML = '';
+      }
+    } else if (stopsEl) stopsEl.innerHTML = '';
+  }
+
+  document.getElementById('runScenario').addEventListener('click', runScenario);
+</script>
+{% endblock %}

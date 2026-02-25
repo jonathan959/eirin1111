@@ -1,0 +1,37 @@
+[Unit]
+Description=Trading Bot Server (UI + API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/local_3comas_clone_v2
+Environment="PATH=/home/ubuntu/local_3comas_clone_v2/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TMPDIR=/home/ubuntu/local_3comas_clone_v2/tmp"
+EnvironmentFile=/home/ubuntu/local_3comas_clone_v2/.env
+ExecStartPre=/home/ubuntu/local_3comas_clone_v2/venv/bin/python -m compileall -q /home/ubuntu/local_3comas_clone_v2 || true
+ExecStartPre=/bin/bash -c '/home/ubuntu/local_3comas_clone_v2/scripts/keys_check.sh /home/ubuntu/local_3comas_clone_v2'
+ExecStart=/home/ubuntu/local_3comas_clone_v2/venv/bin/uvicorn one_server:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 30
+Restart=always
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=60
+KillMode=control-group
+KillSignal=SIGTERM
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Stability: cap memory so OOM killer targets us, not the whole system (2G for ML/heavy modules)
+MemoryMax=2048M
+MemoryHigh=1800M
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingserver
+
+[Install]
+WantedBy=multi-user.target

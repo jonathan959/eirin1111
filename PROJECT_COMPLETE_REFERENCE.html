@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Eirin Bot - Complete Project Reference</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; line-height: 1.6; color: #1a1a1a; }
+    h1 { border-bottom: 2px solid #4f46e5; padding-bottom: 0.5rem; }
+    h2 { color: #4f46e5; margin-top: 2rem; }
+    h3 { margin-top: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    th { background: #f3f4f6; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    pre { background: #1e1e1e; color: #d4d4d4; padding: 1rem; overflow-x: auto; }
+    ul { margin: 0.5rem 0; }
+    .meta { color: #6b7280; font-size: 0.9rem; margin-bottom: 2rem; }
+    @media print { body { padding: 1rem; } }
+  </style>
+</head>
+<body>
+  <p class="meta"><strong>Purpose:</strong> Comprehensive reference for AI agents. <strong>Version:</strong> 2.0 | <strong>Live:</strong> http://3.148.6.246 | <strong>Date:</strong> February 2026</p>
+
+  <h1>Eirin Bot / Local 3Comas Clone — Complete Project Reference</h1>
+
+  <h2>1. PRODUCT OVERVIEW</h2>
+  <p><strong>Eirin Bot</strong> is an automated multi-asset trading system that:</p>
+  <ul>
+    <li>Trades <strong>cryptocurrency</strong> (Kraken) and <strong>US stocks</strong> (Alpaca)</li>
+    <li>Uses a <strong>7-layer intelligence stack</strong> for entry/exit decisions</li>
+    <li>Provides a <strong>3Comas-style web UI</strong> (dashboard, bots, recommendations, risk controls)</li>
+    <li>Supports <strong>multiple strategies</strong>: Smart DCA, Grid, Trend Follow, Mean Reversion, Breakout, etc.</li>
+    <li>Runs <strong>fully automatic</strong> with optional dry-run mode</li>
+    <li><strong>Deployment:</strong> EC2 at 3.148.6.246, deploy via <code>deploy.ps1</code></li>
+  </ul>
+
+  <h2>2. WEBSITE PAGES & UI</h2>
+  <h3>Full App Routes</h3>
+  <table>
+    <tr><th>Page</th><th>Route</th><th>Description</th></tr>
+    <tr><td>Dashboard</td><td>/</td><td>Portfolio, bots, deals, PnL</td></tr>
+    <tr><td>DCA Dashboard</td><td>/dca</td><td>DCA-specific bot view</td></tr>
+    <tr><td>Explore</td><td>/explore</td><td>Market browser + AI recommendations</td></tr>
+    <tr><td>Strategy Leaderboard</td><td>/strategies</td><td>Strategy performance ranking</td></tr>
+    <tr><td>Trade Journal</td><td>/journal</td><td>Trade journal entries</td></tr>
+    <tr><td>Analytics</td><td>/analytics</td><td>Performance analytics</td></tr>
+    <tr><td>Scenario Simulator</td><td>/scenario-simulator</td><td>Scenario simulation</td></tr>
+    <tr><td>Safety</td><td>/safety</td><td>Global pause, kill switch</td></tr>
+    <tr><td>Bots</td><td>/bots</td><td>Bot list and management</td></tr>
+    <tr><td>Bot Detail</td><td>/bots/{id}</td><td>Individual bot view with charts</td></tr>
+    <tr><td>Deal Detail</td><td>/deals/{id}</td><td>Single deal view</td></tr>
+    <tr><td>Autopilot</td><td>/autopilot</td><td>Autopilot dashboard</td></tr>
+    <tr><td>Setup Autopilot</td><td>/setup-autopilot</td><td>Autopilot configuration</td></tr>
+    <tr><td>Intelligence</td><td>/intelligence</td><td>Intelligence Layer dashboard</td></tr>
+  </table>
+
+  <h2>3. API ENDPOINTS (Summary)</h2>
+  <p><strong>Bots:</strong> GET/POST /api/bots, GET/PUT/DELETE /api/bots/{id}, POST /api/bots/{id}/start, /stop, /close_position</p>
+  <p><strong>Market:</strong> /api/symbols, /api/prices, /api/market/ticker, /api/market/ohlcv, /api/portfolio</p>
+  <p><strong>Recommendations:</strong> /api/recommendations, /api/recommendations/scan, /api/recommendations/{symbol}/create_bot</p>
+  <p><strong>Safety:</strong> /api/pause, /api/risk/kill</p>
+  <p><strong>Health:</strong> /health, /api/health, /api/comprehensive_health</p>
+  <p><strong>Autopilot:</strong> /api/autopilot/config, /api/autopilot/status, /api/autopilot/start, /stop</p>
+  <p><em>Full list: 80+ endpoints in worker_api.py</em></p>
+
+  <h2>4. INTELLIGENCE SYSTEM</h2>
+  <p><strong>7 Layers:</strong> Data Validity → Market Safety → Regime Detection → Strategy Routing → Position Sizing → Execution Policy → Trade Management</p>
+  <p><strong>Regimes:</strong> STRONG_BULL, WEAK_BULL, RANGE, WEAK_BEAR, STRONG_BEAR, HIGH_VOL_DEFENSIVE, BREAKOUT, RISK_OFF</p>
+  <p><strong>Phases:</strong> Phase 1 (trailing stop, cooldown, filters), Phase 2 (multi-timeframe, Kelly, sentiment), Phase 3 (ML), Phase 4 (correlation, seasonality, options flow, etc.)</p>
+
+  <h2>5. TRADING STRATEGIES</h2>
+  <p>Smart DCA, Classic DCA, Grid, Trend Follow, Range Mean Reversion, High Vol Defensive, Breakout</p>
+
+  <h2>6. EXCHANGES</h2>
+  <p><strong>Kraken:</strong> Crypto spot (kraken_client.py, CCXT)</p>
+  <p><strong>Alpaca:</strong> US stocks paper/live (alpaca_client.py, alpaca_adapter.py)</p>
+
+  <h2>7. KEY FILES</h2>
+  <pre>app.py, one_server_v2.py, worker_api.py, bot_manager.py, intelligence_layer.py,
+phase1_intelligence.py, strategies.py, executor.py, db.py, kraken_client.py,
+alpaca_client.py, alpaca_adapter.py, symbol_classifier.py, market_data.py,
+templates/, static/, deploy.ps1</pre>
+
+  <h2>8. DEPLOYMENT</h2>
+  <p><code>.\deploy.ps1</code> or <code>.\deploy.ps1 -Quick</code> | Service: ai-bot | Nginx → 8000 | Daily disk cleanup at 4am UTC</p>
+
+  <p style="margin-top: 3rem; color: #6b7280; font-size: 0.9rem;"><em>For full details, see PROJECT_COMPLETE_REFERENCE.md in the project root.</em></p>
+</body>
+</html>

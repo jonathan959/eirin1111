@@ -1,0 +1,121 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Deal #{{ deal.id }}</div>
+      <div class="muted mono">Bot {{ bot.name or deal.bot_id }} • {{ deal.symbol }}</div>
+      {% if not kraken_ready %}
+        <div class="muted mt-6">
+          <span class="tag tag-neg">Kraken not ready</span>
+          <span class="mono text-xs">{{ kraken_error }}</span>
+        </div>
+      {% endif %}
+    </div>
+    <div class="row gap-8 row-wrap row-end">
+      <a class="btn" href="/dca">DCA Dashboard</a>
+      <a class="btn" href="/bots/{{ deal.bot_id }}">Bot</a>
+      <button class="btn btn-purple" onclick="startBot({{ deal.bot_id }})">Start Bot</button>
+      <button class="btn" onclick="stopBot({{ deal.bot_id }})">Stop Bot</button>
+    </div>
+  </div>
+
+  <div class="grid grid-3">
+    <div class="card">
+      <div class="card-label">State</div>
+      <div class="card-value">{{ deal.state }}</div>
+      <div class="card-sub muted">Opened at {{ deal.opened_at }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Entry avg</div>
+      <div class="card-value mono">{{ "%.2f"|format(deal.entry_avg) if deal.entry_avg is not none else "—" }}</div>
+      <div class="card-sub muted">TP target {{ "%.2f"|format(tp_target) if tp_target is not none else "—" }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Size (base)</div>
+      <div class="card-value mono">{{ "%.8f"|format(deal.base_amount) if deal.base_amount is not none else "—" }}</div>
+      <div class="card-sub muted">Last price {{ "%.2f"|format(last_price) if last_price is not none else "—" }}</div>
+    </div>
+  </div>
+
+  <div class="grid grid-3 section">
+    <div class="card">
+      <div class="card-label">Exit avg</div>
+      <div class="card-value mono">{{ "%.2f"|format(deal.exit_avg) if deal.exit_avg is not none else "—" }}</div>
+      <div class="card-sub muted">Closed at {{ deal.closed_at or "—" }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Realized PnL</div>
+      <div class="card-value {% if deal.realized_pnl_quote is not none and deal.realized_pnl_quote >= 0 %}pos{% elif deal.realized_pnl_quote is not none %}neg{% else %}muted{% endif %}">
+        {{ "%.2f"|format(deal.realized_pnl_quote) if deal.realized_pnl_quote is not none else "—" }}
+      </div>
+      <div class="card-sub muted">Closed only</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Unrealized PnL</div>
+      <div class="card-value {% if unrealized_pnl is not none and unrealized_pnl >= 0 %}pos{% else %}neg{% endif %}">
+        {{ "%.2f"|format(unrealized_pnl) if unrealized_pnl is not none else "—" }}
+      </div>
+      <div class="card-sub muted">Live snapshot</div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Deal timeline</div>
+        <div class="muted">Actions around this deal</div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Level</th>
+            <th>Category</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for l in timeline %}
+          <tr>
+            <td class="mono">{{ l.ts }}</td>
+            <td class="mono">{{ l.level }}</td>
+            <td class="mono">{{ l.category }}</td>
+            <td>{{ l.message }}{% if l.count and l.count > 1 %} (x{{ l.count }}){% endif %}</td>
+          </tr>
+          {% endfor %}
+          {% if timeline|length == 0 %}
+          <tr>
+            <td colspan="4" class="muted">No timeline events found.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  async function getJSON(url, opts){
+    const r = await fetch(url, opts || {});
+    const data = await r.json().catch(async () => {
+      const t = await r.text();
+      throw new Error(url + " -> " + r.status + " " + t);
+    });
+    if(!r.ok){
+      throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
+    }
+    return data;
+  }
+
+  async function startBot(id){
+    try{ await getJSON(`/api/bots/${id}/start`, { method:"POST" }); }catch(_){}
+  }
+  async function stopBot(id){
+    try{ await getJSON(`/api/bots/${id}/stop`, { method:"POST" }); }catch(_){}
+  }
+</script>
+{% endblock %}
