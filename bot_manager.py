@@ -2057,7 +2057,7 @@ class BotRunner:
                     
                     if not resolved:
                         # Symbol not found in current client. Try switching?
-                        if market_type == "crypto": 
+                        if stored_market_type == "crypto": 
                             # Failed on Kraken, check Alpaca
                             self._log(f"Symbol {raw_symbol} not found on Kraken. Checking Alpaca...", "WARN")
                             alpaca_client = getattr(self.manager, "alpaca_live", None) or getattr(self.manager, "alpaca_paper", None)
@@ -2328,7 +2328,7 @@ class BotRunner:
                         )
                         if not ok and cb_reason:
                             risk_reason = cb_reason
-                            trip_and_alert(cb_reason, pause_hours=int(bot.get("pause_hours", 6)), bot_label=bot.get("label", str(bot_id)))
+                            trip_and_alert(cb_reason, pause_hours=int(bot.get("pause_hours", 6)), bot_label=bot.get("label", str(self.bot_id)))
                     except Exception as e:
                         import logging
                         logging.getLogger(__name__).debug("Circuit breaker check failed: %s", e)
@@ -2414,7 +2414,7 @@ class BotRunner:
                             try:
                                 pause_hours = int(bot.get("pause_hours", 6))
                                 if trip_and_alert:
-                                    trip_and_alert(risk_reason, pause_hours=pause_hours, bot_label=bot.get("label", str(bot_id)))
+                                    trip_and_alert(risk_reason, pause_hours=pause_hours, bot_label=bot.get("label", str(self.bot_id)))
                                 else:
                                     set_setting("global_pause", "1")
                                     set_setting("global_pause_until", str(int(time.time()) + (pause_hours * 3600)))
@@ -2764,15 +2764,8 @@ class BotRunner:
                         from phase1_intelligence import should_auto_close_eod
                         if should_auto_close_eod():
                             eod_close_triggered = True
-                            decision = Decision(
-                                "EXIT",
-                                "AUTO_CLOSE_EOD: Closing before market close.",
-                                {"side": "sell", "type": "market", "size_base": float(pos_total)},
-                                {"regime": regime},
-                                "auto_close_eod",
-                            )
-                            decision.strategy = "auto_close_eod"
-                            intel_decision.proposed_orders.append(decision.order)
+                            eod_order = {"side": "sell", "type": "market", "size_base": float(pos_total)}
+                            intel_decision.proposed_orders.append(eod_order)
                             self._set("AUTO_CLOSE_EOD: Closing position before market close.", "INFO", "SYSTEM")
                     except Exception:
                         pass
