@@ -59,11 +59,11 @@ class UnifiedAlpacaClient:
         
         if self.mode == "paper":
             self.api_key = api_key or os.getenv("ALPACA_API_KEY_PAPER", os.getenv("ALPACA_API_KEY", ""))
-            self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_PAPER", os.getenv("ALPACA_SECRET_KEY", ""))
+            self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_PAPER", os.getenv("ALPACA_API_SECRET", ""))
             self.base_url = "https://paper-api.alpaca.markets"
         else:
             self.api_key = api_key or os.getenv("ALPACA_API_KEY_LIVE", os.getenv("ALPACA_API_KEY", ""))
-            self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_LIVE", os.getenv("ALPACA_SECRET_KEY", ""))
+            self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_LIVE", os.getenv("ALPACA_API_SECRET", ""))
             self.base_url = "https://api.alpaca.markets"
         
         self.data_url = "https://data.alpaca.markets"

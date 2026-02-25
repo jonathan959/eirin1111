@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ from db import (
     get_trade_journal,
     upsert_trade_journal,
     list_trade_journals_for_deals,
+    get_intelligence_decisions,
 )
 
 
@@ -5363,6 +5365,8 @@ def api_bot_logs(bot_id: int, limit: int = 200):
     # logs usually come newest-first. We will compress repeated spam lines.
     compressed = []
     last_msg = None
+    prev_ts = 0
+    prev_level = "INFO"
     repeat_count = 0
 
     for row in logs:
@@ -5764,7 +5768,8 @@ def api_intelligence_decisions(bot_id: Optional[int] = None, limit: int = 50):
 @app.get("/intelligence")
 def ui_intelligence_dashboard(request: Request):
     """Intelligence Dashboard UI"""
-    return templates.TemplateResponse("intelligence_dashboard.html", {"request": request})
+    _templates = Jinja2Templates(directory="templates")
+    return _templates.TemplateResponse("intelligence_dashboard.html", {"request": request})
 
 
 def _scan_stock_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str, Any]:

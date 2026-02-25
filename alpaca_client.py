@@ -56,7 +56,7 @@ class AlpacaClient:
         self.min_request_interval = 0.2  # 200ms between requests (max 200 req/min)
 
         # Data feed for stocks (iex=free, sip/otc etc require entitlements)
-        self.data_feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower()
+        self.data_feed = os.getenv("ALPACA_DATA_FEED", "iex").strip().lower() or "iex"
         
         # Connection pooling
         self.session = requests.Session()
