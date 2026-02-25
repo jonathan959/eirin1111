@@ -1369,7 +1369,11 @@ class BotRunner:
                     trailing_active=False,
                     trailing_price=None,
                 )
-                account = self._account_snapshot_simple(quote, price, float(self.state.base_pos))
+                try:
+                    account = self._account_snapshot_simple(quote, price, float(self.state.base_pos))
+                except Exception as e:
+                    self._log(f"Account snapshot failed: {type(e).__name__}: {e}", "WARN")
+                    account = AccountSnapshot(total_usd=0, free_usd=0, used_usd=0, positions_usd=0)
                 perf = self._perf_stats(quote)
 
                 # Drawdown guard
@@ -2311,7 +2315,11 @@ class BotRunner:
                         self.state.spent_quote = float(buy_cost)
                     self.state.safety_used = int(safety_used_est)
 
-                account = self._account_snapshot_simple(quote, price, float(self.state.base_pos))
+                try:
+                    account = self._account_snapshot_simple(quote, price, float(self.state.base_pos))
+                except Exception as e:
+                    self._log(f"Account snapshot failed: {type(e).__name__}: {e}", "WARN")
+                    account = AccountSnapshot(total_usd=0, free_usd=0, used_usd=0, positions_usd=0)
                 perf = self._perf_stats(quote)
 
                 # Portfolio-level risk checks
