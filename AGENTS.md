@@ -49,9 +49,21 @@ Compile-all check (used by deploy preflight):
 
 ### Secrets / API keys
 
-When the environment secrets `ALPACA_API_KEY_PAPER`, `ALPACA_API_SECRET_PAPER`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` are set, write them into `.env` before starting the server (the app reads `.env`, not shell env vars directly). The `ALPACA_DATA_FEED` in `.env` should be `iex` (free tier); the default `sip` requires a paid Alpaca subscription and will return errors.
+When the environment secrets `ALPACA_API_KEY_PAPER`, `ALPACA_API_SECRET_PAPER`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` are injected, write them into `.env` before starting the server — the app reads `.env` via `env_utils.load_env()`, not shell env vars directly. Use a script like:
 
-Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorized"` errors if the Alpaca paper keys lack trading permissions or if the data feed is misconfigured — this does not affect Kraken crypto bots.
+```python
+import os
+with open('.env', 'r') as f: content = f.read()
+for key in ['KRAKEN_API_KEY','KRAKEN_API_SECRET','ALPACA_API_KEY_PAPER','ALPACA_API_SECRET_PAPER']:
+    val = os.environ.get(key, '')
+    if val:
+        content = content.replace(f'{key}=\n', f'{key}={val}\n', 1)
+with open('.env', 'w') as f: f.write(content)
+```
+
+The `ALPACA_DATA_FEED` in `.env` should be `iex` (free tier); the older `alpaca_client.py` code path defaults to `sip` which requires a paid subscription and will return `"subscription does not permit querying recent SIP data"` errors. The newer `unified_alpaca_client.py` correctly defaults to `iex`.
+
+Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorized"` errors if the Alpaca paper keys lack trading permissions — this does not affect Kraken crypto bots. Kraken may intermittently show DDoS protection / rate limit errors on first startup; these are transient.
 
 ### Gotchas
 
