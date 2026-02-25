@@ -102,7 +102,8 @@ class UnifiedAlpacaClient:
         if not self.rate_limiter.acquire("get_latest_trade", priority=5):
             return None
         try:
-            req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+            stock_feed = os.getenv("ALPACA_DATA_FEED", "iex").strip().lower() or "iex"
+            req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=stock_feed)
             trade = self.data_client.get_stock_latest_trade(req)
             if trade and symbol in trade:
                 price = float(trade[symbol].price)
@@ -350,7 +351,8 @@ class UnifiedAlpacaClient:
                 days = min(max(days_back * mult, 30), 730)
                 end = datetime.now(timezone.utc)
                 start = end - timedelta(days=days)
-                req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end, limit=req_limit)
+                stock_feed = os.getenv("ALPACA_DATA_FEED", "iex").strip().lower() or "iex"
+                req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end, limit=req_limit, feed=stock_feed)
                 logger.info(
                     "get_ohlcv %s %s attempt=%d range=%s..%s limit=%d",
                     symbol, tf_lower, attempt + 1, start.date(), end.date(), req_limit,

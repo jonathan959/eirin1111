@@ -1299,13 +1299,31 @@ class BotRunner:
                     self.state.last_price = price
                 self._heartbeat()
 
-                # Legacy 15m fetch preserved for compatibility logic if needed, 
-                # but we prefer MTF for the brain.
-                candles_15m = self.kc.fetch_ohlcv(symbol, timeframe="15m", limit=200)
-                candles_1h = self.kc.fetch_ohlcv(symbol, timeframe="1h", limit=100)
-                candles_4h = self.kc.fetch_ohlcv(symbol, timeframe="4h", limit=100)
-                candles_1d = self.kc.fetch_ohlcv(symbol, timeframe="1d", limit=100)
-                candles_1w = self.kc.fetch_ohlcv(symbol, timeframe="1w", limit=50)
+                # Fetch candles with caching and error handling to avoid rate-limit crashes
+                try:
+                    mt = bot.get("market_type", "crypto")
+                    if self.manager:
+                        candles_15m = self.manager.ohlcv_cached(symbol, "15m", limit=200, ttl_sec=30, market_type=mt)
+                        candles_1h = self.manager.ohlcv_cached(symbol, "1h", limit=100, ttl_sec=60, market_type=mt)
+                        candles_4h = self.manager.ohlcv_cached(symbol, "4h", limit=100, ttl_sec=180, market_type=mt)
+                        candles_1d = self.manager.ohlcv_cached(symbol, "1d", limit=100, ttl_sec=900, market_type=mt)
+                        candles_1w = self.manager.ohlcv_cached(symbol, "1w", limit=50, ttl_sec=1800, market_type=mt)
+                    else:
+                        candles_15m = self.kc.fetch_ohlcv(symbol, timeframe="15m", limit=200)
+                        time.sleep(0.5)
+                        candles_1h = self.kc.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+                        time.sleep(0.5)
+                        candles_4h = self.kc.fetch_ohlcv(symbol, timeframe="4h", limit=100)
+                        time.sleep(0.5)
+                        candles_1d = self.kc.fetch_ohlcv(symbol, timeframe="1d", limit=100)
+                        time.sleep(0.5)
+                        candles_1w = self.kc.fetch_ohlcv(symbol, timeframe="1w", limit=50)
+                except Exception as e:
+                    self._set(f"Candle fetch failed: {type(e).__name__}: {e}", "WARN", "DATA")
+                    self._heartbeat()
+                    time.sleep(backoff)
+                    backoff = min(float(BACKOFF_MAX_SEC), max(float(BACKOFF_MIN_SEC), backoff * 2))
+                    continue
 
                 deal_opened_at = int(self.state.deal_opened_at or int(time.time()))
                 avg_entry, buy_amt, buy_cost, sell_amt, sell_proceeds = self._deal_metrics_from_trades(symbol, deal_opened_at)
@@ -3154,8 +3172,17 @@ class BotRunner:
                 if buy_amt <= 0:
                     self._set(f"Trend filter enabled (SMA{cfg.trend_sma}). Waiting for entry condition…", "INFO", "STRATEGY")
                     while not self._stop.is_set():
-                        ohlcv = self.kc.fetch_ohlcv(symbol, timeframe="15m", limit=max(cfg.trend_sma + 10, 260))
+                        try:
+                            ohlcv = self.kc.fetch_ohlcv(symbol, timeframe="15m", limit=max(cfg.trend_sma + 10, 260))
+                        except Exception as e:
+                            self._set(f"Trend candle fetch failed: {type(e).__name__}. Retrying…", "WARN", "DATA")
+                            self._heartbeat()
+                            time.sleep(min(60, poll * 3))
+                            continue
                         closes = [float(c[4]) for c in ohlcv]
+                        if not closes:
+                            time.sleep(poll)
+                            continue
                         price_now = float(closes[-1])
                         with self._lock:
                             self.state.last_price = price_now
@@ -3166,6 +3193,7 @@ class BotRunner:
                         if self._last_wait_reason != wait_msg:
                             self._last_wait_reason = wait_msg
                             self._set(wait_msg, "INFO", "STRATEGY")
+                        self._heartbeat()
                         time.sleep(poll)
 
             # Base buy (only if deal has no buys yet)
