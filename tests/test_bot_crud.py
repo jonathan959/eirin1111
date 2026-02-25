@@ -10,7 +10,7 @@ import os
 sys.path.append(os.getcwd())
 
 # We will mock the database functions to avoid touching real DB or needing running server
-from worker_api import api_bots_create, api_bots_update, Request
+from worker_api import api_create_bot, api_update_bot, Request
 
 # Mock helper for Request
 class MockRequest:
@@ -33,7 +33,7 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
         payload = {"symbol": "INTC", "base_quote": 100}
         req = MockRequest(payload)
         
-        resp = await api_bots_create(req)
+        resp = await api_create_bot(req)
         body = json.loads(resp.body)
         
         self.assertTrue(body["ok"])
@@ -69,7 +69,7 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
         payload = {"symbol": "AAPL", "base_quote": 50, "market_type": ""}
         req = MockRequest(payload)
         
-        await api_bots_update(16, req)
+        await api_update_bot(16, req)
         
         args, _ = mock_update.call_args
         settings = args[1]
@@ -87,11 +87,11 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
         payload = {"symbol": "INTC", "base_quote": 100, "market_type": "crypto"}
         req = MockRequest(payload)
         
-        await api_bots_create(req)
+        await api_create_bot(req)
         
         args, _ = mock_create.call_args
         settings = args[1]
-        self.assertEqual(settings["market_type"], "stocks", "INTC should forciby override 'crypto' tag")
+        self.assertEqual(settings["market_type"], "stocks", "INTC should forcibly override 'crypto' tag")
 
 if __name__ == "__main__":
     unittest.main()

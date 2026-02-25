@@ -80,9 +80,9 @@ class KrakenClient:
         return False
 
     def _retry(self, fn, *args, **kwargs):
-        attempts = int(kwargs.pop("_attempts", 4))
-        base_sleep = float(kwargs.pop("_base_sleep", 0.5))
-        max_sleep = float(kwargs.pop("_max_sleep", 8.0))
+        attempts = int(kwargs.pop("_attempts", 5))
+        base_sleep = float(kwargs.pop("_base_sleep", 1.0))
+        max_sleep = float(kwargs.pop("_max_sleep", 30.0))
 
         last_err = None
         for i in range(attempts):
@@ -92,7 +92,10 @@ class KrakenClient:
                 last_err = e
                 if not self._is_transient(e):
                     raise
+                is_ddos = isinstance(e, ccxt.DDoSProtection) or "rate limit" in str(e).lower()
                 sleep_s = min(max_sleep, base_sleep * (2 ** i))
+                if is_ddos:
+                    sleep_s = min(max_sleep, sleep_s * 2)
                 time.sleep(sleep_s)
         raise last_err
 

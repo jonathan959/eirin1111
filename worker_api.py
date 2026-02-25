@@ -408,7 +408,8 @@ async def api_create_bot(request: Request):
         return _json({"ok": False, "error": "Invalid payload"}, 400)
 
     raw_sym = str(payload.get("symbol") or "").strip()
-    market_type_val = "stocks" if (len(raw_sym) < 6 and "/" not in raw_sym) else str(payload.get("market_type") or "crypto")
+    detected_type = classify_symbol(raw_sym) if raw_sym else "crypto"
+    market_type_val = "stocks" if detected_type == "stock" else "crypto"
     if market_type_val == "crypto" and raw_sym:
         resolved, err = _validate_crypto_symbol(raw_sym)
         if err:
@@ -2535,7 +2536,8 @@ async def api_update_bot(bot_id: int, request: Request):
 
     # Merge: existing bot as base, overlay payload (partial updates supported)
     raw_sym = str(payload.get("symbol") or b.get("symbol") or "").strip()
-    market_type = "stocks" if (len(raw_sym) < 6 and "/" not in raw_sym) else str(payload.get("market_type") or b.get("market_type") or "crypto")
+    detected_type = classify_symbol(raw_sym) if raw_sym else "crypto"
+    market_type = "stocks" if detected_type == "stock" else "crypto"
     if market_type == "crypto" and raw_sym:
         resolved, err = _validate_crypto_symbol(raw_sym)
         if err:

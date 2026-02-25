@@ -751,12 +751,14 @@ class BotRunner:
 
         self._stop.clear()
         with self._lock:
-            self.state.running = True
             self.state.last_event = "Starting..."
             self.state.errors = 0
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+
+        with self._lock:
+            self.state.running = True
 
         self._log("Start command received.", "INFO", "SYSTEM")
         self._log("Bot is turned on.", "INFO", "SYSTEM")
