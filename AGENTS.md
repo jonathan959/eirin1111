@@ -25,12 +25,11 @@ Run `python init_db.py` once to create `botdb.sqlite3`. The server will not crea
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -v --ignore=tests/test_bot_crud.py
+.venv/bin/python -m pytest tests/ -v
 ```
 
-- `tests/test_bot_crud.py` has a pre-existing import error (`api_bots_create` was renamed) — skip it.
-- Some tests in `test_order_sizing.py` fail due to outdated `IntelligenceDecision` constructor signatures.
-- `test_symbol_routing.py` subtests for stock symbols require network access and Alpaca API keys.
+- `test_symbol_routing.py` has a few subtests that depend on network access and yfinance (which fails in the sandbox due to curl_cffi); these fail in CI but pass locally.
+- `test_order_sizing.py` acceptance tests depend on the executor's implementation details; rejection tests (zero/negative size) pass.
 - The project also has `run_all_checks.py` which runs unittest discovery plus custom routing verification.
 
 ### Lint
@@ -61,7 +60,7 @@ for key in ['KRAKEN_API_KEY','KRAKEN_API_SECRET','ALPACA_API_KEY_PAPER','ALPACA_
 with open('.env', 'w') as f: f.write(content)
 ```
 
-The `ALPACA_DATA_FEED` in `.env` should be `iex` (free tier); the older `alpaca_client.py` code path defaults to `sip` which requires a paid subscription and will return `"subscription does not permit querying recent SIP data"` errors. The newer `unified_alpaca_client.py` correctly defaults to `iex`.
+Both `alpaca_client.py` and `unified_alpaca_client.py` now default to `iex` (free tier). The `ALPACA_DATA_FEED` in `.env` should remain `iex` unless you have a paid SIP subscription.
 
 Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorized"` errors if the Alpaca paper keys lack trading permissions — this does not affect Kraken crypto bots. Kraken may intermittently show DDoS protection / rate limit errors on first startup; these are transient.
 
