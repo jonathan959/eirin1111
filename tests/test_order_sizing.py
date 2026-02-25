@@ -17,21 +17,24 @@ def _make_decision(proposed_orders, order_type="limit", limit_price=50000.0):
         IntelligenceDecision, ExecutionPolicyResult, AllowedAction,
         DataValidityResult, MarketSafetyResult, RegimeDetectionResult,
         StrategyRoutingResult, PositionSizingResult, TradeManagementResult,
+        RegimeType,
     )
     return IntelligenceDecision(
-        data_validity=DataValidityResult(valid=True, reasons=[]),
-        market_safety=MarketSafetyResult(safe=True, reasons=[]),
+        data_validity=DataValidityResult(data_ok=True),
+        market_safety=MarketSafetyResult(
+            allowed_actions=AllowedAction.TRADE_ALLOWED,
+            risk_budget=1000.0,
+        ),
         regime_detection=RegimeDetectionResult(
-            regime="RANGING", confidence=0.7,
-            volatility_regime="normal", trend_strength=0.0, reasons=[],
+            regime=RegimeType.RANGE, confidence=0.7, ttl_seconds=300,
         ),
         strategy_routing=StrategyRoutingResult(
             strategy_mode="classic_dca", entry_style="moderate",
-            exit_style="fixed_tp", reasons=[],
+            exit_style="fixed_tp",
         ),
         position_sizing=PositionSizingResult(
             base_size=15.0, ladder_steps=1,
-            ladder_spacing_pct=1.5, max_adds=3, reasons=[],
+            ladder_spacing_pct=1.5, max_adds=3,
         ),
         execution_policy=ExecutionPolicyResult(
             order_type=order_type,
@@ -39,7 +42,7 @@ def _make_decision(proposed_orders, order_type="limit", limit_price=50000.0):
             post_only=False,
             min_cooldown_seconds=10,
         ),
-        trade_management=TradeManagementResult(manage_actions=[]),
+        trade_management=TradeManagementResult(),
         allowed_actions=AllowedAction.TRADE_ALLOWED,
         final_action="ENTER",
         final_reason="test",
