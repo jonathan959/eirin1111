@@ -47,9 +47,17 @@ Compile-all check (used by deploy preflight):
 .venv/bin/python -m compileall -q .
 ```
 
+### Secrets / API keys
+
+When the environment secrets `ALPACA_API_KEY_PAPER`, `ALPACA_API_SECRET_PAPER`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` are set, write them into `.env` before starting the server (the app reads `.env`, not shell env vars directly). The `ALPACA_DATA_FEED` in `.env` should be `iex` (free tier); the default `sip` requires a paid Alpaca subscription and will return errors.
+
+Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorized"` errors if the Alpaca paper keys lack trading permissions or if the data feed is misconfigured — this does not affect Kraken crypto bots.
+
 ### Gotchas
 
 - `python3.12-venv` system package must be installed for `python3 -m venv` to work (not present by default on Ubuntu 24.04).
 - TensorFlow import emits info-level messages about oneDNN; these are harmless.
 - The `start.sh` script in the repo root automates venv creation, pip install, db init, and server start — but runs uvicorn in the foreground, so use it for one-off manual testing only.
 - The `.cursor/rules/deploy-after-changes.mdc` rule about running `deploy.ps1` applies only when deploying to the production EC2 server. For local dev, ignore it.
+- `yfinance` (Yahoo Finance fallback) fails in the Cloud Agent sandbox due to `curl_cffi` browser impersonation incompatibility. This only affects the fallback data source; primary exchange data via Kraken/Alpaca works fine.
+- Alpaca WebSocket connections may hit "connection limit exceeded" on free tier — this is non-fatal; the app falls back to REST polling.
