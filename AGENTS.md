@@ -62,7 +62,14 @@ with open('.env', 'w') as f: f.write(content)
 
 Both `alpaca_client.py` and `unified_alpaca_client.py` now default to `iex` (free tier). The `ALPACA_DATA_FEED` in `.env` should remain `iex` unless you have a paid SIP subscription.
 
-Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorized"` errors if the Alpaca paper keys lack trading permissions — this does not affect Kraken crypto bots. Kraken may intermittently show DDoS protection / rate limit errors on first startup; these are transient.
+Stock bots may show WARN-level `"Account snapshot failed: request is not authorized"` — this is non-fatal and the bot continues to run. The Alpaca Trading API auth issue is logged as a warning rather than crashing the bot.
+
+### Bot architecture notes
+
+- All strategy modes (including `classic`) now route through `_run_loop_multi()`, which has the best error handling for exchange API calls.
+- OHLCV fetches use `ohlcv_cached()` (TTL-based caching) to reduce API calls and avoid rate limit storms when running multiple crypto bots.
+- Kraken DDoS/rate-limit errors are handled with exponential backoff (5 retries, up to 30s sleep, extra 2x for DDoS).
+- Exchange API errors in the bot loop are caught per-iteration (not fatal) — the bot logs a WARN and retries on the next cycle.
 
 ### Gotchas
 
@@ -72,3 +79,4 @@ Stock bots (WMT, AAPL, etc.) that use Alpaca may show `"request is not authorize
 - The `.cursor/rules/deploy-after-changes.mdc` rule about running `deploy.ps1` applies only when deploying to the production EC2 server. For local dev, ignore it.
 - `yfinance` (Yahoo Finance fallback) fails in the Cloud Agent sandbox due to `curl_cffi` browser impersonation incompatibility. This only affects the fallback data source; primary exchange data via Kraken/Alpaca works fine.
 - Alpaca WebSocket connections may hit "connection limit exceeded" on free tier — this is non-fatal; the app falls back to REST polling.
+- Multiple crypto bots sharing the same Kraken API keys will share rate limits. The `ohlcv_cached` layer mitigates this.
