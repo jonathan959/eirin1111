@@ -3027,7 +3027,7 @@ class BotRunner:
                     self.state.running = False
                 return
             mode = str(bot.get("strategy_mode", "classic")).lower()
-            if mode in ("smart", "smart_dca", "classic_dca", "grid", "trend", "trend_follow", "range_mean_reversion", "high_vol_defensive", "breakout", "auto", "router"):
+            if mode in ("classic", "smart", "smart_dca", "classic_dca", "grid", "trend", "trend_follow", "range_mean_reversion", "high_vol_defensive", "breakout", "auto", "router"):
                 self._run_loop_multi()
                 return
 
@@ -3208,7 +3208,10 @@ class BotRunner:
             avg_entry, buy_amt, buy_cost, _, _ = self._deal_metrics_from_trades(symbol, deal_opened_at)
             base_already_placed_dry = dry_run and (float(self.state.spent_quote or 0.0) > 0.0)
             # Resume guard: if we already hold base asset, treat as having bought (avoids double-buy after restart)
-            free_base, total_base = self._balance_free_total(base) if base else (0.0, 0.0)
+            try:
+                free_base, total_base = self._balance_free_total(base) if base else (0.0, 0.0)
+            except Exception:
+                free_base, total_base = 0.0, 0.0
             already_has_position = (total_base or 0.0) > 0.0
             # Prevent double-buy: skip if we have an open BUY order (e.g. limit pending or market in flight)
             has_open_buy_order = False
