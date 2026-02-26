@@ -82,15 +82,21 @@ def trip_and_alert(
     bot_label: str = "",
 ) -> None:
     """
-    When circuit breaker trips: set global pause and send Discord alert.
+    When circuit breaker trips: log warning and send Discord alert.
+    Only sets global pause for critical reasons (drawdown kill-switch, explicit global triggers).
+    Routine per-bot exposure/deal-count limits do NOT pause all bots.
     """
-    try:
-        from db import set_setting
-        set_setting("global_pause", "1")
-        set_setting("global_pause_until", str(int(time.time()) + (pause_hours * 3600)))
-        logger.warning("Circuit breaker tripped: %s — global pause set for %sh", reason, pause_hours)
-    except Exception as e:
-        logger.warning("Failed to set global pause: %s", e)
+    is_critical = any(k in reason.lower() for k in ("drawdown", "kill", "emergency", "global"))
+    if is_critical:
+        try:
+            from db import set_setting
+            set_setting("global_pause", "1")
+            set_setting("global_pause_until", str(int(time.time()) + (pause_hours * 3600)))
+            logger.warning("CRITICAL circuit breaker: %s — global pause set for %sh", reason, pause_hours)
+        except Exception as e:
+            logger.warning("Failed to set global pause: %s", e)
+    else:
+        logger.warning("Circuit breaker tripped (bot-level only): %s", reason)
 
     if os.getenv("DISCORD_NOTIFY_RISK", "1").strip().lower() in ("1", "true", "yes", "y", "on"):
         try:
