@@ -376,13 +376,14 @@ class OrderExecutor:
         if _order_type != "market" and not os.getenv("DISABLE_EDGE_COST_CHECK", "").strip():
             try:
                 expected_edge_pct = float(proposed_order.get("expected_edge_pct") or 0.0)
-                spread_pct = float(proposed_order.get("spread_pct") or 0.0)
-                volatility_pct = float(proposed_order.get("volatility_pct") or 0.0)
-                slippage_pct = min(0.02, max(0.0, volatility_pct * 0.5))
-                modeled_cost_pct = max(0.0, spread_pct) + slippage_pct
-                expected_edge_net = expected_edge_pct - modeled_cost_pct
-                if expected_edge_net <= 0:
-                    return {"error": f"Expected edge <= 0 after cost ({expected_edge_net*100:.2f}%)"}
+                if expected_edge_pct > 0:
+                    spread_pct = float(proposed_order.get("spread_pct") or 0.0)
+                    volatility_pct = float(proposed_order.get("volatility_pct") or 0.0)
+                    slippage_pct = min(0.02, max(0.0, volatility_pct * 0.5))
+                    modeled_cost_pct = max(0.0, spread_pct) + slippage_pct
+                    expected_edge_net = expected_edge_pct - modeled_cost_pct
+                    if expected_edge_net <= 0:
+                        return {"error": f"Expected edge <= 0 after cost ({expected_edge_net*100:.2f}%)"}
             except Exception:
                 pass
         
