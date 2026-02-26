@@ -2429,7 +2429,7 @@ class BotRunner:
                 except Exception:
                     pass
 
-                # Daily loss limit (realized + unrealized for this bot) — circuit breaker handles realized; this catches unrealized
+                # Daily loss limit (realized + unrealized for this bot)
                 if not risk_reason:
                     try:
                         ps = pnl_summary(_today_start_ts_local())
@@ -2438,14 +2438,11 @@ class BotRunner:
                         loss_total = float(realized_today + unrealized)
                         loss_limit_pct = float(bot.get("daily_loss_limit_pct", 0.06))
                         if equity > 0 and loss_limit_pct > 0 and loss_total <= -(equity * loss_limit_pct):
-                            risk_reason = "Daily loss circuit breaker (realized + unrealized)."
+                            risk_reason = "Daily loss limit: pausing THIS bot (not all)."
                             try:
                                 pause_hours = int(bot.get("pause_hours", 6))
                                 if trip_and_alert:
                                     trip_and_alert(risk_reason, pause_hours=pause_hours, bot_label=bot.get("label", str(self.bot_id)))
-                                else:
-                                    set_setting("global_pause", "1")
-                                    set_setting("global_pause_until", str(int(time.time()) + (pause_hours * 3600)))
                             except Exception:
                                 pass
                     except Exception:
