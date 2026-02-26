@@ -75,6 +75,10 @@ Stock bots may show WARN-level `"Account snapshot failed: request is not authori
 - Autopilot uses risk profiles (conservative/balanced/aggressive) to set TP, SL, trailing stop, and position sizing defaults when creating bots.
 - Per-bot risk controls are editable in the UI: stop loss %, max drawdown %, max hold hours, trailing stop activation/distance %, and risk profile.
 
+### Deployment
+
+Use `deploy.ps1` (Windows) to deploy to production. The old `deploy.sh` was fixed to upload ALL files. The production server is at `ubuntu@3.148.6.246` with code at `/home/ubuntu/local_3comas_clone_v2`. The service is `tradingserver` (systemd). Key: after code changes, ALWAYS redeploy — the production server does NOT auto-pull from git.
+
 ### Gotchas
 
 - `python3.12-venv` system package must be installed for `python3 -m venv` to work (not present by default on Ubuntu 24.04).
@@ -84,3 +88,5 @@ Stock bots may show WARN-level `"Account snapshot failed: request is not authori
 - `yfinance` (Yahoo Finance fallback) fails in the Cloud Agent sandbox due to `curl_cffi` browser impersonation incompatibility. This only affects the fallback data source; primary exchange data via Kraken/Alpaca works fine.
 - Alpaca WebSocket connections may hit "connection limit exceeded" on free tier — this is non-fatal; the app falls back to REST polling.
 - Multiple crypto bots sharing the same Kraken API keys will share rate limits. The `ohlcv_cached` layer mitigates this.
+- Dashboard and DCA pages use in-memory BotManager snapshots + background portfolio fetching for instant loads. Portfolio data may be up to 30s stale on first load.
+- The `/api/autopilot/status` endpoint can be slow (10-15s) on first call when portfolio data hasn't been cached yet.
