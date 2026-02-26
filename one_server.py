@@ -176,22 +176,38 @@ def _json_payload(resp: Any) -> Dict[str, Any]:
     return {}
 
 
+_PORTFOLIO_CACHE: Dict[str, Any] = {}
+_PORTFOLIO_CACHE_TS: float = 0.0
+
 def _portfolio_snapshot() -> Dict[str, Any]:
-    """Prefer worker_api portfolio snapshot (needs Kraken); fallback to empty."""
-    try:
-        payload = _json_payload(worker_api.api_portfolio())  # type: ignore[misc]
-        if isinstance(payload, dict) and payload.get("ok") and "portfolio" in payload:
-            return payload["portfolio"]
-    except Exception:
-        pass
-    return {
+    """Return cached portfolio instantly. Background thread refreshes every 30s."""
+    global _PORTFOLIO_CACHE_TS
+    import time as _t
+    import threading
+
+    empty = {
         "holdings": [],
-        "total_usd": 0.0,
-        "free_usd": 0.0,
-        "used_usd": 0.0,
-        "positions_usd": 0.0,
+        "total_usd": 0.0, "free_usd": 0.0, "used_usd": 0.0, "positions_usd": 0.0,
         "ts": int(datetime.now(tz=timezone.utc).timestamp()),
     }
+
+    now = _t.time()
+    if _PORTFOLIO_CACHE and (now - _PORTFOLIO_CACHE_TS) < 30:
+        return _PORTFOLIO_CACHE
+
+    def _refresh():
+        global _PORTFOLIO_CACHE_TS
+        try:
+            payload = _json_payload(worker_api.api_portfolio())
+            if isinstance(payload, dict) and payload.get("ok") and "portfolio" in payload:
+                _PORTFOLIO_CACHE.clear()
+                _PORTFOLIO_CACHE.update(payload["portfolio"])
+                _PORTFOLIO_CACHE_TS = _t.time()
+        except Exception:
+            pass
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return _PORTFOLIO_CACHE if _PORTFOLIO_CACHE else empty
 
 
 def _bots_snapshot() -> Any:
@@ -203,10 +219,13 @@ def _bots_snapshot() -> Any:
 
 
 def _bot_runtime(bot_id: int) -> Dict[str, Any]:
+    """Get bot runtime snapshot (in-memory, fast)."""
     try:
-        payload = _json_payload(worker_api.api_bot_status(int(bot_id)))  # type: ignore[misc]
-        if isinstance(payload, dict) and payload.get("ok"):
-            return payload.get("snap") or {}
+        bm_ref = getattr(worker_api, "bm", None)
+        if bm_ref:
+            snap = bm_ref.snapshot(int(bot_id))
+            if snap:
+                return snap
     except Exception:
         pass
     return {}
@@ -279,7 +298,7 @@ def ui_logout():
 
 
 _DASH_CACHE: Dict[str, Any] = {"ts": 0, "data": None}
-_DASH_TTL_SEC = 3
+_DASH_TTL_SEC = 15
 
 
 def _dashboard_data() -> Dict[str, Any]:
@@ -460,8 +479,14 @@ def ui_bot(request: Request, bot_id: int):
     return templates.TemplateResponse("bot.html", ctx)
 
 
+_DCA_CACHE: Dict[str, Any] = {"ts": 0, "data": None}
+
 @app.get("/dca", include_in_schema=False)
 def ui_dca_dashboard(request: Request):
+    now = int(time_mod.time())
+    if _DCA_CACHE.get("data") and (now - int(_DCA_CACHE.get("ts") or 0)) <= 15:
+        return templates.TemplateResponse("dca.html", {**_base_ctx(request), **_DCA_CACHE["data"]})
+
     bots = _bots_snapshot()
     bot_rows = []
     unrealized_total = 0.0
@@ -538,6 +563,8 @@ def ui_dca_dashboard(request: Request):
         "kraken_ready": bool(getattr(worker_api, "KRAKEN_READY", False)),
         "kraken_error": str(getattr(worker_api, "KRAKEN_ERROR", "") or ""),
     }
+    _DCA_CACHE["ts"] = now
+    _DCA_CACHE["data"] = {k: v for k, v in ctx.items() if k != "request"}
     return templates.TemplateResponse("dca.html", ctx)
 
 
