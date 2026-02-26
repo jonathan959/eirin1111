@@ -8,9 +8,17 @@ This is a Python 3.12 / FastAPI algorithmic trading bot platform ("Eirin Bot"). 
 
 ### Running the application
 
+**Production** uses `one_server_v2.py` (via `ai-bot.service`):
+```bash
+.venv/bin/uvicorn one_server_v2:app --host 0.0.0.0 --port 8000
+```
+
+**Local dev** can use either `one_server.py` or `one_server_v2.py`:
 ```bash
 .venv/bin/uvicorn one_server:app --reload --port 8000 --host 0.0.0.0
 ```
+
+**CRITICAL**: When adding UI routes or template pages, add them to BOTH `one_server.py` AND `one_server_v2.py`. The production server (`ai-bot.service`) runs `one_server_v2:app`.
 
 The app starts in **minimal mode** when exchange API keys (`ALPACA_API_KEY_PAPER`, `KRAKEN_API_KEY`, etc.) are absent. The UI and all non-trading endpoints work normally without keys; only live trading and market-data features are degraded.
 
