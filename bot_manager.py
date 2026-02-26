@@ -2371,9 +2371,8 @@ class BotRunner:
                                 max_total_pct = max(max_total_pct, float(override_pct))
                             except ValueError:
                                 pass
-                        if max_total_pct > 0 and self.manager and equity > 0:
-                            total_exposure = float(self.manager.total_exposure_usd())
-                            exp_ratio = total_exposure / equity
+                        if max_total_pct > 0 and equity > 0:
+                            exp_ratio = float(account.positions_usd) / equity if equity > 0 else 0.0
                             if exp_ratio >= max_total_pct:
                                 risk_reason = "Global exposure cap reached."
                             logger.debug("Exposure check: %s = %.2f%% (limit: %.2f%%)", self._bot_label(), exp_ratio * 100, max_total_pct * 100)
@@ -2392,7 +2391,8 @@ class BotRunner:
                 try:
                     per_symbol_pct = float(bot.get("per_symbol_exposure_pct", 0.15))
                     if per_symbol_pct > 0 and equity > 0:
-                        if (position_value / equity) >= per_symbol_pct:
+                        bot_exposure = float(self.state.spent_quote or 0.0) if dry_run else position_value
+                        if bot_exposure > 0 and (bot_exposure / equity) >= per_symbol_pct:
                             risk_reason = "Per-symbol exposure cap reached."
                 except Exception:
                     pass
