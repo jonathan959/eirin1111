@@ -67,7 +67,7 @@ def enhance_score(
         penalty = min(10, (volatility_pct - 0.08) * 100)
         score -= penalty
         reasons.append(f"High vol penalty: -{penalty:.0f}")
-    return max(0.0, min(100.0, score)), reasons
+    return max(0.0, min(95.0, score)), reasons
 
 
 def diversify_picks(

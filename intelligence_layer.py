@@ -1995,14 +1995,81 @@ class IntelligenceLayer:
                 elif ret_30 < -0.25: momentum_bonus -= 10.0
             score += momentum_bonus
 
+            # C1b. Multi-timeframe momentum (5d + 10d weighted for better signal quality)
+            mtf_bonus = 0.0
+            if len(closes_1d) >= 11:
+                denom_5 = float(closes_1d[-6]) if closes_1d[-6] != 0 else 1.0
+                denom_10 = float(closes_1d[-11]) if closes_1d[-11] != 0 else 1.0
+                ret_5d_mtf = (closes_1d[-1] - closes_1d[-6]) / denom_5
+                ret_10d_mtf = (closes_1d[-1] - closes_1d[-11]) / denom_10
+                if ret_5d_mtf > 0 and ret_10d_mtf > 0:
+                    mtf_bonus = min(6.0, (ret_5d_mtf * 40 + ret_10d_mtf * 20))
+                    if mtf_bonus >= 2.0:
+                        reasons.append(f"Multi-TF momentum: 5d +{ret_5d_mtf:.1%}, 10d +{ret_10d_mtf:.1%}")
+                elif ret_5d_mtf < -0.03 and ret_10d_mtf < -0.05:
+                    mtf_bonus = max(-8.0, (ret_5d_mtf * 30 + ret_10d_mtf * 20))
+                    risk_flags.append(f"Declining momentum: 5d {ret_5d_mtf:.1%}, 10d {ret_10d_mtf:.1%}")
+            score += mtf_bonus
+
+            # C1c. Volume confirmation (above-average volume confirms move)
+            vol_bonus = 0.0
+            if context.candles_1d and len(context.candles_1d) >= 21:
+                recent_vol = float(context.candles_1d[-1][5]) if len(context.candles_1d[-1]) > 5 else 0
+                avg_vol = sum(float(c[5]) for c in context.candles_1d[-21:-1] if len(c) > 5) / 20.0
+                if avg_vol > 0 and recent_vol > 0:
+                    vol_ratio = recent_vol / avg_vol
+                    if vol_ratio >= 2.0:
+                        vol_bonus = 5.0
+                        reasons.append(f"Volume surge {vol_ratio:.1f}x average")
+                    elif vol_ratio >= 1.3:
+                        vol_bonus = 2.0
+                        reasons.append(f"Above-average volume ({vol_ratio:.1f}x)")
+                    elif vol_ratio < 0.5:
+                        vol_bonus = -3.0
+                        risk_flags.append("Very low volume (weak conviction)")
+            score += vol_bonus
+
+            # C1d. Trend strength via ADX (strong trends are more reliable)
+            try:
+                from strategies import adx as _adx_fn
+                adx_val = _adx_fn(context.candles_1d, 14)
+                if adx_val is not None:
+                    if adx_val >= 30:
+                        score += 4.0
+                        reasons.append(f"Strong trend (ADX {adx_val:.0f})")
+                    elif adx_val >= 22:
+                        score += 2.0
+                    elif adx_val < 15:
+                        score -= 2.0
+                        reasons.append(f"Weak/choppy market (ADX {adx_val:.0f})")
+            except Exception:
+                pass
+
+            # C1e. Price distance from key MAs (mean reversion / extended move signal)
+            if ema50_1d and context.last_price > 0:
+                dist_ema50 = (context.last_price - ema50_1d) / ema50_1d
+                if dist_ema50 > 0.15:
+                    score -= 4.0
+                    risk_flags.append(f"Extended above EMA50 ({dist_ema50:.1%})")
+                elif dist_ema50 < -0.10 and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL):
+                    score += 4.0
+                    reasons.append(f"Mean reversion: {abs(dist_ema50):.1%} below EMA50")
+
             # C2. RSI Oversold Bonus (mean-reversion opportunity in range/bull)
             rsi_val = rsi(closes_1d or [], 14)
-            if rsi_val is not None and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL):
-                if rsi_val <= 30:
+            if rsi_val is not None:
+                if rsi_val <= 30 and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL, RegimeType.WEAK_BEAR):
                     score += 6.0
-                    reasons.append("RSI oversold (mean-reversion opportunity)")
-                elif rsi_val <= 35:
+                    reasons.append(f"RSI oversold ({rsi_val:.0f}) — mean-reversion opportunity")
+                elif rsi_val <= 35 and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL):
                     score += 3.0
+                    reasons.append(f"RSI approaching oversold ({rsi_val:.0f})")
+                elif rsi_val >= 80:
+                    score -= 6.0
+                    risk_flags.append(f"RSI overbought ({rsi_val:.0f}) — extended, risk of pullback")
+                elif rsi_val >= 70 and regime not in (RegimeType.STRONG_BULL, RegimeType.BREAKOUT):
+                    score -= 3.0
+                    risk_flags.append(f"RSI overbought ({rsi_val:.0f})")
             
             # D. Drawdown Penalty (Max -20)
             # Don't buy bags
@@ -2123,8 +2190,8 @@ class IntelligenceLayer:
                     risk_flags.append(f"Earnings in {int(earnings_days)}d")
 
         # --- 3. Final Clamping & Formatting ---
-        # Cap at 98.0 to preserve differentiation at top (avoids "all 100" clustering)
-        score = clamp(score, 0.0, 98.0)
+        # Cap at 95.0 to preserve differentiation at top (avoids "all 100" clustering)
+        score = clamp(score, 0.0, 95.0)
         score = round(score, 1)
 
         # Min score for eligibility: profile-based (conservative=stricter, aggressive=looser)
