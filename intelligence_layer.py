@@ -361,13 +361,13 @@ class IntelligenceLayer:
         
         self.max_drawdown_pct = float(os.getenv("INTEL_MAX_DRAWDOWN_PCT", "0.20"))  # 20%
         
-        self.regime_confidence_threshold = float(os.getenv("INTEL_REGIME_CONFIDENCE_THRESHOLD", "0.6"))
+        self.regime_confidence_threshold = float(os.getenv("INTEL_REGIME_CONFIDENCE_THRESHOLD", "0.40"))
         self.regime_hysteresis_seconds = int(os.getenv("INTEL_REGIME_HYSTERESIS_SEC", "300"))  # 5 min
         self.base_risk_pct = float(os.getenv("INTEL_BASE_RISK_PCT", "0.02"))  # 2% of equity
         # Default hard caps (safe defaults unless overridden)
         self.max_daily_loss_pct = float(os.getenv("INTEL_MAX_DAILY_LOSS_PCT", "0.05"))  # 5%
         self.max_exposure_pct = float(os.getenv("INTEL_MAX_EXPOSURE_PCT", "0.20"))  # 20%
-        self.per_symbol_exposure_pct = float(os.getenv("INTEL_PER_SYMBOL_EXPOSURE_PCT", "0.03"))  # 3%
+        self.per_symbol_exposure_pct = float(os.getenv("INTEL_PER_SYMBOL_EXPOSURE_PCT", "0.15"))  # 15%
         self.max_consec_losses = int(os.getenv("INTEL_MAX_CONSEC_LOSSES", "3"))
         
         self.max_slippage_pct = float(os.getenv("INTEL_MAX_SLIPPAGE_PCT", "0.001"))  # 0.1%
@@ -697,20 +697,17 @@ class IntelligenceLayer:
                 allowed_actions = AllowedAction.MANAGE_ONLY
                 reasons.append(f"Per-symbol exposure limit hit: {symbol_exposure_pct*100:.2f}% >= {self.per_symbol_exposure_pct*100:.2f}%")
         
-        # Check BTC risk-off context
+        # Check BTC risk-off context (position sizing already reduces size by 50% at Layer 5)
         btc_risk_off = bool(context.btc_context.get("risk_off", False))
         if btc_risk_off and context.symbol != "XBT/USD" and context.symbol != "BTC/USD":
-            # For altcoins, BTC risk-off reduces to MANAGE_ONLY
-            if allowed_actions == AllowedAction.TRADE_ALLOWED:
-                allowed_actions = AllowedAction.MANAGE_ONLY
-                reasons.append("BTC risk-off context: altcoin trading reduced to manage-only")
+            reasons.append("BTC risk-off context: altcoin position size will be reduced")
 
         # Volatility spike filter (pause new entries)
         try:
             atr_val = _atr(context.candles_1d or context.candles_4h or [], 14)
             if atr_val and context.last_price > 0:
                 vol_pct = atr_val / context.last_price
-                if vol_pct >= 0.10 and allowed_actions == AllowedAction.TRADE_ALLOWED:
+                if vol_pct >= 0.15 and allowed_actions == AllowedAction.TRADE_ALLOWED:
                     allowed_actions = AllowedAction.MANAGE_ONLY
                     reasons.append("Volatility spike: manage-only")
         except Exception:
@@ -1397,16 +1394,16 @@ class IntelligenceLayer:
             except Exception:
                 pass
         
-        # Adjust size based on volatility
+        # Adjust size based on volatility (moderate reduction to stay in the game)
         volatility_adjusted = False
-        if volatility_pct > 0.05:  # High vol (>5%)
-            base_size *= 0.5  # Reduce by 50%
+        if volatility_pct > 0.08:  # Very high vol (>8%)
+            base_size *= 0.5
             volatility_adjusted = True
-            reasons.append(f"High volatility ({volatility_pct*100:.2f}%): size reduced")
-        elif volatility_pct > 0.03:  # Medium-high vol
+            reasons.append(f"Very high volatility ({volatility_pct*100:.2f}%): size halved")
+        elif volatility_pct > 0.05:  # High vol (>5%)
             base_size *= 0.75
             volatility_adjusted = True
-            reasons.append(f"Medium-high volatility ({volatility_pct*100:.2f}%): size reduced")
+            reasons.append(f"High volatility ({volatility_pct*100:.2f}%): size reduced 25%")
         
         # Correlation + BTC risk-off adjustments
         btc_risk_adjusted = False
@@ -1511,6 +1508,12 @@ class IntelligenceLayer:
             ladder_steps = min(ladder_steps, 1)
         max_adds = ladder_steps
         
+        # Minimum position size floor to prevent near-zero orders
+        min_position = float(os.getenv("INTEL_MIN_POSITION_SIZE", "5.0"))
+        if 0 < base_size < min_position:
+            base_size = min_position
+            reasons.append(f"Position size floored to ${min_position:.0f} minimum")
+
         return PositionSizingResult(
             base_size=base_size,
             ladder_steps=ladder_steps,

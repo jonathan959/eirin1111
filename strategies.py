@@ -336,7 +336,7 @@ class SmartDcaConfig:
     cooldown_sec: int = 300
     safety_cooldown_sec: int = 120
     max_open_deals: int = 3
-    vol_pause_ratio: float = 0.03
+    vol_pause_ratio: float = 0.05
     mean_rev_pct: float = 0.02
     stop_loss_pct: float = 0.08
     max_drawdown_pct: float = 0.0  # Per-position: halt when unrealized loss >= this (0 = disabled)
@@ -505,8 +505,8 @@ def _detect_regime_impl(closes: List[float], candles: List[List[float]]) -> Regi
 
     thresholds = {
         "adx_trend": 22.0,
-        "adx_range": 18.0,
-        "bb_bw_low": 0.035,
+        "adx_range": 22.0,
+        "bb_bw_low": 0.05,
         "bb_bw_high": 0.09,
         "atr_high": 0.04,
         "vol_breakout": 1.5,
@@ -729,7 +729,7 @@ def build_smart_dca_config(ctx_or_cfg: Any, overrides: Optional[Dict[str, Any]] 
         cooldown_sec=(_safe_cfg_int(cfg, "min_minutes_between_entries", 5) * 60) if "min_minutes_between_entries" in cfg else int(os.getenv("SMART_COOLDOWN_SEC", "300")),
         safety_cooldown_sec=(_safe_cfg_int(cfg, "min_minutes_between_safety_orders", 2) * 60) if "min_minutes_between_safety_orders" in cfg else int(os.getenv("SMART_SAFETY_COOLDOWN_SEC", "120")),
         max_open_deals=_safe_cfg_int(cfg, "max_concurrent_deals", 3) or _safe_cfg_int(cfg, "max_open_orders", 3) or int(os.getenv("SMART_MAX_OPEN_DEALS", "3")),
-        vol_pause_ratio=float(os.getenv("SMART_VOL_PAUSE_RATIO", "0.03")),
+        vol_pause_ratio=float(os.getenv("SMART_VOL_PAUSE_RATIO", "0.05")),
         mean_rev_pct=float(os.getenv("SMART_MEAN_REV_PCT", "0.02")),
         stop_loss_pct=_safe_cfg_float(cfg, "stop_loss_pct", 0.08) or float(os.getenv("SMART_STOP_LOSS_PCT", "0.08")),
         max_drawdown_pct=_safe_cfg_float(cfg, "max_drawdown_pct", 0.0),
