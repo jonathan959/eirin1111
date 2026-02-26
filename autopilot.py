@@ -370,6 +370,13 @@ def run_autopilot_cycle(
             if market == "stock":
                 market = "stocks"
             try:
+                profile = str(cfg.get("risk_profile") or os.getenv("AUTOPILOT_PROFILE", "balanced")).lower()
+                _profile_params = {
+                    "conservative": {"tp": 0.02, "stop_loss_pct": 0.05, "trailing_activation_pct": 0.015, "trailing_distance_pct": 0.008, "max_safety": 2, "max_drawdown_pct": 0.10, "daily_loss_limit_pct": 0.03, "per_symbol_exposure_pct": 0.08},
+                    "balanced":     {"tp": 0.03, "stop_loss_pct": 0.08, "trailing_activation_pct": 0.020, "trailing_distance_pct": 0.010, "max_safety": 3, "max_drawdown_pct": 0.15, "daily_loss_limit_pct": 0.05, "per_symbol_exposure_pct": 0.10},
+                    "aggressive":   {"tp": 0.05, "stop_loss_pct": 0.12, "trailing_activation_pct": 0.030, "trailing_distance_pct": 0.015, "max_safety": 5, "max_drawdown_pct": 0.20, "daily_loss_limit_pct": 0.08, "per_symbol_exposure_pct": 0.15},
+                }
+                pp = _profile_params.get(profile, _profile_params["balanced"])
                 bot_id = create_bot_fn({
                     "name": f"Autopilot {sym}",
                     "symbol": sym,
@@ -380,26 +387,35 @@ def run_autopilot_cycle(
                     "forced_strategy": "",
                     "base_quote": base_order,
                     "safety_quote": safety_order,
-                    "max_safety": 3,
+                    "max_safety": pp["max_safety"],
                     "first_dev": 0.015,
                     "step_mult": 1.2,
-                    "tp": 0.012,
+                    "tp": pp["tp"],
                     "trend_filter": 0,
                     "trend_sma": 200,
                     "max_spend_quote": capital_per_bot,
                     "poll_seconds": 10,
                     "max_open_orders": 6,
                     "max_total_exposure_pct": float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50")),
-                    "per_symbol_exposure_pct": 0.1,
+                    "per_symbol_exposure_pct": pp["per_symbol_exposure_pct"],
                     "min_free_cash_pct": 0.2,
                     "max_concurrent_deals": 4,
                     "spread_guard_pct": 0.004,
                     "limit_timeout_sec": 8,
-                    "daily_loss_limit_pct": 0.05,
+                    "daily_loss_limit_pct": pp["daily_loss_limit_pct"],
                     "pause_hours": 6,
                     "market_type": market,
                     "alpaca_mode": cfg.get("alpaca_mode", "paper"),
                     "auto_restart": 1,
+                    "stop_loss_pct": pp["stop_loss_pct"],
+                    "trailing_stop_enabled": 1,
+                    "trailing_activation_pct": pp["trailing_activation_pct"],
+                    "trailing_distance_pct": pp["trailing_distance_pct"],
+                    "max_drawdown_pct": pp["max_drawdown_pct"],
+                    "use_kelly_sizing": 1,
+                    "kelly_fraction": 0.25,
+                    "risk_profile": profile,
+                    "adaptive_tp_enabled": 1,
                 })
                 if bot_id and start_bot_fn:
                     start_bot_fn(bot_id)

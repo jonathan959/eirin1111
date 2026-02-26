@@ -2629,6 +2629,68 @@ class BotRunner:
                     time.sleep(poll)
                     continue
 
+                # Part 0: Universal stop-loss check (fires BEFORE trailing stop and strategy)
+                if avg_entry and price and float(self.state.base_pos or 0) > 0:
+                    stop_loss_pct = float(bot.get("stop_loss_pct") or 0)
+                    if stop_loss_pct > 0:
+                        loss_pct = (avg_entry - price) / avg_entry
+                        if loss_pct >= stop_loss_pct:
+                            sl_reason = f"STOP LOSS: Price ${price:.2f} is {loss_pct:.1%} below entry ${avg_entry:.2f} (limit: {stop_loss_pct:.1%})"
+                            self._set(sl_reason, "ERROR", "RISK")
+                            self._notify_discord(f"🛑 {self._bot_label()} {sl_reason}", trade_event=True, force=True)
+                            if not dry_run and pos_free > 0:
+                                try:
+                                    self._ensure_trading_allowed()
+                                    if tp_order_id:
+                                        self._cancel_order_safe(symbol, tp_order_id)
+                                        tp_order_id = None
+                                    self.kc.create_market_sell_base(symbol, float(pos_total), f"stoploss_{self.bot_id}")
+                                    deal_id = self.state.deal_id
+                                    if deal_id:
+                                        close_deal(deal_id, entry_avg=float(avg_entry or 0), exit_avg=float(price),
+                                                   base_amount=float(pos_total),
+                                                   realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                                   exit_strategy="stop_loss")
+                                except Exception as e:
+                                    self._set(f"Stop loss sell failed: {e}", "ERROR", "ORDER")
+                            now_ts_sl = int(time.time())
+                            self._cooldown_until = now_ts_sl + int(float(bot.get("stop_loss_cooldown_sec") or 3600))
+                            with self._lock:
+                                self.state.cooldown_until = int(self._cooldown_until)
+                            set_setting(f"bot:{self.bot_id}:last_stop_ts", str(now_ts_sl))
+                            self._heartbeat()
+                            time.sleep(poll)
+                            continue
+
+                # Part 0b: Time-based exit check
+                if float(self.state.base_pos or 0) > 0:
+                    max_hold_hours = int(bot.get("max_hold_hours") or 0)
+                    if max_hold_hours > 0 and deal_opened_at > 0:
+                        hold_seconds = int(time.time()) - deal_opened_at
+                        if hold_seconds > max_hold_hours * 3600:
+                            hold_hrs = hold_seconds / 3600
+                            time_reason = f"TIME EXIT: Held {hold_hrs:.1f}h exceeds max {max_hold_hours}h"
+                            self._set(time_reason, "INFO", "ORDER")
+                            self._notify_discord(f"⏰ {self._bot_label()} {time_reason}", trade_event=True)
+                            if not dry_run and pos_free > 0:
+                                try:
+                                    self._ensure_trading_allowed()
+                                    if tp_order_id:
+                                        self._cancel_order_safe(symbol, tp_order_id)
+                                        tp_order_id = None
+                                    self.kc.create_market_sell_base(symbol, float(pos_total), f"timeexit_{self.bot_id}")
+                                    deal_id = self.state.deal_id
+                                    if deal_id:
+                                        close_deal(deal_id, entry_avg=float(avg_entry or 0), exit_avg=float(price),
+                                                   base_amount=float(pos_total),
+                                                   realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                                   exit_strategy="time_exit")
+                                except Exception as e:
+                                    self._set(f"Time exit sell failed: {e}", "ERROR", "ORDER")
+                            self._heartbeat()
+                            time.sleep(poll)
+                            continue
+
                 # Part 1: Trailing stop check (direct in bot_manager)
                 if avg_entry and price and float(self.state.base_pos or 0) > 0:
                     should_exit_ts, ts_reason = self._check_trailing_stop(

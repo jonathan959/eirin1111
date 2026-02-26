@@ -329,6 +329,45 @@
 
     <div class="grid grid-3 section-md">
       <div>
+        <div class="label">Stop loss %</div>
+        <input id="f_stop_loss_pct" class="input" type="number" step="0.01" value="0.08" />
+        <div class="muted text-xs">Sell if price drops this % below entry (0.08 = 8%)</div>
+      </div>
+      <div>
+        <div class="label">Max drawdown %</div>
+        <input id="f_max_drawdown_pct" class="input" type="number" step="0.01" value="0.15" />
+        <div class="muted text-xs">Pause bot if portfolio drops this % from peak</div>
+      </div>
+      <div>
+        <div class="label">Max hold (hours, 0=off)</div>
+        <input id="f_max_hold_hours" class="input" type="number" step="1" value="0" />
+        <div class="muted text-xs">Auto-exit after this many hours</div>
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
+        <div class="label">Trailing stop activation %</div>
+        <input id="f_trailing_activation_pct" class="input" type="number" step="0.005" value="0.02" />
+        <div class="muted text-xs">Activate trailing at this profit % (0.02 = 2%)</div>
+      </div>
+      <div>
+        <div class="label">Trailing stop distance %</div>
+        <input id="f_trailing_distance_pct" class="input" type="number" step="0.005" value="0.01" />
+        <div class="muted text-xs">Trail this % below peak (0.01 = 1%)</div>
+      </div>
+      <div>
+        <div class="label">Risk profile</div>
+        <select id="f_risk_profile" class="input">
+          <option value="conservative">Conservative</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="aggressive">Aggressive</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="grid grid-3 section-md">
+      <div>
         <div class="label">Daily loss limit (pct)</div>
         <input id="f_daily_loss_limit_pct" class="input" type="number" step="0.01" value="0.06" />
       </div>
@@ -603,7 +642,12 @@
     setF("f_limit_timeout_sec", 8);
     setF("f_daily_loss_limit_pct", 0.06);
     setF("f_pause_hours", 6);
-    setF("f_max_drawdown_pct", 0);
+    setF("f_stop_loss_pct", 0.08);
+    setF("f_max_drawdown_pct", 0.15);
+    setF("f_max_hold_hours", 0);
+    setF("f_trailing_activation_pct", 0.02);
+    setF("f_trailing_distance_pct", 0.01);
+    setF("f_risk_profile", "balanced");
     setF("f_trend_filter", 0);
     setF("f_trend_sma", 200);
     setF("f_max_spend", 250);
@@ -701,7 +745,12 @@
     setVal("f_limit_timeout_sec", b.limit_timeout_sec, 8);
     setVal("f_daily_loss_limit_pct", b.daily_loss_limit_pct, 0.06);
     setVal("f_pause_hours", b.pause_hours, 6);
-    setVal("f_max_drawdown_pct", b.max_drawdown_pct, 0);
+    setVal("f_stop_loss_pct", b.stop_loss_pct, 0.08);
+    setVal("f_max_drawdown_pct", b.max_drawdown_pct, 0.15);
+    setVal("f_max_hold_hours", b.max_hold_hours, 0);
+    setVal("f_trailing_activation_pct", b.trailing_activation_pct, 0.02);
+    setVal("f_trailing_distance_pct", b.trailing_distance_pct, 0.01);
+    setVal("f_risk_profile", b.risk_profile, "balanced");
     setVal("f_trend_filter", b.trend_filter, 0);
     setVal("f_trend_sma", b.trend_sma, 200);
     setVal("f_max_spend", b.max_spend_quote, 0);
@@ -769,7 +818,12 @@
       limit_timeout_sec: Number(_v("f_limit_timeout_sec", "8")),
       daily_loss_limit_pct: Number(_v("f_daily_loss_limit_pct", "0.06")),
       pause_hours: Number(_v("f_pause_hours", "6")),
-      max_drawdown_pct: Number(_v("f_max_drawdown_pct", "0")) || 0,
+      stop_loss_pct: Number(_v("f_stop_loss_pct", "0.08")),
+      max_drawdown_pct: Number(_v("f_max_drawdown_pct", "0.15")) || 0,
+      max_hold_hours: Number(_v("f_max_hold_hours", "0")) || 0,
+      trailing_activation_pct: Number(_v("f_trailing_activation_pct", "0.02")),
+      trailing_distance_pct: Number(_v("f_trailing_distance_pct", "0.01")),
+      risk_profile: _v("f_risk_profile", "balanced"),
 
       trend_filter: Number(_v("f_trend_filter", "0")),
       trend_sma: Number(_v("f_trend_sma", "200")),

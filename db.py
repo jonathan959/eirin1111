@@ -732,7 +732,7 @@ def init_db() -> None:
         # Phase 1: Adaptive Volume & Spread
         _ensure_column(con, "bots", "min_volume_ratio", "REAL NOT NULL DEFAULT 1.5")
         _ensure_column(con, "bots", "adaptive_spread_enabled", "INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(con, "bots", "max_drawdown_pct", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(con, "bots", "max_drawdown_pct", "REAL NOT NULL DEFAULT 0.15")
         
         # Phase A: Kelly Criterion position sizing
         _ensure_column(con, "bots", "use_kelly_sizing", "INTEGER NOT NULL DEFAULT 1")
@@ -756,6 +756,11 @@ def init_db() -> None:
         _ensure_column(con, "bots", "fundamental_exit_only", "INTEGER DEFAULT 0")
         _ensure_column(con, "bots", "rebalance_enabled", "INTEGER DEFAULT 0")
         _ensure_column(con, "bots", "bot_type", "TEXT DEFAULT ''")
+
+        # Universal stop-loss and time-based exit
+        _ensure_column(con, "bots", "stop_loss_pct", "REAL NOT NULL DEFAULT 0.08")
+        _ensure_column(con, "bots", "max_hold_hours", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "bots", "risk_profile", "TEXT NOT NULL DEFAULT 'balanced'")
 
         # Deals table - tracking for trailing stops
         _ensure_column(con, "deals", "highest_price", "REAL")
