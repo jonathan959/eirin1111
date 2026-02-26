@@ -257,6 +257,12 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
     _def_slots, _def_score = _profile_defaults.get(AUTOPILOT_PROFILE, (6, 75.0))
     max_positions = int(cfg.get("max_positions") or os.getenv("DEFAULT_MAX_POSITIONS", str(_def_slots)))
     max_positions = min(max_positions, AUTOPILOT_MAX_BOTS)
+    # Limit positions to what capital can support ($5 minimum per bot)
+    min_capital_per = float(os.getenv("MIN_CAPITAL_PER_BOT", "5.0"))
+    capital_affordable_slots = max(1, int(total_capital / min_capital_per))
+    if max_positions > capital_affordable_slots:
+        logger.info("Autopilot: Reducing max_positions from %d to %d (capital $%.0f / $%.0f min per bot)", max_positions, capital_affordable_slots, total_capital, min_capital_per)
+        max_positions = capital_affordable_slots
     asset_filter = cfg.get("asset_types", "both")
     sectors_avoid = cfg.get("sectors_avoid") or []
     if isinstance(sectors_avoid, str):
@@ -375,8 +381,12 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                 capital_per_bot = max(floor, min(capital_per_bot, total_capital / max_positions * 1.5))
                 default_cap = float(os.getenv("DEFAULT_CAPITAL_PER_BOT", "500"))
                 capital_per_bot = min(capital_per_bot, default_cap)
-            base_order = max(0.5, capital_per_bot * 0.15)
-            safety_order = max(0.5, capital_per_bot * 0.1)
+            # Ensure capital_per_bot is enough for meaningful trades ($5 minimum)
+            min_viable_capital = float(os.getenv("MIN_CAPITAL_PER_BOT", "5.0"))
+            if capital_per_bot < min_viable_capital:
+                capital_per_bot = min_viable_capital
+            base_order = max(2.0, capital_per_bot * 0.30)
+            safety_order = max(1.0, capital_per_bot * 0.15)
             metrics = rec.get("metrics") or {}
             strategy = str(metrics.get("strategy") or metrics.get("recommended_strategy") or "smart_dca")
             market = (metrics.get("market_type") or "crypto").strip().lower()

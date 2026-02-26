@@ -29,14 +29,14 @@ from symbol_classifier import is_stock_symbol
 
 logger = logging.getLogger(__name__)
 
-# LIVE-HARDENED: exchange minimum order size for small-capital live trading ($100-$1000)
-MIN_NOTIONAL_KRAKEN_USD = float(os.getenv("MIN_NOTIONAL_KRAKEN_USD", "10.0"))
+# Exchange minimum order sizes (Kraken actual minimum ~$1, Alpaca $1 fractional)
+MIN_NOTIONAL_KRAKEN_USD = float(os.getenv("MIN_NOTIONAL_KRAKEN_USD", "1.0"))
 MIN_NOTIONAL_ALPACA_USD = float(os.getenv("MIN_NOTIONAL_ALPACA_USD", "1.0"))
 
 
 def _min_notional_usd(symbol: str, is_alpaca: bool) -> float:
-    """Minimum notional by exchange. Kraken ~$10, Alpaca $1 fractional."""
-    env_min = float(os.getenv("MIN_NOTIONAL_USD", "5.0"))
+    """Minimum notional by exchange. Kraken ~$1, Alpaca $1 fractional."""
+    env_min = float(os.getenv("MIN_NOTIONAL_USD", "1.0"))
     exchange_min = MIN_NOTIONAL_ALPACA_USD if is_alpaca else MIN_NOTIONAL_KRAKEN_USD
     return max(env_min, exchange_min)
 

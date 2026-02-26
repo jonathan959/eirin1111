@@ -1515,7 +1515,7 @@ class IntelligenceLayer:
             reasons.append("Position size reset: NaN/Inf detected")
 
         # Minimum position size floor to prevent near-zero orders
-        min_position = float(os.getenv("INTEL_MIN_POSITION_SIZE", "5.0"))
+        min_position = float(os.getenv("INTEL_MIN_POSITION_SIZE", "2.0"))
         if 0 < base_size < min_position:
             base_size = min_position
             reasons.append(f"Position size floored to ${min_position:.0f} minimum")
