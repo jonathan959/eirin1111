@@ -185,15 +185,54 @@ def ui_safety(request: Request):
 # --- Template-based pages (rich UI with sidebar) ---
 # These use Jinja2 templates from /templates/ for the full dashboard experience.
 
+def _dashboard_ctx_v2(request: Request) -> Dict[str, Any]:
+    """Build dashboard context without importing one_server (avoids circular imports)."""
+    import db
+    ctx = _base_ctx(request)
+    bm_ref = getattr(worker_api, "bm", None)
+    bots = db.list_bots() or []
+    bot_rows = []
+    for b in bots:
+        try:
+            stats = db.bot_deal_stats(int(b.get("id")))
+        except Exception:
+            stats = {"open_count": 0, "closed_count": 0, "realized_total": 0.0}
+        snap = bm_ref.snapshot(int(b.get("id"))) if bm_ref else {}
+        bot_rows.append({**b, "stats": stats, "runtime": snap or {}, "unrealized_pnl": 0.0})
+    try:
+        deals_stats = db.all_deal_stats()
+    except Exception:
+        deals_stats = {"open_count": 0, "closed_count": 0, "realized_total": 0.0}
+    deals_stats["unrealized_total"] = 0.0
+    try:
+        active_deals = [d for d in db.list_all_deals("OPEN", limit=50)]
+    except Exception:
+        active_deals = []
+    try:
+        closed_deals = [d for d in db.list_all_deals("CLOSED", limit=50)]
+    except Exception:
+        closed_deals = []
+    try:
+        pnl_today = db.pnl_summary(int(time.time()) - 86400).get("realized", 0.0) or 0.0
+        pnl_total = db.pnl_summary(0).get("realized", 0.0) or 0.0
+    except Exception:
+        pnl_today, pnl_total = 0.0, 0.0
+    ctx.update({
+        "portfolio": {"holdings": [], "total_usd": 0, "free_usd": 0, "used_usd": 0, "positions_usd": 0, "ts": int(time.time())},
+        "pnl": {"today": float(pnl_today), "total": float(pnl_total)},
+        "bots": bots, "bot_rows": bot_rows, "deals_stats": deals_stats,
+        "active_deals": active_deals, "closed_deals": closed_deals,
+        "kraken_ready": bool(getattr(worker_api, "KRAKEN_READY", False)),
+        "kraken_error": str(getattr(worker_api, "KRAKEN_ERROR", "") or ""),
+    })
+    return ctx
+
+
 @app.get("/dashboard", include_in_schema=False)
 def ui_dashboard_v2(request: Request):
     if templates is None:
         raise HTTPException(status_code=503, detail="Templates not found.")
-    try:
-        from one_server import _dashboard_context
-        return templates.TemplateResponse("dashboard.html", _dashboard_context(request))
-    except Exception:
-        return templates.TemplateResponse("dashboard.html", _base_ctx(request))
+    return templates.TemplateResponse("dashboard.html", _dashboard_ctx_v2(request))
 
 
 @app.get("/dca", include_in_schema=False)
@@ -201,10 +240,9 @@ def ui_dca_v2(request: Request):
     if templates is None:
         raise HTTPException(status_code=503, detail="Templates not found.")
     try:
-        from one_server import ui_dca_dashboard
-        return ui_dca_dashboard(request)
+        return templates.TemplateResponse("dca.html", _dashboard_ctx_v2(request))
     except Exception:
-        return templates.TemplateResponse("dca.html", _base_ctx(request))
+        return templates.TemplateResponse("dca_dashboard.html", _base_ctx(request))
 
 
 @app.get("/explore", include_in_schema=False)
@@ -225,7 +263,7 @@ def ui_analytics_v2(request: Request):
 def ui_journal_v2(request: Request):
     if templates is None:
         raise HTTPException(status_code=503, detail="Templates not found.")
-    return templates.TemplateResponse("trade_journal.html", _base_ctx(request))
+    return templates.TemplateResponse("journal.html", _base_ctx(request))
 
 
 @app.get("/strategies", include_in_schema=False)
