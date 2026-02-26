@@ -197,19 +197,40 @@ def _dashboard_ctx_v2(request: Request) -> Dict[str, Any]:
             stats = db.bot_deal_stats(int(b.get("id")))
         except Exception:
             stats = {"open_count": 0, "closed_count": 0, "realized_total": 0.0}
-        snap = bm_ref.snapshot(int(b.get("id"))) if bm_ref else {}
-        bot_rows.append({**b, "stats": stats, "runtime": snap or {}, "unrealized_pnl": 0.0})
+        try:
+            snap = bm_ref.snapshot(int(b.get("id"))) if bm_ref else {}
+        except Exception:
+            snap = {}
+        if not isinstance(snap, dict):
+            snap = {}
+        bot_rows.append({**b, "stats": stats, "runtime": snap, "unrealized_pnl": 0.0})
     try:
         deals_stats = db.all_deal_stats()
     except Exception:
         deals_stats = {"open_count": 0, "closed_count": 0, "realized_total": 0.0}
     deals_stats["unrealized_total"] = 0.0
+    bot_map = {int(b.get("id")): b for b in bots}
+    def _enrich_deal(d):
+        bid = int(d.get("bot_id") or 0)
+        bot = bot_map.get(bid, {})
+        tp = float(bot.get("tp") or 0.0)
+        entry = d.get("entry_avg")
+        snap = bm_ref.snapshot(bid) if bm_ref else {} if bid else {}
+        if not isinstance(snap, dict): snap = {}
+        lp = snap.get("last_price")
+        unreal = None
+        if entry and lp:
+            try: unreal = float(float(lp) - float(entry)) * float(d.get("base_amount") or snap.get("base_pos") or 0)
+            except Exception: pass
+        return {**d, "bot_name": bot.get("name"), "bot_symbol": bot.get("symbol"),
+                "tp_target": (float(entry) * (1 + tp)) if entry else None,
+                "last_price": lp, "unrealized_pnl": unreal}
     try:
-        active_deals = [d for d in db.list_all_deals("OPEN", limit=50)]
+        active_deals = [_enrich_deal(d) for d in db.list_all_deals("OPEN", limit=50)]
     except Exception:
         active_deals = []
     try:
-        closed_deals = [d for d in db.list_all_deals("CLOSED", limit=50)]
+        closed_deals = [_enrich_deal(d) for d in db.list_all_deals("CLOSED", limit=50)]
     except Exception:
         closed_deals = []
     try:
@@ -239,10 +260,8 @@ def ui_dashboard_v2(request: Request):
 def ui_dca_v2(request: Request):
     if templates is None:
         raise HTTPException(status_code=503, detail="Templates not found.")
-    try:
-        return templates.TemplateResponse("dca.html", _dashboard_ctx_v2(request))
-    except Exception:
-        return templates.TemplateResponse("dca_dashboard.html", _base_ctx(request))
+    ctx = _dashboard_ctx_v2(request)
+    return templates.TemplateResponse("dca.html", ctx)
 
 
 @app.get("/explore", include_in_schema=False)
