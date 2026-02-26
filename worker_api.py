@@ -2118,7 +2118,7 @@ def _health_watchdog_loop() -> None:
                     if bot and int(bot.get("enabled", 0)) == 1:
                         # Add a minimum cooldown to avoid rapid restart loops
                         last_restart = getattr(_health_watchdog_loop, f"_last_restart_{bot_id}", 0)
-                        if (now - last_restart) > 60:  # Don't restart more than once per 60 seconds
+                        if (now - last_restart) > 300:  # Don't restart more than once per 5 minutes
                             ok, reason = _can_start_bot_live(b)
                             if ok:
                                 bm.start(bot_id)

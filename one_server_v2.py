@@ -182,6 +182,67 @@ def ui_safety(request: Request):
     return templates.TemplateResponse("safety.html", _base_ctx(request))
 
 
+# --- Template-based pages (rich UI with sidebar) ---
+# These use Jinja2 templates from /templates/ for the full dashboard experience.
+
+@app.get("/dashboard", include_in_schema=False)
+def ui_dashboard_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    try:
+        from one_server import _dashboard_context
+        return templates.TemplateResponse("dashboard.html", _dashboard_context(request))
+    except Exception:
+        return templates.TemplateResponse("dashboard.html", _base_ctx(request))
+
+
+@app.get("/dca", include_in_schema=False)
+def ui_dca_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    try:
+        from one_server import ui_dca_dashboard
+        return ui_dca_dashboard(request)
+    except Exception:
+        return templates.TemplateResponse("dca.html", _base_ctx(request))
+
+
+@app.get("/explore", include_in_schema=False)
+def ui_explore_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    return templates.TemplateResponse("explore.html", _base_ctx(request))
+
+
+@app.get("/analytics", include_in_schema=False)
+def ui_analytics_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    return templates.TemplateResponse("analytics.html", _base_ctx(request))
+
+
+@app.get("/journal", include_in_schema=False)
+def ui_journal_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    return templates.TemplateResponse("trade_journal.html", _base_ctx(request))
+
+
+@app.get("/strategies", include_in_schema=False)
+@app.get("/strategies-leaderboard", include_in_schema=False)
+def ui_strategies_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    return templates.TemplateResponse("strategies_leaderboard.html", _base_ctx(request))
+
+
+@app.get("/scenario", include_in_schema=False)
+def ui_scenario_v2(request: Request):
+    if templates is None:
+        raise HTTPException(status_code=503, detail="Templates not found.")
+    return templates.TemplateResponse("scenario_simulator.html", _base_ctx(request))
+
+
 @app.get("/", response_class=HTMLResponse)
 def ui_home():
     bots = _list_bots()

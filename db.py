@@ -1375,7 +1375,21 @@ def close_deal(
             )
             con.commit()
         except Exception:
-            pass  # Do not fail deal close if performance tracking fails
+            pass
+
+    # Auto-populate trade journal with execution details
+    try:
+        pnl_str = f"${realized_pnl_quote:.2f}" if realized_pnl_quote is not None else "?"
+        hold_str = f"{hold_sec // 3600}h {(hold_sec % 3600) // 60}m" if hold_sec else "?"
+        exit_reason_auto = exit_strategy or "manual"
+        entry_reason_auto = entry_strategy or "strategy"
+        upsert_trade_journal(
+            int(deal_id),
+            entry_reason=f"Auto: {entry_reason_auto}",
+            exit_reason=f"Auto: {exit_reason_auto} | P&L: {pnl_str} | Hold: {hold_str}",
+        )
+    except Exception:
+        pass
     con.close()
 
 
