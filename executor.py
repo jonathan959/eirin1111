@@ -20,6 +20,8 @@ from kraken_client import KrakenClient, _userref_from_client_order_id
 
 ORDER_IDEMPOTENCY_ENABLED = os.getenv("ORDER_IDEMPOTENCY_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 LIMIT_ORDER_PATIENCE_SECONDS = int(os.getenv("LIMIT_ORDER_PATIENCE_SECONDS", "300"))
+# Stale quote: max age (sec) before rejecting. 0 = disable. Default 300. Set STALE_QUOTE_MAX_AGE_SECONDS in .env.
+STALE_QUOTE_MAX_AGE_SECONDS = int(os.getenv("STALE_QUOTE_MAX_AGE_SECONDS", "300"))
 ENABLE_ICEBERG = os.getenv("ENABLE_ICEBERG", "0").strip().lower() in ("1", "true", "yes", "y", "on")
 ICEBERG_MIN_NOTIONAL_USD = float(os.getenv("ICEBERG_MIN_NOTIONAL_USD", "10000"))
 from intelligence_layer import IntelligenceDecision, ExecutionPolicyResult
@@ -338,11 +340,13 @@ class OrderExecutor:
         if side not in ["buy", "sell"]:
             return {"error": f"Invalid side: {side}"}
 
-        # Stale quote protection
+        # Stale quote protection (0 = disabled; STALE_QUOTE_MAX_AGE_SECONDS in .env)
         try:
-            qts = float(proposed_order.get("quote_ts") or 0.0)
-            if qts > 0 and (time.time() - qts) > 30:
-                return {"error": "Stale quote: order rejected"}
+            max_age = STALE_QUOTE_MAX_AGE_SECONDS
+            if max_age > 0:
+                qts = float(proposed_order.get("quote_ts") or 0.0)
+                if qts > 0 and (time.time() - qts) > max_age:
+                    return {"error": f"Stale quote: order rejected (quote older than {max_age}s)"}
         except Exception:
             pass
 
