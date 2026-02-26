@@ -70,6 +70,10 @@ Stock bots may show WARN-level `"Account snapshot failed: request is not authori
 - OHLCV fetches use `ohlcv_cached()` (TTL-based caching) to reduce API calls and avoid rate limit storms when running multiple crypto bots.
 - Kraken DDoS/rate-limit errors are handled with exponential backoff (5 retries, up to 30s sleep, extra 2x for DDoS).
 - Exchange API errors in the bot loop are caught per-iteration (not fatal) — the bot logs a WARN and retries on the next cycle.
+- Universal stop-loss enforcement: `stop_loss_pct` (per-bot, default 8%) fires before trailing stop and strategy logic. Sells immediately when loss exceeds threshold.
+- Time-based exit: `max_hold_hours` (per-bot, default 0=off) auto-sells if position held too long.
+- Autopilot uses risk profiles (conservative/balanced/aggressive) to set TP, SL, trailing stop, and position sizing defaults when creating bots.
+- Per-bot risk controls are editable in the UI: stop loss %, max drawdown %, max hold hours, trailing stop activation/distance %, and risk profile.
 
 ### Gotchas
 
