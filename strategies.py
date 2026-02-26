@@ -456,8 +456,9 @@ def base_formation(values: List[float], window: int = 12, max_range_pct: float =
 
 def detect_regime(candles: List[List[float]]) -> RegimeResult:
     confidence = 0.0  # Always initialized; never leave undefined
-    closes = [float(c[4]) for c in candles if len(c) >= 5]
-    if not closes:
+    import math
+    closes = [float(c[4]) for c in candles if len(c) >= 5 and not math.isnan(float(c[4]))]
+    if len(closes) < 2:
         return RegimeResult(
             regime="RISK_OFF",
             confidence=0.0,

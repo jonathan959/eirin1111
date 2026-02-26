@@ -1226,7 +1226,7 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                     spread_bps=spread_bps if spread_bps > 0 else None,
                     volatility_pct=float(vol_pct) if vol_pct is not None else None,
                 )
-                recommendation["score"] = adj_score
+                recommendation["score"] = max(0.0, min(100.0, adj_score))
                 recommendation["reasons"] = (recommendation.get("reasons") or []) + extra_reasons
     except ImportError:
         pass

@@ -7,6 +7,7 @@ Autopilot: Set-and-forget automation.
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -215,6 +216,8 @@ def get_now_opportunities(
     return candidates[: max(1, int(max_count))]
 
 
+_cycle_lock = threading.Lock()
+
 def run_autopilot_cycle(
     create_bot_fn,
     delete_bot_fn,
@@ -231,6 +234,16 @@ def run_autopilot_cycle(
     if not force_run and not is_autopilot_enabled():
         logger.info("Autopilot check skipped: disabled (set autopilot_enabled=1 in settings to enable)")
         return {"status": "disabled", "created": 0, "closed": 0}
+    if not _cycle_lock.acquire(blocking=False):
+        logger.info("Autopilot cycle already running, skipping")
+        return {"status": "busy", "created": 0, "closed": 0}
+    try:
+        return _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_bot_fn, get_portfolio_total_fn, notify_fn, force_run)
+    finally:
+        _cycle_lock.release()
+
+
+def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_bot_fn, get_portfolio_total_fn, notify_fn, force_run):
     # LIVE-HARDENED: heartbeat written at end of cycle for watchdog
     logger.info("Autopilot checking... [%s]", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
     cfg = get_autopilot_config()

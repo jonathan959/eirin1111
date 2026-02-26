@@ -1809,11 +1809,11 @@ def get_strategy_perf(bot_id: int, strategy: str, window: int = 30) -> Dict[str,
         return {"trades": 0, "win_rate": 0.0, "profit_factor": 0.0, "expectancy": 0.0, "max_drawdown": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
-    win_rate = len(wins) / len(pnls)
+    win_rate = len(wins) / len(pnls) if pnls else 0.0
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses)) if losses else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
-    expectancy = sum(pnls) / len(pnls)
+    expectancy = sum(pnls) / len(pnls) if pnls else 0.0
     avg_win = (sum([p for p in pnl_pcts if p > 0]) / max(1, len([p for p in pnl_pcts if p > 0]))) if pnl_pcts else 0.0
     avg_loss = abs(sum([p for p in pnl_pcts if p < 0]) / max(1, len([p for p in pnl_pcts if p < 0]))) if pnl_pcts else 0.0
     # Simple max drawdown on cumulative pnl

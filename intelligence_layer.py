@@ -1508,6 +1508,12 @@ class IntelligenceLayer:
             ladder_steps = min(ladder_steps, 1)
         max_adds = ladder_steps
         
+        # Guard against NaN/Inf from upstream calculations
+        import math
+        if math.isnan(base_size) or math.isinf(base_size):
+            base_size = 0.0
+            reasons.append("Position size reset: NaN/Inf detected")
+
         # Minimum position size floor to prevent near-zero orders
         min_position = float(os.getenv("INTEL_MIN_POSITION_SIZE", "5.0"))
         if 0 < base_size < min_position:

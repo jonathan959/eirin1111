@@ -247,13 +247,21 @@ class AlpacaAdapter:
          'free': {'USD': 50.0, 'AAPL': 10}, 
          'used': {'USD': 50.0, 'AAPL': 0}}
         """
-        acct = self.client.get_account()
-        cash = float(acct.get("cash", 0))
-        buying_power = float(acct.get("buying_power", 0))
-        # buying_power approx cash for non-margin?
-        # Alpaca separates cash and positions.
+        try:
+            acct = self.client.get_account()
+        except Exception:
+            acct = {}
+        if not isinstance(acct, dict):
+            acct = {}
+        cash = float(acct.get("cash", 0) or 0)
+        buying_power = float(acct.get("buying_power", 0) or 0)
         
-        positions = self.client.get_positions()
+        try:
+            positions = self.client.get_positions()
+        except Exception:
+            positions = []
+        if not isinstance(positions, list):
+            positions = []
         
         total = {"USD": cash} # Actually cash is free? No, cash + position value = equity.
         # But Kraken `total['USD']` is usually checking cash balance?

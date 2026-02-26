@@ -594,6 +594,8 @@ class BotRunner:
                     if n >= 30:
                         r1 = _rets(btc_close[-n:])
                         r2 = _rets(sym_close[-n:])
+                        if not r1 or not r2:
+                            raise ValueError("empty returns")
                         m1 = sum(r1) / len(r1)
                         m2 = sum(r2) / len(r2)
                         cov = sum((a - m1) * (b - m2) for a, b in zip(r1, r2)) / max(1, len(r1) - 1)
@@ -2647,9 +2649,11 @@ class BotRunner:
                                     self.kc.create_market_sell_base(symbol, float(pos_total), f"stoploss_{self.bot_id}")
                                     deal_id = self.state.deal_id
                                     if deal_id:
-                                        close_deal(deal_id, entry_avg=float(avg_entry or 0), exit_avg=float(price),
+                                        _entry = float(avg_entry) if avg_entry else None
+                                    _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
+                                    close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
                                                    base_amount=float(pos_total),
-                                                   realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                                   realized_pnl_quote=_pnl,
                                                    exit_strategy="stop_loss")
                                 except Exception as e:
                                     self._set(f"Stop loss sell failed: {e}", "ERROR", "ORDER")
@@ -2681,9 +2685,11 @@ class BotRunner:
                                     self.kc.create_market_sell_base(symbol, float(pos_total), f"timeexit_{self.bot_id}")
                                     deal_id = self.state.deal_id
                                     if deal_id:
-                                        close_deal(deal_id, entry_avg=float(avg_entry or 0), exit_avg=float(price),
+                                        _entry = float(avg_entry) if avg_entry else None
+                                    _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
+                                    close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
                                                    base_amount=float(pos_total),
-                                                   realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                                   realized_pnl_quote=_pnl,
                                                    exit_strategy="time_exit")
                                 except Exception as e:
                                     self._set(f"Time exit sell failed: {e}", "ERROR", "ORDER")
