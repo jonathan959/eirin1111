@@ -3400,9 +3400,36 @@ def api_market_overview(quote: str = "USD", limit: int = 50, market_type: str = 
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+_PORTFOLIO_SNAP_CACHE: Dict[str, Any] = {}
+_PORTFOLIO_SNAP_TS: float = 0.0
+
+def _portfolio_snapshot_cached() -> Dict[str, Any]:
+    """Return cached portfolio (refreshed by background _portfolio_loop every 60s)."""
+    global _PORTFOLIO_SNAP_TS
+    now = time.time()
+    if _PORTFOLIO_SNAP_CACHE and (now - _PORTFOLIO_SNAP_TS) < 30:
+        return _PORTFOLIO_SNAP_CACHE
+    import threading
+    def _bg():
+        global _PORTFOLIO_SNAP_TS
+        try:
+            snap = _portfolio_snapshot()
+            _PORTFOLIO_SNAP_CACHE.clear()
+            _PORTFOLIO_SNAP_CACHE.update(snap)
+            _PORTFOLIO_SNAP_TS = time.time()
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+    if _PORTFOLIO_SNAP_CACHE:
+        return _PORTFOLIO_SNAP_CACHE
+    with _globals_lock:
+        latest = PORT_HISTORY[-1]["total_usd"] if PORT_HISTORY else 0.0
+    return {"total_usd": float(latest), "free_usd": 0, "used_usd": 0, "positions_usd": 0, "holdings": []}
+
+
 @app.get("/api/portfolio")
 def api_portfolio():
-    snap = _portfolio_snapshot()
+    snap = _portfolio_snapshot_cached()
     with _globals_lock:
         history = list(PORT_HISTORY[-500:])
     return _json({"ok": True, "portfolio": snap, "history": history})
@@ -3412,7 +3439,7 @@ def api_portfolio():
 def api_portfolio_performance(timeframe: str = "1D"):
     """Portfolio performance for charts. Uses PORT_HISTORY."""
     try:
-        snap = _portfolio_snapshot()
+        snap = _portfolio_snapshot_cached()
         total_usd = float(snap.get("total_usd") or 0)
         with _globals_lock:
             history = list(PORT_HISTORY[-500:])
@@ -6019,7 +6046,7 @@ def _autopilot_loop() -> None:
 
             def _get_portfolio_fn():
                 try:
-                    snap = _portfolio_snapshot()
+                    snap = _portfolio_snapshot_cached()
                     t = float(snap.get("total_usd") or 0)
                     if t > 0:
                         return t
@@ -6117,7 +6144,7 @@ def api_autopilot_status():
     active_positions = 0
     total_pnl = 0.0
     try:
-        snap = _portfolio_snapshot()
+        snap = _portfolio_snapshot_cached()
         portfolio_value = float(snap.get("total_usd") or 0)
         bots = list_bots()
         active_positions = sum(1 for b in bots if int(b.get("enabled", 0)) == 1)
@@ -6277,7 +6304,7 @@ def api_autopilot_run():
 
     def _get_portfolio_fn():
         try:
-            snap = _portfolio_snapshot()
+            snap = _portfolio_snapshot_cached()
             t = float(snap.get("total_usd") or 0)
             if t > 0:
                 return t
