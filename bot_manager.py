@@ -1637,10 +1637,10 @@ class BotRunner:
                             if deal_id:
                                 close_deal(
                                     deal_id,
-                                    entry_avg=float(avg_entry or 0),
+                                    entry_avg=float(avg_entry) if avg_entry else None,
                                     exit_avg=float(price),
                                     base_amount=float(sell_amt),
-                                    realized_pnl_quote=float(price - (avg_entry or 0)) * float(sell_amt),
+                                    realized_pnl_quote=float(price - float(avg_entry)) * float(sell_amt) if avg_entry else 0.0,
                                     exit_strategy="partial_exit",
                                 )
                             with self._lock:
@@ -1693,10 +1693,10 @@ class BotRunner:
                         if deal_id:
                             close_deal(
                                 deal_id,
-                                entry_avg=float(avg_entry or 0),
+                                entry_avg=float(avg_entry) if avg_entry else None,
                                 exit_avg=float(price),
                                 base_amount=float(pos_total),
-                                realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                realized_pnl_quote=float(price - float(avg_entry)) * float(pos_total) if avg_entry else 0.0,
                                 exit_strategy="trailing_exit",
                             )
                         with self._lock:
@@ -2594,10 +2594,10 @@ class BotRunner:
                                 if deal_id:
                                     close_deal(
                                         deal_id,
-                                        entry_avg=float(avg_entry or 0),
+                                        entry_avg=float(avg_entry) if avg_entry else None,
                                         exit_avg=float(price),
                                         base_amount=float(sell_amt),
-                                        realized_pnl_quote=float(price - (avg_entry or 0)) * float(sell_amt),
+                                        realized_pnl_quote=float(price - float(avg_entry)) * float(sell_amt) if avg_entry else 0.0,
                                         exit_strategy="partial_exit",
                                     )
                                 with self._lock:
@@ -2725,10 +2725,10 @@ class BotRunner:
                             if deal_id:
                                 close_deal(
                                     deal_id,
-                                    entry_avg=float(avg_entry or 0),
+                                    entry_avg=float(avg_entry) if avg_entry else None,
                                     exit_avg=float(price),
                                     base_amount=float(pos_total),
-                                    realized_pnl_quote=float(price - (avg_entry or 0)) * float(pos_total),
+                                    realized_pnl_quote=float(price - float(avg_entry)) * float(pos_total) if avg_entry else 0.0,
                                     exit_strategy="trailing_exit",
                                 )
                             with self._lock:
