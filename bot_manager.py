@@ -725,7 +725,7 @@ class BotRunner:
             bot_config=bot_config,
             dry_run=bool(bot.get("dry_run", 1)),
             portfolio_total_usd=total_quote,
-            portfolio_exposure_pct=(float(self.state.spent_quote or 0) / total_quote) if (total_quote > 0 and dry_run) else ((account.positions_usd / total_quote) if total_quote > 0 else 0.0),
+            portfolio_exposure_pct=(float(self.state.spent_quote or 0) / total_quote) if (total_quote > 0 and bool(bot.get("dry_run", 1))) else ((account.positions_usd / total_quote) if total_quote > 0 else 0.0),
             daily_realized_pnl=perf.realized_today,
             portfolio_drawdown=perf.drawdown,
             btc_context=btc_context,
