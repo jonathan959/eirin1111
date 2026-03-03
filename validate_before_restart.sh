@@ -19,7 +19,7 @@ source venv/bin/activate
 # Skip pip - temp dir often broken/full after EC2 reboot; deps should already be installed
 # pip install -q -r requirements.txt 2>/dev/null || true
 
-if python -c "import sys; sys.path.insert(0, '.'); from one_server_v2 import app; assert app is not None; print('Import OK')" 2>&1; then
+if python3 -c "import sys; sys.path.insert(0, '.'); from one_server_v2 import app; assert app is not None; print('Import OK')" 2>&1; then
   echo "=== Validation passed ==="
   exit 0
 fi
