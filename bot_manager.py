@@ -725,7 +725,7 @@ class BotRunner:
             bot_config=bot_config,
             dry_run=bool(bot.get("dry_run", 1)),
             portfolio_total_usd=total_quote,
-            portfolio_exposure_pct=(account.positions_usd / total_quote) if total_quote > 0 else 0.0,
+            portfolio_exposure_pct=(float(self.state.spent_quote or 0) / total_quote) if (total_quote > 0 and dry_run) else ((account.positions_usd / total_quote) if total_quote > 0 else 0.0),
             daily_realized_pnl=perf.realized_today,
             portfolio_drawdown=perf.drawdown,
             btc_context=btc_context,
@@ -2334,7 +2334,7 @@ class BotRunner:
                     try:
                         ps = pnl_summary(_today_start_ts_local())
                         daily_realized = _extract_realized_pnl(ps)
-                        total_exposure = float(self.manager.total_exposure_usd())
+                        total_exposure = float(account.positions_usd)
                         open_deals = int(self.manager.open_positions_count())
                         exp_pct = total_exposure / equity if equity > 0 else 0.0
                         _max_exp = float(bot.get("max_total_exposure_pct") or os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))
