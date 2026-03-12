@@ -704,8 +704,13 @@ def init_db() -> None:
 
     # Helpful indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_ts ON bot_logs(bot_id, ts);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_id ON bot_logs(bot_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON bot_logs(ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bots_symbol ON bots(symbol);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bots_enabled ON bots(enabled);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_bot_id ON deals(bot_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_state ON deals(state);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_symbol ON deals(symbol);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_bot_state ON deals(bot_id, state);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_closed_at ON deals(closed_at);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_intel_bot_ts ON intelligence_decisions(bot_id, ts);")

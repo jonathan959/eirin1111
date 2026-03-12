@@ -8,6 +8,7 @@ import re
 import json
 import logging
 import gc
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,25 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 logger = logging.getLogger(__name__)
+
+# =========================================================
+# Graceful shutdown handling
+# =========================================================
+_shutdown_event = threading.Event()
+
+def _handle_shutdown_signal(signum, frame):
+    """Handle SIGINT and SIGTERM for graceful shutdown."""
+    sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+    logger.info(f"Graceful shutdown initiated by {sig_name}...")
+    _shutdown_event.set()
+
+# Register signal handlers
+try:
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    logger.info("Signal handlers registered for graceful shutdown (SIGINT, SIGTERM)")
+except Exception as e:
+    logger.warning(f"Could not register signal handlers: {e}")
 
 # =========================================================
 # Env loader: MUST RUN BEFORE importing KrakenClient/BotManager
@@ -629,6 +649,66 @@ def api_bots_summary():
     return _json({"ok": True, "total": total, "running": running, "paused": paused})
 
 
+@app.get("/api/bots/export")
+def api_bots_export():
+    """Export all bot configurations as JSON array."""
+    try:
+        bots = list_bots()
+        # Remove internal fields and timestamps for cleaner export
+        export_list = []
+        for bot in bots:
+            export_bot = dict(bot)
+            # Keep essential config but remove runtime/internal fields
+            export_bot.pop("id", None)
+            export_bot.pop("created_at", None)
+            export_list.append(export_bot)
+
+        return _json({"ok": True, "bots": export_list, "count": len(export_list)})
+    except Exception as e:
+        logger.exception("api_bots_export failed")
+        return _json({"ok": False, "error": str(e), "bots": []}, 500)
+
+
+@app.post("/api/bots/import")
+async def api_bots_import(request: Request):
+    """Import bot configurations from JSON array."""
+    try:
+        body = await request.json() or {}
+        bots_to_import = body.get("bots") or []
+
+        if not isinstance(bots_to_import, list):
+            return _json({"ok": False, "error": "Expected 'bots' as array"}, 400)
+
+        created = []
+        failed = []
+
+        for bot_config in bots_to_import:
+            try:
+                # Sanitize numeric fields
+                _sanitize_bot_numbers(bot_config)
+                # Ensure disabled state for import
+                bot_config["enabled"] = 0
+                # Create the bot
+                new_id = create_bot(bot_config)
+                created.append({"id": new_id, "name": bot_config.get("name")})
+            except Exception as e:
+                failed.append({"name": bot_config.get("name"), "error": str(e)})
+                logger.warning("Import bot failed: %s", e)
+
+        try:
+            _discord_notify(f"📥 Imported {len(created)} bot(s)")
+        except Exception:
+            pass
+
+        return _json({
+            "ok": True,
+            "created": created,
+            "failed": failed,
+            "total_imported": len(created)
+        })
+    except Exception as e:
+        logger.exception("api_bots_import failed")
+        return _json({"ok": False, "error": str(e)}, 500)
 
 
 # =========================================================
@@ -2799,8 +2879,36 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
-    """Clean shutdown: stop UnifiedAlpacaClient WebSocket and cache."""
-    global alpaca_paper, alpaca_live
+    """Graceful shutdown: stop all bots, close websockets, clean up resources."""
+    global alpaca_paper, alpaca_live, bm, _shutdown_event
+
+    logger.info("Shutdown event triggered - waiting up to 30 seconds for operations to complete...")
+    _shutdown_event.set()
+
+    # Stop all running bots
+    if bm:
+        try:
+            logger.info("Stopping all bots...")
+            for b in list_bots():
+                try:
+                    bm.stop(int(b.get("id")))
+                except Exception as e:
+                    logger.debug("Stop bot %s failed: %s", b.get("id"), e)
+        except Exception as e:
+            logger.warning("Error stopping bots: %s", e)
+
+    # Wait for running operations to complete (up to 30 seconds)
+    start_time = time.time()
+    timeout_sec = 30
+    while time.time() - start_time < timeout_sec:
+        if bm and bm._running_tasks and len([t for t in bm._running_tasks if t.get("active")]) > 0:
+            active_tasks = len([t for t in bm._running_tasks if t.get("active")])
+            logger.info(f"Waiting for {active_tasks} task(s) to complete... ({int(time.time() - start_time)}s)")
+            time.sleep(1)
+        else:
+            break
+
+    # Close Alpaca clients
     for client in [alpaca_paper, alpaca_live]:
         if client and hasattr(client, "shutdown"):
             try:
@@ -2808,6 +2916,8 @@ def shutdown():
                 logger.info("UnifiedAlpacaClient shutdown complete")
             except Exception as e:
                 logger.warning("Client shutdown: %s", e)
+
+    logger.info("Shutdown complete")
 
 
 def _start_websocket_with_timeout(ws_manager, timeout_sec: int = 10):
@@ -2980,8 +3090,11 @@ def _retry_alpaca_init_if_keys_present() -> bool:
 
 
 def _validate_config() -> None:
-    """Validate configuration at startup. Fail fast with clear errors if invalid."""
+    """Validate configuration at startup. Check API keys and connectivity."""
     errs = []
+    warnings = []
+
+    # Numeric range validation
     ttl_val = os.getenv("MARKETS_TTL_SEC", "300").strip()
     if ttl_val:
         try:
@@ -2990,6 +3103,7 @@ def _validate_config() -> None:
                 errs.append(f"MARKETS_TTL_SEC must be 60-3600, got {ttl}")
         except (ValueError, TypeError):
             errs.append("MARKETS_TTL_SEC must be an integer")
+
     port_val = os.getenv("PORT_EVERY_SEC", "60").strip()
     if port_val:
         try:
@@ -2998,10 +3112,56 @@ def _validate_config() -> None:
                 errs.append(f"PORT_EVERY_SEC must be 1-3600, got {port_every}")
         except (ValueError, TypeError):
             errs.append("PORT_EVERY_SEC must be an integer")
+
+    # Check API key presence
+    kraken_key = os.getenv("KRAKEN_API_KEY", "").strip()
+    kraken_secret = os.getenv("KRAKEN_API_SECRET", "").strip()
+
+    if not kraken_key:
+        warnings.append("KRAKEN_API_KEY not set; crypto trading disabled")
+    elif len(kraken_key) < 20:
+        warnings.append(f"KRAKEN_API_KEY seems too short ({len(kraken_key)} chars)")
+
+    if not kraken_secret:
+        warnings.append("KRAKEN_API_SECRET not set; crypto trading disabled")
+    elif len(kraken_secret) < 20:
+        warnings.append(f"KRAKEN_API_SECRET seems too short ({len(kraken_secret)} chars)")
+
+    # Check Alpaca keys if enabled
+    enable_alpaca = os.getenv("ENABLE_ALPACA", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+    if enable_alpaca:
+        alpaca_key_paper = os.getenv("ALPACA_API_KEY_PAPER", "").strip()
+        alpaca_secret_paper = os.getenv("ALPACA_API_SECRET_PAPER", "").strip()
+
+        if not alpaca_key_paper:
+            warnings.append("ALPACA_API_KEY_PAPER not set; paper trading disabled")
+        if not alpaca_secret_paper:
+            warnings.append("ALPACA_API_SECRET_PAPER not set; paper trading disabled")
+
+        alpaca_key_live = os.getenv("ALPACA_API_KEY_LIVE", "").strip()
+        alpaca_secret_live = os.getenv("ALPACA_API_SECRET_LIVE", "").strip()
+        live_trading = os.getenv("LIVE_TRADING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+
+        if live_trading:
+            if not alpaca_key_live or not alpaca_secret_live:
+                warnings.append("LIVE_TRADING_ENABLED but Alpaca live keys not set; live trading disabled")
+
+    # Log warnings
+    for w in warnings:
+        logger.warning(f"[STARTUP VALIDATION] {w}")
+
+    # Log key validation results
+    _STARTUP_STATUS["validation_warnings"] = warnings
+    _STARTUP_STATUS["kraken_key_present"] = bool(kraken_key)
+    _STARTUP_STATUS["kraken_secret_present"] = bool(kraken_secret)
+
     if errs:
         msg = "Config validation failed: " + "; ".join(errs)
         logger.error(msg)
+        _STARTUP_STATUS["validation_errors"] = errs
         raise ValueError(msg)
+
+    logger.info(f"[STARTUP VALIDATION] Config valid. {len(warnings)} warning(s).")
 
 
 def _startup_impl():
@@ -3827,6 +3987,80 @@ def api_health_prometheus():
     return _json({"ok": False, "message": "Prometheus disabled"})
 
 
+@app.get("/api/health/detailed")
+def api_health_detailed():
+    """Enhanced health check with detailed component status."""
+    try:
+        import time as time_module
+
+        # Determine overall status
+        status = "healthy"
+        uptime_sec = int(time_module.time() - _APP_START_TIME) if _APP_START_TIME else 0
+
+        # Database check
+        db_status = "ok"
+        db_latency_ms = 0
+        try:
+            start = time_module.time()
+            init_db()
+            db_latency_ms = int((time_module.time() - start) * 1000)
+        except Exception as e:
+            db_status = "error"
+            status = "degraded"
+
+        # Kraken check
+        kraken_status = "ok" if KRAKEN_READY and kc else ("error" if KRAKEN_ERROR else "not_configured")
+        kraken_message = KRAKEN_ERROR if KRAKEN_ERROR else ("Ready" if KRAKEN_READY else "Not initialized")
+
+        # Alpaca Paper check
+        alpaca_paper_status = "ok" if ALPACA_PAPER_READY else ("error" if ALPACA_ERROR else "not_configured")
+        alpaca_paper_message = ALPACA_ERROR if ALPACA_ERROR else ("Ready" if ALPACA_PAPER_READY else "Not initialized")
+
+        # Alpaca Live check
+        alpaca_live_status = "ok" if ALPACA_LIVE_READY else ("not_configured")
+        alpaca_live_message = "Ready" if ALPACA_LIVE_READY else "Not configured/Live trading disabled"
+
+        # Set status to degraded if any exchange is down
+        if kraken_status == "error" or alpaca_paper_status == "error":
+            status = "degraded"
+
+        checks = {
+            "database": {
+                "status": db_status,
+                "latency_ms": db_latency_ms
+            },
+            "kraken": {
+                "status": kraken_status,
+                "message": kraken_message
+            },
+            "alpaca_paper": {
+                "status": alpaca_paper_status,
+                "message": alpaca_paper_message
+            },
+            "alpaca_live": {
+                "status": alpaca_live_status,
+                "message": alpaca_live_message
+            }
+        }
+
+        return _json({
+            "status": status,
+            "version": "2.0.0",
+            "uptime_seconds": uptime_sec,
+            "checks": checks,
+            "timestamp": int(time_module.time())
+        })
+    except Exception as e:
+        logger.exception("api_health_detailed failed")
+        return _json({
+            "status": "error",
+            "version": "2.0.0",
+            "uptime_seconds": 0,
+            "checks": {},
+            "error": str(e)
+        }, 503)
+
+
 @app.get("/api/comprehensive_health")
 def api_comprehensive_health():
     """Run comprehensive health check and return issues (if any)."""
@@ -4042,6 +4276,19 @@ def api_mark_notification_read(notification_id: int):
     except Exception as e:
         logger.error(f"Mark notification read error: {type(e).__name__}: {e}")
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
+@app.get("/api/notifications/unread_count")
+def api_notifications_unread_count():
+    """Get count of unread notifications."""
+    try:
+        from notification_manager import get_unread_count
+
+        count = get_unread_count()
+        return _json({"ok": True, "unread_count": count})
+    except Exception as e:
+        logger.error(f"Unread count error: {type(e).__name__}: {e}")
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}", "unread_count": 0}, 500)
 
 
 @app.get("/api/alpaca/symbols")
@@ -4627,6 +4874,40 @@ def api_bots_delete(bot_id: int):
     except Exception as e:
         logger.exception("api_bots_delete: delete_bot failed for bot %s", bid)
         return _json({"ok": False, "error": f"Delete failed: {e}"}, 500)
+
+
+@app.post("/api/bots/{bot_id}/clone")
+def api_bots_clone(bot_id: int):
+    """Create a copy of a bot with (Copy) suffix in name."""
+    bid = int(bot_id)
+    original = get_bot(bid)
+    if not original:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+
+    try:
+        # Create a copy of the bot config
+        copy_data = dict(original)
+        # Remove ID so it gets a new one
+        copy_data.pop("id", None)
+        # Append (Copy) to name
+        original_name = copy_data.get("name", "Bot")
+        copy_data["name"] = f"{original_name} (Copy)"
+        # Ensure it starts disabled
+        copy_data["enabled"] = 0
+
+        # Create the new bot
+        new_bot_id = create_bot(copy_data)
+        new_bot = get_bot(new_bot_id)
+
+        try:
+            _discord_notify(f"✅ Bot '{original_name}' cloned as '{copy_data['name']}'")
+        except Exception:
+            pass
+
+        return _json({"ok": True, "bot": new_bot, "message": f"Bot cloned with ID {new_bot_id}"})
+    except Exception as e:
+        logger.exception("api_bots_clone: clone failed for bot %s", bid)
+        return _json({"ok": False, "error": f"Clone failed: {e}"}, 500)
 
 
 @app.get("/api/bots/{bot_id}/dealstats")
@@ -6149,6 +6430,75 @@ def api_logs(lines: int = 200, service: str = "tradingserver"):
     except Exception as e:
         logger.exception("api_logs failed")
         return _json({"ok": False, "error": str(e)[:200]}, 500)
+
+
+@app.get("/api/activity")
+def api_activity(limit: int = 20):
+    """Get recent bot activity for the dashboard live feed.
+    Returns recent logs from all bots, combining them into a single timeline."""
+    try:
+        from db import list_all_deals
+
+        limit = min(500, max(1, int(limit)))
+
+        # Get recent deals (trades) from all bots
+        all_deals = list_all_deals(limit=limit*2)
+
+        activities = []
+
+        for deal in all_deals:
+            if not deal or deal.get("state") not in ("open", "closed"):
+                continue
+
+            try:
+                bot = get_bot(deal.get("bot_id"))
+                if not bot:
+                    continue
+
+                action = "BUY"
+                details = ""
+                deal_type = "trade"
+                timestamp = deal.get("opened_at") or now_ts()
+
+                entry_price = deal.get("entry_avg") or 0
+                base_amt = deal.get("base_amount") or 0
+                realized_pnl = deal.get("realized_pnl_quote") or 0
+
+                if entry_price > 0 and base_amt > 0:
+                    details = f"Bought {base_amt:.4f} {deal.get('symbol')} at {entry_price:.2f}"
+                    if deal.get("state") == "closed":
+                        exit_price = deal.get("exit_avg") or entry_price
+                        pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                        action = "TAKE_PROFIT" if realized_pnl > 0 else "LOSS"
+                        details = f"Sold {base_amt:.4f} {deal.get('symbol')} at {exit_price:.2f} ({pnl_pct:+.2f}%)"
+                        deal_type = "profit" if realized_pnl > 0 else "loss"
+                        timestamp = deal.get("closed_at") or timestamp
+
+                activities.append({
+                    "timestamp": timestamp,
+                    "bot_name": bot.get("name") or f"Bot {bot.get('id')}",
+                    "bot_id": bot.get("id"),
+                    "symbol": deal.get("symbol"),
+                    "action": action,
+                    "details": details or f"Deal on {deal.get('symbol')}",
+                    "type": deal_type,
+                    "pnl": realized_pnl
+                })
+            except Exception as e:
+                logger.debug("Activity feed deal processing error: %s", e)
+                continue
+
+        # Sort by timestamp descending (newest first)
+        activities.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+
+        return _json({
+            "ok": True,
+            "activities": activities[:limit],
+            "total": len(activities)
+        })
+    except Exception as e:
+        logger.exception("api_activity failed")
+        return _json({"ok": False, "error": str(e), "activities": []}, 500)
 
 
 @app.post("/api/recommendations/{symbol}/create_bot")
