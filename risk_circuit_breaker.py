@@ -15,6 +15,18 @@ _OVERRIDE_MIN_EXPOSURE = os.getenv("OVERRIDE_MAX_EXPOSURE_PCT", "").strip()
 _OVERRIDE_MIN_EXPOSURE_VAL = float(_OVERRIDE_MIN_EXPOSURE) if _OVERRIDE_MIN_EXPOSURE and _OVERRIDE_MIN_EXPOSURE.replace(".", "").isdigit() else None
 
 
+def _clamp_exposure_pct(val: float) -> float:
+    """Clamp exposure percentage to 0-100. Handles NaN/inf."""
+    if val != val or val == float("inf") or val == float("-inf"):  # NaN check
+        return 0.0
+    return max(0.0, min(100.0, float(val)))
+
+
+def _breaker_enabled() -> bool:
+    """Check if portfolio exposure breaker is enabled."""
+    return os.getenv("PORTFOLIO_EXPOSURE_BREAKER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def check_circuit_breakers(
     equity: float,
     daily_realized_pnl: float,
@@ -25,13 +37,19 @@ def check_circuit_breakers(
     max_total_exposure_pct: Optional[float] = None,
     max_concurrent_deals: int = 6,
     max_daily_loss_pct: float = 0.06,
-    max_drawdown_pct: float = 0.20,
+    max_drawdown_pct: float = 0.15,
     max_exposure_pct: Optional[float] = None,
+    consecutive_losses: int = 0,
+    loss_circuit_threshold: int = 3,
+    loss_circuit_pause_until_ts: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Check all circuit breakers. Returns (ok, reason).
     If not ok, reason explains what tripped.
+    When PORTFOLIO_EXPOSURE_BREAKER_ENABLED=0, always returns (True, None).
     """
+    if not _breaker_enabled():
+        return True, None
     if max_total_exposure_pct is None:
         max_total_exposure_pct = _DEFAULT_MAX_EXPOSURE
     if max_exposure_pct is None:
@@ -42,6 +60,18 @@ def check_circuit_breakers(
         max_exposure_pct = max(max_exposure_pct, _OVERRIDE_MIN_EXPOSURE_VAL)
     if equity <= 0:
         return True, None
+
+    # 0. 3-loss circuit breaker: pause 24h after 3 consecutive losses
+    if consecutive_losses >= loss_circuit_threshold:
+        now_ts = int(time.time())
+        pause_until = loss_circuit_pause_until_ts or 0
+        # Block during 24h pause window
+        if pause_until > 0 and now_ts < pause_until:
+            reason = f"Circuit breaker: {consecutive_losses} consecutive losses — autopilot paused for 24h"
+            return False, reason
+        # No pause set or expired; block while at threshold (caller sets pause when 3rd loss closes)
+        reason = f"Circuit breaker: {consecutive_losses} consecutive losses — autopilot paused for 24h"
+        return False, reason
 
     # 1. Daily loss limit
     if max_daily_loss_pct > 0 and daily_realized_pnl < 0:

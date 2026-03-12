@@ -14,5 +14,9 @@ done
 [ -d templates ] && cp -rp templates .previous/ 2>/dev/null || true
 [ -d static ] && cp -rp static .previous/ 2>/dev/null || true
 [ -f tradingserver.service ] && cp -p tradingserver.service .previous/ 2>/dev/null || true
+# Backup DB so bots/data can be restored if deploy creates a new empty DB or path changes
+for db in botdb.sqlite3 botdb.sqlite3-wal botdb.sqlite3-shm; do
+  [ -f "$db" ] && cp -p "$db" .previous/ 2>/dev/null || true
+done
 
 echo "BACKUP_DONE"

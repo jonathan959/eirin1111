@@ -12,17 +12,18 @@ class TestSymbolRouting(unittest.TestCase):
     """Test that symbols are routed to correct trading providers"""
     
     @patch('worker_api.intelligence_layer')
+    @patch('phase2_data_fetcher.fetch_recent_candles')
     @patch('worker_api.alpaca_paper')
     @patch('worker_api.alpaca_live', None)
     @patch('worker_api.kc')
-    def test_stock_symbol_uses_alpaca_not_kraken(self, mock_kraken, mock_alpaca_paper, mock_intelligence):
+    def test_stock_symbol_uses_alpaca_not_kraken(self, mock_kraken, mock_alpaca_paper, mock_fetch, mock_intelligence):
         """INTC should call Alpaca methods, not Kraken methods"""
         from worker_api import _scan_symbol
-        
-        # Setup Alpaca mock
-        mock_alpaca_paper.get_ohlcv = Mock(return_value=[])
-        mock_alpaca_paper.get_latest_quote = Mock(return_value={"price": 50.0})
-        
+
+        # Stock path uses phase2_data_fetcher.fetch_recent_candles and client.get_ticker
+        mock_fetch.return_value = [[1000000, 45, 46, 44, 45.5, 1e6]] * 100
+        mock_alpaca_paper.get_ticker = Mock(return_value={"last": 50.0, "bid": 49.9, "ask": 50.1})
+
         # Setup intelligence layer mock
         mock_intelligence.generate_recommendation = Mock(return_value={
             "symbol": "INTC",
@@ -30,24 +31,25 @@ class TestSymbolRouting(unittest.TestCase):
             "eligible": True,
             "reasons": [],
             "risk_flags": [],
-            "metrics": {},
+            "metrics": {"market_type": "stocks"},
             "regime": {}
         })
-        
+
         # Call _scan_symbol with stock ticker
         result = _scan_symbol("INTC", "short", {})
-        
-        # Verify Alpaca was called (4 timeframes)
-        self.assertEqual(mock_alpaca_paper.get_ohlcv.call_count, 4, 
-                        "Should fetch OHLCV for 4 timeframes")
-        mock_alpaca_paper.get_latest_quote.assert_called_with("INTC")
-        
+
+        # Verify fetch_recent_candles was called (4 timeframes: 1h, 4h, 1d, 1w)
+        self.assertGreaterEqual(mock_fetch.call_count, 4,
+                        "Should fetch candles for 4 timeframes")
+        mock_alpaca_paper.get_ticker.assert_called_with("INTC")
+
         # Verify Kraken methods were NOT called
         mock_kraken.fetch_ohlcv.assert_not_called()
-        mock_kraken.fetch_ticker_last.assert_not_called()
-        
+        if hasattr(mock_kraken, 'fetch_ticker_last'):
+            mock_kraken.fetch_ticker_last.assert_not_called()
+
         # Verify market_type is set
-        self.assertEqual(result.get("metrics", {}).get("market_type"), "stock")
+        self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"))
     
     @patch('worker_api.intelligence_layer')  
     @patch('worker_api.alpaca_paper', None)
@@ -116,16 +118,20 @@ class TestSymbolRouting(unittest.TestCase):
     def test_api_market_ticker_routes_stock_to_alpaca(self, mock_alpaca):
         """API endpoint should route stock ticker requests to Alpaca"""
         from worker_api import api_market_ticker
-        
-        mock_alpaca.get_latest_quote = Mock(return_value={"price": 155.0, "bid": 154.9, "ask": 155.1})
-        
+
+        # api_market_ticker uses client.get_ticker(symbol), not get_latest_quote
+        mock_alpaca.get_ticker = Mock(return_value={"last": 155.0, "bid": 154.9, "ask": 155.1})
+
         response = api_market_ticker("AAPL")
-        
-        # Should call Alpaca
-        mock_alpaca.get_latest_quote.assert_called_with("AAPL")
-        
-        # Should return success
-        self.assertTrue(response.body.get("ok") if hasattr(response, 'body') else True)
+
+        # Should call Alpaca get_ticker
+        mock_alpaca.get_ticker.assert_called_with("AAPL")
+
+        # Should return success (FastAPI returns Response, body is JSON)
+        if hasattr(response, 'body'):
+            import json
+            body = json.loads(response.body) if isinstance(response.body, bytes) else response.body
+            self.assertTrue(body.get("ok", False), f"Response: {body}")
     
     @patch('worker_api._kraken_ready', return_value=True)
     @patch('worker_api._resolve_symbol', side_effect=lambda x: x)
@@ -170,42 +176,43 @@ class TestSymbolRouting(unittest.TestCase):
 
 class TestMultipleStockSymbols(unittest.TestCase):
     """Test that multiple different stock symbols are handled correctly"""
-    
+
     @patch('worker_api.intelligence_layer')
+    @patch('phase2_data_fetcher.fetch_recent_candles')
     @patch('worker_api.alpaca_paper')
     @patch('worker_api.alpaca_live', None)
-    def test_various_stock_symbols(self, mock_alpaca, mock_intelligence):
+    def test_various_stock_symbols(self, mock_alpaca, mock_fetch, mock_intelligence):
         """Test a variety of stock tickers"""
         from worker_api import _scan_symbol
-        
+
         stock_symbols = ["INTC", "AAPL", "MSFT", "TSLA", "AMD", "NVDA", "META"]
-        
-        mock_alpaca.get_ohlcv = Mock(return_value=[])
-        mock_alpaca.get_latest_quote = Mock(return_value={"price": 100.0})
+
+        # Stock path uses fetch_recent_candles and client.get_ticker
+        mock_fetch.return_value = [[1000000, 95, 96, 94, 95.5, 1e6]] * 100
+        mock_alpaca.get_ticker = Mock(return_value={"last": 100.0, "bid": 99.9, "ask": 100.1})
         mock_intelligence.generate_recommendation = Mock(return_value={
             "symbol": "TEST",
             "score": 0.5,
             "eligible": True,
-            "metrics": {},
+            "metrics": {"market_type": "stocks"},
             "regime": {}
         })
-        
+
         for symbol in stock_symbols:
             with self.subTest(symbol=symbol):
-                # Reset mock call counts
-                mock_alpaca.get_ohlcv.reset_mock()
-                mock_alpaca.get_latest_quote.reset_mock()
-                
+                mock_fetch.reset_mock()
+                mock_alpaca.get_ticker.reset_mock()
+
                 result = _scan_symbol(symbol, "short", {})
-                
-                # Verify Alpaca was called for this symbol
-                self.assertGreater(mock_alpaca.get_ohlcv.call_count, 0,
-                                  f"{symbol} should use Alpaca for OHLCV")
-                mock_alpaca.get_latest_quote.assert_called_with(symbol)
-                
+
+                # Verify fetch_recent_candles was called (stock data path)
+                self.assertGreater(mock_fetch.call_count, 0,
+                                  f"{symbol} should use Alpaca/fetcher for OHLCV")
+                mock_alpaca.get_ticker.assert_called_with(symbol)
+
                 # Verify market type
-                self.assertEqual(result.get("metrics", {}).get("market_type"), "stock",
-                               f"{symbol} should be classified as stock")
+                self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"),
+                             f"{symbol} should be classified as stock")
 
 
 if __name__ == "__main__":

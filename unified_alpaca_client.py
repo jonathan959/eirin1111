@@ -507,11 +507,18 @@ class UnifiedAlpacaClient:
             "status": str(getattr(o, "status", "")),
         }
     
-    def place_market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day") -> Dict[str, Any]:
+    def place_market_order(self, symbol: str, qty: float, side: str, time_in_force: str = "day", client_order_id: Optional[str] = None) -> Dict[str, Any]:
         if not self.rate_limiter.acquire("submit_order", priority=10):
             raise Exception("Rate limit: cannot place order")
         try:
-            req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC)
+            kwargs: Dict[str, Any] = dict(
+                symbol=symbol, qty=qty,
+                side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC,
+            )
+            if client_order_id:
+                kwargs["client_order_id"] = client_order_id
+            req = MarketOrderRequest(**kwargs)
             order = self.trading_client.submit_order(order_data=req)
             self.cache.invalidate_pattern("orders_")
             return self._order_to_dict(order)
@@ -519,12 +526,19 @@ class UnifiedAlpacaClient:
             if "429" in str(e):
                 self.rate_limiter.enter_backoff(429)
             raise
-    
-    def place_limit_order(self, symbol: str, qty: float, limit_price: float, side: str, time_in_force: str = "day") -> Dict[str, Any]:
+
+    def place_limit_order(self, symbol: str, qty: float, limit_price: float, side: str, time_in_force: str = "day", client_order_id: Optional[str] = None) -> Dict[str, Any]:
         if not self.rate_limiter.acquire("submit_order", priority=10):
             raise Exception("Rate limit: cannot place order")
         try:
-            req = LimitOrderRequest(symbol=symbol, qty=qty, limit_price=limit_price, side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL, time_in_force=TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC)
+            kwargs: Dict[str, Any] = dict(
+                symbol=symbol, qty=qty, limit_price=limit_price,
+                side=OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY if time_in_force.lower() == "day" else TimeInForce.GTC,
+            )
+            if client_order_id:
+                kwargs["client_order_id"] = client_order_id
+            req = LimitOrderRequest(**kwargs)
             order = self.trading_client.submit_order(order_data=req)
             self.cache.invalidate_pattern("orders_")
             return self._order_to_dict(order)

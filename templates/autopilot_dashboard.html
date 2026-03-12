@@ -91,7 +91,7 @@
   <div id="recosSection" class="section" style="display: none; min-height: 280px;">
   <div class="card section">
     <div class="card-head" style="flex-wrap: wrap; gap: 12px;">
-      <div class="h2">Top Recommendations (Score ≥ 75)</div>
+      <div class="h2">Top Recommendations (BUY signals)</div>
       <button type="button" class="btn btn-ghost" id="scanRecosBtn" onclick="scanRecommendations()">Scan recommendations</button>
     </div>
     <div id="topRecos" class="reco-list"></div>
@@ -100,11 +100,20 @@
 
   <div class="card section">
     <div class="card-head">
-      <div class="h2">Watchlist (Score 65–74)</div>
-      <div class="muted">Monitor only; auto-promote when score ≥ 75</div>
+      <div class="h2">Watchlist (WATCH signals)</div>
+      <div class="muted">Monitor only; auto-promote when score rises above buy threshold</div>
     </div>
     <div id="watchlist" class="reco-list"></div>
     <div id="watchlistEmpty" class="muted" style="padding: 24px; text-align: center; display: none;">No watchlist items. Run a scan first.</div>
+  </div>
+
+  <div class="card section">
+    <div class="card-head">
+      <div class="h2">Scanner Watchlist (Awaiting Entry Trigger)</div>
+      <div class="muted">Good setups that aren't ready yet. Auto-promoted when trigger fires + execution gate passes.</div>
+    </div>
+    <div id="scannerWatchlist" class="reco-list"></div>
+    <div id="scannerWatchlistEmpty" class="muted" style="padding: 24px; text-align: center; display: none;">No scanner watchlist items.</div>
   </div>
   </div>
 
@@ -178,7 +187,7 @@
       var totalCap = totalCapEl ? Math.max(0, parseFloat(totalCapEl.value) || 0) : undefined;
       var maxPos = parseInt(_elVal('cfgMaxPositions', '6'), 10) || 6;
       var minScoreEl = document.getElementById('cfgMinScore');
-      var minScore = minScoreEl ? Math.max(50, Math.min(95, parseFloat(minScoreEl.value) || 75)) : 75;
+      var minScore = minScoreEl ? Math.max(40, Math.min(95, parseFloat(minScoreEl.value) || 65)) : 65;
       var assetTypes = _elVal('cfgAssetTypes', 'both');
       var risk = _elVal('cfgRisk', 'moderate');
       var dryRun = parseInt(_elVal('cfgDryRun', '1'), 10) || 1;
@@ -196,7 +205,7 @@
       });
       var d = await res.json().catch(function() { return {}; });
       if (res.ok && d.ok) {
-        setStatus('Saved.', false);
+        setStatus('Settings saved. Click "Run Cycle Now" to create bots from top recommendations.', false);
         if (window._autopilotCfg) {
           window._autopilotCfg.max_positions = maxPos;
           window._autopilotCfg.min_score = minScore;
@@ -272,16 +281,20 @@
     if (btnPos) btnPos.className = 'btn ' + (v === 'positions' ? 'btn-purple' : 'btn-ghost');
     if (btnRecos) btnRecos.className = 'btn ' + (v === 'recommendations' ? 'btn-purple' : 'btn-ghost');
     if (btnActivity) btnActivity.className = 'btn ' + (v === 'activity' ? 'btn-purple' : 'btn-ghost');
-    if (v === 'recommendations') { loadTopRecos(); loadWatchlist(); }
+    if (v === 'recommendations') { loadTopRecos(); loadWatchlist(); loadScannerWatchlist(); }
     if (v === 'activity') loadActivity();
   }
   function fetchWithTimeout(url, opts, timeoutMs) {
-    timeoutMs = timeoutMs || 15000;
+    timeoutMs = timeoutMs || 20000;
     var ctrl = new AbortController();
     var id = setTimeout(function() { ctrl.abort(); }, timeoutMs);
     return fetch(url, Object.assign({}, opts, { signal: ctrl.signal })).then(function(r) {
       clearTimeout(id);
       return r;
+    }).catch(function(err) {
+      clearTimeout(id);
+      if (err.name === 'AbortError') throw new Error('Request timed out (' + Math.round(timeoutMs/1000) + 's). Server may be starting up — try Refresh.');
+      throw err;
     });
   }
   function refreshAll() {
@@ -293,6 +306,7 @@
     loadPositions();
     loadTopRecos();
     loadWatchlist();
+    loadScannerWatchlist();
     loadPerformanceChart();
     refreshAddCapitalBots();
     if (currentView === 'activity') loadActivity();
@@ -317,13 +331,18 @@
           var pos = pnl >= 0;
           var tp = p.take_profit_price != null && p.take_profit_price > 0 ? '$' + formatNum(p.take_profit_price) : '—';
           var sl = p.stop_loss_price != null && p.stop_loss_price > 0 ? '$' + formatNum(p.stop_loss_price) : '—';
+          var hasEntry = p.avg_entry_price != null && p.avg_entry_price > 0;
+          var hasPosition = p.position_value != null && p.position_value > 0;
+          var entryStr = hasEntry ? '$' + formatNum(p.avg_entry_price) : '<span style="color:var(--text-secondary);font-style:italic;">Awaiting entry</span>';
+          var posStr = hasPosition ? '$' + formatNum(p.position_value) : '<span style="color:var(--text-secondary);font-style:italic;">—</span>';
+          var pnlStr = hasEntry ? '<div style="font-weight: 700; ' + (pos ? 'color: var(--success)' : 'color: var(--danger)') + ';">' + (pos ? '+' : '') + '$' + formatNum(pnl) + ' (' + (pos ? '+' : '') + pnlPct.toFixed(2) + '%)</div>' : '<div style="color:var(--text-secondary);font-size:0.9em;">Waiting for optimal entry</div>';
           return '<div class="position-row row gap-12" style="padding: 16px 0; border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap;">' +
             '<div style="min-width: 120px;"><span class="mono" style="font-weight: 700; font-size: 1.1rem;">' + (p.symbol || '—') + '</span><br><span class="muted" style="font-size: 0.8rem;">' + (p.strategy || 'classic') + '</span></div>' +
-            '<div><span class="muted">Entry:</span> $' + formatNum(p.avg_entry_price) + '</div>' +
+            '<div><span class="muted">Entry:</span> ' + entryStr + '</div>' +
             '<div><span class="muted">Current:</span> $' + formatNum(p.current_price) + '</div>' +
-            '<div><span class="muted">Position:</span> $' + formatNum(p.position_value) + '</div>' +
+            '<div><span class="muted">Position:</span> ' + posStr + '</div>' +
             '<div><span class="muted">TP:</span> ' + tp + ' <span class="muted">SL:</span> ' + sl + '</div>' +
-            '<div style="font-weight: 700; ' + (pos ? 'color: var(--success)' : 'color: var(--danger)') + ';">' + (pos ? '+' : '') + '$' + formatNum(pnl) + ' (' + (pos ? '+' : '') + pnlPct.toFixed(2) + '%)</div>' +
+            pnlStr +
             '<a href="/bots/' + p.id + '" class="btn btn-purple" style="padding: 6px 12px;">Edit bot</a>' +
             '<button type="button" class="btn btn-ghost" style="padding: 6px 12px; color: var(--danger);" onclick="disableBot(' + p.id + ', \'' + (p.symbol || '').replace(/'/g, "\\'") + '\')" title="Disable this bot (stops new orders, keeps position)">Disable</button>' +
             '</div>';
@@ -359,7 +378,7 @@
     var grid = document.getElementById('configGrid');
     if (!grid) return;
     var maxPos = cfg.max_positions ?? 6;
-    var minScore = cfg.min_score != null ? Math.max(50, Math.min(95, Number(cfg.min_score))) : 75;
+    var minScore = cfg.min_score != null ? Math.max(40, Math.min(95, Number(cfg.min_score))) : 65;
     var dryRun = (cfg.dry_run === 1 || cfg.dry_run === true);
     var scanHours = cfg.scan_interval_hours != null ? cfg.scan_interval_hours : 4;
     var totalCap = Number(cfg.total_capital || cfg.total_capital_allocated || 0);
@@ -376,7 +395,7 @@
         '<span style="margin-right:4px;">$</span><input type="number" id="cfgTotalCapital" min="0" step="1" value="' + (totalCap || 0) + '" style="width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);">' +
       '</div><div class="muted" style="font-size:0.8em;margin-top:4px;">Capital pool for autopilot bots.</div></div>' +
       '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Max positions</div><div class="card-value"><input type="number" id="cfgMaxPositions" min="1" max="20" value="' + maxPos + '" style="width:60px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"></div></div>' +
-      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Min score</div><div class="card-value"><input type="number" id="cfgMinScore" min="65" max="95" value="' + minScore + '" style="width:50px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"></div></div>' +
+      '<div class="card card-stat" style="min-width: 140px;"><div class="card-label">Min score</div><div class="card-value"><input type="number" id="cfgMinScore" min="40" max="95" value="' + minScore + '" style="width:50px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);"></div><div class="muted" style="font-size:0.75em;">65+ recommended</div></div>' +
       '<div class="card card-stat" style="min-width: 160px;"><div class="card-label">Budget per bot ($)</div><div class="card-value" style="font-size: 14px;">' +
         '<input type="number" id="cfgBudgetPerBot" min="0" step="0.5" value="' + budgetInputValue + '" placeholder="auto" style="width:80px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);" title="Per-bot budget. Empty or 0 = auto (Total capital ÷ Max positions).">' +
       '</div><div class="muted" style="font-size:0.75em;">Order size: <span id="cfgBaseOrder">' + baseOrderStr + '</span> (auto uses ~$' + (derivedPerBot ? derivedPerBot.toFixed(0) : '—') + '/bot)</div></div>' +
@@ -394,21 +413,20 @@
     var toggleBtn = document.getElementById('toggleBtn');
     var cfg = d.config || {};
     if (d.enabled) {
-      if (pill) { pill.textContent = 'Enabled'; pill.className = 'status-pill status-running'; }
+      if (pill) { pill.textContent = 'Active'; pill.className = 'badge badge-success badge-dot badge-pulse'; }
       var sec = d.next_scan_in_sec;
-      if (sub) sub.textContent = sec > 0 ? 'Next scan in ' + sec + 's' : 'Autopilot active. Run cycle to scan now.';
+      if (sub) sub.textContent = sec > 0 ? 'Next scan in ' + Math.round(sec / 60) + ' min' : 'Autopilot active. Run cycle to scan now.';
       if (toggleBtn) {
-        toggleBtn.textContent = 'Disable Autopilot';
+        toggleBtn.textContent = 'Disable';
         toggleBtn.classList.remove('btn-purple');
         toggleBtn.style.background = 'var(--danger-soft)';
         toggleBtn.style.color = 'var(--danger)';
       }
     } else {
-      if (pill) { pill.textContent = 'Disabled'; pill.className = 'status-pill status-paused'; }
-      var scanH = (cfg.scan_interval_hours) ? cfg.scan_interval_hours : 4;
-      if (sub) sub.textContent = 'Click Enable to start. Autopilot scans every ' + scanH + ' hour(s) and manages bots from top recommendations.';
+      if (pill) { pill.textContent = 'Paused'; pill.className = 'badge badge-neutral badge-dot'; }
+      if (sub) sub.textContent = 'Autopilot is paused. Click Start Autopilot to scan for opportunities and create bots automatically.';
       if (toggleBtn) {
-        toggleBtn.textContent = 'Enable Autopilot';
+        toggleBtn.textContent = 'Enable';
         toggleBtn.className = 'btn btn-purple';
         toggleBtn.style.background = '';
         toggleBtn.style.color = '';
@@ -426,13 +444,19 @@
         window._autopilotNextSec = 0;
       }
     }
-    if (heartEl && d.last_autopilot_heartbeat_ts) {
-      var ago = Math.floor((Date.now() / 1000) - d.last_autopilot_heartbeat_ts);
-      if (ago < 60) heartEl.textContent = 'Last cycle: just now';
-      else if (ago < 3600) heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 60) + ' min ago';
-      else heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 3600) + 'h ago';
-      if (ago > 900) heartEl.innerHTML = '<span style="color: var(--warning, #b45309);">Last cycle was ' + Math.floor(ago / 60) + ' min ago. Run a cycle below to scan now.</span>';
-    } else if (heartEl) heartEl.textContent = '';
+    if (heartEl) {
+      if (!d.enabled) {
+        heartEl.innerHTML = '<span style="color: var(--text-secondary);">Autopilot is paused. Click Start Autopilot to begin automatic trading.</span>';
+      } else if (d.last_autopilot_heartbeat_ts) {
+        var ago = Math.floor((Date.now() / 1000) - d.last_autopilot_heartbeat_ts);
+        if (ago < 60) heartEl.textContent = 'Last cycle: just now';
+        else if (ago < 3600) heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 60) + ' min ago';
+        else heartEl.textContent = 'Last cycle: ' + Math.floor(ago / 3600) + 'h ' + Math.floor((ago % 3600) / 60) + 'm ago';
+        if (d.enabled && ago > 900) heartEl.innerHTML = 'Last cycle: ' + Math.floor(ago / 60) + ' min ago — <a href="#" onclick="runCycleNow(); return false;" style="color:var(--accent);">Run now</a>';
+      } else {
+        heartEl.textContent = d.enabled ? 'No cycles run yet — click Run Cycle Now' : '';
+      }
+    }
     var pv = Number(d.portfolio_value) || 0;
     var ap = Number(d.active_positions) || 0;
     var mp = Number(cfg.max_positions || d.max_positions || 6) || 6;
@@ -498,12 +522,17 @@
         updateStatusOnly(d);
       }
     } catch (e) {
-      if (sub) sub.textContent = 'Error: ' + (e.message || e);
-      if (pill) { pill.textContent = 'Error'; pill.className = 'status-pill status-error'; }
+      var errMsg = (e.message || String(e));
+      if (sub) sub.textContent = errMsg;
+      if (pill) { pill.textContent = 'Connecting...'; pill.className = 'status-pill status-error'; }
       var m = document.getElementById('metricPortfolio');
       if (m) m.textContent = '—';
       m = document.getElementById('metricPortfolioSub');
-      if (m) m.textContent = 'Request failed. Click Refresh.';
+      if (m) m.textContent = 'Server starting up. Click Refresh.';
+      var m2 = document.getElementById('metricPositions');
+      if (m2) m2.textContent = '—';
+      var m3 = document.getElementById('metricPnl');
+      if (m3) m3.textContent = '—';
     }
   }
   async function toggleAutopilot() {
@@ -533,19 +562,70 @@
     const sub = document.getElementById('statusSub');
     if (!runBtn || !sub) return;
     runBtn.disabled = true;
-    sub.textContent = 'Running cycle...';
+    sub.textContent = 'Running autopilot cycle...';
+    removeBanner();
     try {
       const res = await fetch('/api/autopilot/run', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
       const d = await res.json();
-      sub.textContent = 'Cycle done. Created: ' + (d.created || 0) + ', Closed: ' + (d.closed || 0) + (d.errors?.length ? '. ' + d.errors.length + ' error(s)' : '');
+      var created = d.created || 0;
+      var closed = d.closed || 0;
+      var createdBots = d.created_bots || [];
+      var skipped = d.skipped || [];
+      var errors = d.errors || [];
+
+      if (d.ok === false || (created === 0 && closed === 0 && d.error)) {
+        var errMsg = d.error || 'No bots created and no reason given.';
+        if (d.bm_ready === false) errMsg = 'BotManager not ready: ' + (d.reason || errMsg);
+        else if (d.paused) errMsg = 'Trading is paused. Resume from Safety page.';
+        else if (d.kill_switch) errMsg = 'Kill switch is ON. Disable it first.';
+        showBanner(errMsg, 'error', skipped);
+        sub.textContent = 'Cycle finished — no bots created. See message above.';
+      } else if (created > 0) {
+        var symList = createdBots.map(function(b) { return b.symbol; }).join(', ');
+        showBanner('Created ' + created + ' bot(s): ' + symList + (closed ? '. Closed ' + closed + '.' : ''), 'success', []);
+        sub.textContent = 'Cycle done. Created: ' + created + ', Closed: ' + closed;
+        if (typeof showToast === 'function') showToast('Cycle Complete', 'Created ' + created + ' bot(s): ' + symList, 'success');
+        loadPositions();
+      } else {
+        sub.textContent = 'Cycle done. Created: 0, Closed: ' + closed + '.';
+        if (d.candidates_considered === 0) {
+          showBanner(d.error || 'No recommendation candidates found. Click "Scan recommendations" first, then retry.', 'warning', []);
+        } else if (skipped.length > 0) {
+          showBanner('All ' + d.candidates_considered + ' candidate(s) skipped. ' + (d.error || ''), 'warning', skipped);
+        }
+      }
+      if (errors.length > 0) {
+        console.warn('Autopilot cycle errors:', errors);
+      }
       await loadStatus();
+      loadPositions();
     } catch (e) {
       sub.textContent = 'Error: ' + e.message;
+      showBanner('Network error running cycle: ' + e.message, 'error', []);
       loadStatus();
     } finally {
       runBtn.disabled = false;
     }
   }
+  function showBanner(msg, type, skipped) {
+    removeBanner();
+    var colors = { error: 'var(--danger, #ef4444)', warning: 'var(--warning, #f59e0b)', success: 'var(--success, #22c55e)' };
+    var bgColors = { error: 'rgba(239,68,68,0.12)', warning: 'rgba(245,158,11,0.12)', success: 'rgba(34,197,94,0.12)' };
+    var banner = document.createElement('div');
+    banner.id = 'autopilotBanner';
+    banner.style.cssText = 'padding:14px 18px;border-radius:10px;margin-bottom:16px;border:1px solid ' + (colors[type] || colors.error) + ';background:' + (bgColors[type] || bgColors.error) + ';color:' + (colors[type] || colors.error) + ';font-weight:600;position:relative;';
+    var close = '<span onclick="removeBanner()" style="position:absolute;top:8px;right:12px;cursor:pointer;font-size:1.2em;opacity:0.7;">&times;</span>';
+    var html = close + '<div>' + msg + '</div>';
+    if (skipped && skipped.length > 0) {
+      html += '<details style="margin-top:8px;font-weight:400;font-size:0.9em;"><summary style="cursor:pointer;">Skipped ' + skipped.length + ' symbol(s)</summary><ul style="margin:6px 0 0 16px;padding:0;">';
+      skipped.forEach(function(s) { html += '<li>' + (s.symbol || '?') + ': ' + (s.reason || 'unknown') + '</li>'; });
+      html += '</ul></details>';
+    }
+    banner.innerHTML = html;
+    var page = document.querySelector('.page');
+    if (page && page.firstChild) page.insertBefore(banner, page.children[1] || page.firstChild);
+  }
+  function removeBanner() { var el = document.getElementById('autopilotBanner'); if (el) el.remove(); }
   async function loadTopRecos() {
     var listEl = document.getElementById('topRecos');
     var emptyEl = document.getElementById('topRecosEmpty');
@@ -573,6 +653,42 @@
     } catch (e) {
       if (listEl) listEl.innerHTML = '<div class="muted" style="padding: 16px 0;">Error loading</div>';
       if (emptyEl) emptyEl.style.display = 'none';
+    }
+  }
+  async function loadScannerWatchlist() {
+    var listEl = document.getElementById('scannerWatchlist');
+    var emptyEl = document.getElementById('scannerWatchlistEmpty');
+    try {
+      var res = await fetchWithTimeout('/api/scanner/watchlist');
+      if (!res.ok) throw new Error(res.statusText);
+      var d = await res.json();
+      var items = (d.items || []).slice(0, 20);
+      if (items.length) {
+        if (emptyEl) emptyEl.style.display = 'none';
+        if (listEl) listEl.innerHTML = items.map(function(r) {
+          var sym = r.symbol || '—';
+          var regime = r.regime || '';
+          var entryType = r.entry_type || '';
+          var conf = r.confidence != null ? (r.confidence * 100).toFixed(1) + '%' : '-';
+          var edge = r.edge_score != null ? (r.edge_score * 100).toFixed(1) + '%' : '-';
+          var trigger = r.trigger_conditions || '';
+          var evidence = (r.evidence || []).slice(0, 3);
+          return '<div style="padding: 10px 0; border-bottom: 1px solid var(--border);">' +
+            '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+            '<div><strong>' + sym + '</strong> <span class="muted" style="margin-left:8px;">' + regime + '</span></div>' +
+            '<div><span style="color:#eab308;font-weight:600;">WATCH</span> &nbsp; Edge: ' + edge + ' &nbsp; Conf: ' + conf + '</div>' +
+            '</div>' +
+            (entryType ? '<div class="muted" style="font-size:0.85rem; margin-top:4px;">Entry: ' + entryType + '</div>' : '') +
+            (evidence.length ? '<div style="font-size:0.82rem; margin-top:4px; color:var(--text-secondary);"><ul style="margin:2px 0 0 16px;padding:0;">' + evidence.map(function(e) { return '<li>' + e + '</li>'; }).join('') + '</ul></div>' : '') +
+            (trigger ? '<div class="muted" style="font-size:0.82rem; margin-top:4px; color:#eab308;">Trigger: ' + trigger + '</div>' : '') +
+            '</div>';
+        }).join('');
+      } else {
+        if (listEl) listEl.innerHTML = '';
+        if (emptyEl) emptyEl.style.display = '';
+      }
+    } catch (e) {
+      if (listEl) listEl.innerHTML = '<div class="muted" style="padding:12px;">Failed to load scanner watchlist</div>';
     }
   }
   async function loadWatchlist() {
@@ -614,6 +730,7 @@
       if (d.ok !== true && !res.ok) throw new Error(d.error || res.statusText);
       await loadTopRecos();
       await loadWatchlist();
+      await loadScannerWatchlist();
       if (btn) btn.disabled = false;
     } catch (e) {
       alert('Scan failed: ' + e.message);
@@ -744,6 +861,7 @@
     loadPositions();
     loadTopRecos();
     loadWatchlist();
+    loadScannerWatchlist();
     loadPerformanceChart();
     refreshAddCapitalBots();
     if (currentView === 'activity') loadActivity();

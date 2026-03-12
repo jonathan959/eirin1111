@@ -50,12 +50,13 @@
       html += '<th class="right">Total PnL</th><th class="right">Max DD</th><th class="right">Sharpe</th><th class="right">Score</th></tr></thead><tbody>';
       rows.forEach(r => {
         const pnlClass = (r.total_pnl || 0) > 0 ? 'pos' : (r.total_pnl || 0) < 0 ? 'neg' : 'muted';
+        const pnlSign = (r.total_pnl || 0) > 0 ? '+' : '';
         html += `<tr>
           <td><strong>${escapeHtml(r.strategy || 'unknown')}</strong></td>
           <td class="right">${r.trades || 0}</td>
           <td class="right">${(r.win_rate || 0).toFixed(1)}%</td>
           <td class="right">${(r.profit_factor || 0).toFixed(2)}</td>
-          <td class="right ${pnlClass}">${(r.total_pnl || 0).toFixed(2)}</td>
+          <td class="right ${pnlClass}">${pnlSign}${(r.total_pnl || 0).toFixed(2)}</td>
           <td class="right">${(r.max_drawdown || 0).toFixed(2)}</td>
           <td class="right">${(r.sharpe_approx || 0).toFixed(2)}</td>
           <td class="right"><span class="tag tag-pos">${(r.score || 0).toFixed(0)}</span></td>

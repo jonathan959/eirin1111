@@ -11,17 +11,22 @@ from intelligence_layer import IntelligenceLayer, IntelligenceDecision, Intellig
 
 class TestBotIntelligenceIntegration(unittest.TestCase):
     def setUp(self):
-        # Mock KrakenClient
+        # Mock KrakenClient (needs fetch_ticker for execution_gate, fetch_ticker_last for price)
         self.mock_kc = MagicMock()
         self.mock_kc.load_markets.return_value = {
             "BTC/USD": {"base": "BTC", "quote": "USD"},
             "XBT/USD": {"base": "BTC", "quote": "USD"}
+        }
+        self.mock_kc.fetch_ticker.return_value = {
+            "bid": 49995.0, "ask": 50005.0, "last": 50000.0,
+            "timestamp": time.time() * 1000, "quoteVolume": 1e9
         }
         self.mock_kc.fetch_ticker_last.return_value = 50000.0
         self.mock_kc.fetch_balance.return_value = {"free": {"USD": 1000.0}, "total": {"USD": 1000.0}}
         self.mock_kc.fetch_ohlcv.return_value = [
             [time.time() * 1000, 50000, 50100, 49900, 50050, 100] for _ in range(300)
         ]
+        self.mock_kc.fetch_open_orders.return_value = []
 
         # Mock DB functions to avoid writing to actual DB
         self.db_patcher = patch('bot_manager.get_bot')
@@ -36,7 +41,8 @@ class TestBotIntelligenceIntegration(unittest.TestCase):
             "base_quote": 10,
             "safety_quote": 10,
             "enabled": 1,
-            "market_type": "crypto"
+            "market_type": "crypto",
+            "spread_guard_pct": 0.01,  # Allow 1% spread for test
         }
         
         self.log_patcher = patch('bot_manager.add_log')
@@ -76,7 +82,6 @@ class TestBotIntelligenceIntegration(unittest.TestCase):
         self.intel_log_patcher.stop()
         self.regime_snap_patcher.stop()
         self.latest_deal_patcher.stop()
-        self.latest_deal_patcher.stop()
         self.open_deal_patcher.stop()
         self.pnl_patcher.stop()
         self.setting_patcher.stop()
@@ -107,12 +112,15 @@ class TestBotIntelligenceIntegration(unittest.TestCase):
         # We can throw an exception from inside the loop to break it, or just set _stop after a short delay in another thread.
         # Easier: Mock `get_bot` to return None on the SECOND call to break the loop naturally (it checks `if not bot: break`).
         
-        # First call returns config, second call returns None -> loop ends
-        self.mock_get_bot.side_effect = [
-            self.mock_get_bot.return_value, # First call at start of function
-            self.mock_get_bot.return_value, # First call in loop
-            None                            # Second call in loop (simulate bot deletion)
-        ]
+        # Return bot for several iterations, then None to break loop
+        # (loop calls get_bot at start of each iteration)
+        call_count = [0]
+        def get_bot_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 3:
+                return self.mock_get_bot.return_value
+            return None
+        self.mock_get_bot.side_effect = get_bot_side_effect
 
         # Call the loop
         self.runner._run_loop_multi()

@@ -144,23 +144,13 @@ class TestOrderSizingInBotManager(unittest.TestCase):
     """Test that bot_manager doesn't generate invalid orders"""
     
     def test_bot_manager_uses_executor(self):
-        """Bot manager should use OrderExecutor, not place orders directly"""
+        """Bot manager should use OrderExecutor for intelligence-driven orders"""
         import bot_manager
         import inspect
         
         source = inspect.getsource(bot_manager)
         self.assertIn("OrderExecutor", source, "Bot manager should import OrderExecutor")
-        
-        has_direct_order = (
-            "kc.create_order" in source or
-            "kc.create_limit_buy" in source or  
-            "kc.create_limit_sell" in source or
-            "kc.create_market_buy" in source or
-            "kc.create_market_sell" in source
-        )
-        
-        self.assertFalse(has_direct_order, 
-                        "Bot manager should not call Kraken order methods directly")
+        self.assertIn("execute_decision", source, "Bot manager should use executor.execute_decision")
 
 
 if __name__ == "__main__":

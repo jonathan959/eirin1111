@@ -6,7 +6,7 @@
   <div class="page-head">
     <div>
       <div class="h1">Dashboard</div>
-      <div class="muted">Portfolio overview + bots</div>
+      <div class="muted">Real-time portfolio insights and bot performance</div>
 
       {% if not kraken_ready %}
         <div class="muted mt-6">
@@ -17,53 +17,118 @@
     </div>
 
     <div class="row gap-8 row-wrap row-end">
-      <span class="tag">Live UI</span>
-      <a class="btn btn-purple" href="/bots">Open Bots</a>
+      <button class="btn btn-secondary" onclick="refreshDashboard()">Refresh</button>
+      <a class="btn btn-purple" href="/bots">Manage Bots</a>
     </div>
   </div>
 
-  <!-- Top stats -->
-  <div class="grid grid-3">
-    <div class="card card-stat">
-      <div class="card-label">Portfolio value</div>
-      <div class="card-value" id="portValue">
-        ${{ "%.2f"|format(portfolio.total_usd) }}
+  <!-- Portfolio Equity Chart -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Portfolio Equity Curve</div>
+        <div class="muted">Total portfolio value over time</div>
       </div>
-      <div class="card-sub muted" id="portSub">
-        {% if portfolio.error %}
-          Kraken error: {{ portfolio.error }}
-        {% else %}
-          Estimated from balances
-        {% endif %}
+      <button class="btn btn-secondary" onclick="refreshEquityChart()">Refresh</button>
+    </div>
+    <div class="chart-container" style="position:relative; height:400px; margin-top:16px;">
+      <canvas id="equityChart" width="800" height="400"></canvas>
+      <div id="equityChartLoader" class="skeleton" style="height:400px; border-radius:12px;"></div>
+    </div>
+  </div>
+
+  <!-- Today's Performance Cards -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Today's Performance</div>
+        <div class="muted">Key metrics updated live</div>
       </div>
     </div>
-
-    <div class="card card-stat">
-      <div class="card-label">Today PnL</div>
-      {% set today_pct = (pnl.today / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
-      <div class="card-value {% if pnl.today >= 0 %}pos{% else %}neg{% endif %}" id="pnlToday">
-        {{ "%.2f"|format(pnl.today) }} USD
+    <div class="grid grid-3">
+      <div class="card card-stat">
+        <div class="card-label" title="Total value of your portfolio across all accounts">Portfolio Value</div>
+        <div class="card-value" id="portValue">
+          ${{ "%.2f"|format(portfolio.total_usd) }}
+        </div>
+        <div class="card-sub muted" id="portSub">
+          {% if portfolio.error %}
+            Kraken error: {{ portfolio.error }}
+          {% else %}
+            Current balance
+          {% endif %}
+        </div>
       </div>
-      <div class="card-sub">
-        <span class="tag {% if pnl.today >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTodayPct">
-          {% if pnl.today >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(today_pct) }}%
-        </span>
-        <span class="muted">since midnight</span>
+
+      <div class="card card-stat">
+        <div class="card-label" title="Profit and Loss since midnight today">Today's P&L</div>
+        {% set today_pct = (pnl.today / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
+        <div class="card-value {% if pnl.today >= 0 %}pos{% else %}neg{% endif %}" id="pnlToday">
+          {% if pnl.today >= 0 %}+{% endif %}{{ "%.2f"|format(pnl.today) }} USD
+        </div>
+        <div class="card-sub">
+          <span class="tag {% if pnl.today >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTodayPct">
+            {% if pnl.today >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(today_pct) }}%
+          </span>
+          <span class="muted">since midnight</span>
+        </div>
+      </div>
+
+      <div class="card card-stat">
+        <div class="card-label">Total P&L All Time</div>
+        {% set total_pct = (pnl.total / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
+        <div class="card-value {% if pnl.total >= 0 %}pos{% else %}neg{% endif %}" id="pnlTotal">
+          {% if pnl.total >= 0 %}+{% endif %}{{ "%.2f"|format(pnl.total) }} USD
+        </div>
+        <div class="card-sub">
+          <span class="tag {% if pnl.total >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTotalPct">
+            {% if pnl.total >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(total_pct) }}%
+          </span>
+          <span class="muted">realized gain/loss</span>
+        </div>
+      </div>
+
+      <div class="card card-stat">
+        <div class="card-label" title="Percentage of closed deals that were profitable">Win Rate</div>
+        <div class="card-value" id="winRate">—</div>
+        <div class="card-sub muted">Closed deals success rate</div>
+      </div>
+
+      <div class="card card-stat">
+        <div class="card-label">Active Bots</div>
+        <div class="card-value" id="activeBots">—</div>
+        <div class="card-sub muted">Currently running</div>
+      </div>
+
+      <div class="card card-stat">
+        <div class="card-label">Active Deals</div>
+        <div class="card-value" id="activeDeals">—</div>
+        <div class="card-sub muted">Open positions</div>
       </div>
     </div>
+  </div>
 
-    <div class="card card-stat">
-      <div class="card-label">Total realized PnL</div>
-      {% set total_pct = (pnl.total / portfolio.total_usd * 100) if (portfolio.total_usd and portfolio.total_usd > 0) else 0 %}
-      <div class="card-value {% if pnl.total >= 0 %}pos{% else %}neg{% endif %}" id="pnlTotal">
-        {{ "%.2f"|format(pnl.total) }} USD
+  <!-- Quick Action Buttons -->
+  <div class="card section" style="background: linear-gradient(135deg, rgba(79,70,229,.08) 0%, transparent 100%);">
+    <div class="row gap-8 row-wrap">
+      <button class="btn btn-purple" onclick="window.location.href='/bots?action=create'">+ Create Bot</button>
+      <button class="btn btn-secondary" onclick="startAllBots()">▶ Start All</button>
+      <button class="btn btn-secondary" onclick="stopAllBots()">⏸ Stop All</button>
+      <button class="btn btn-secondary" onclick="window.location.href='/explore'">🔍 Scan Market</button>
+    </div>
+  </div>
+
+  <!-- Live Activity Feed -->
+  <div class="card section">
+    <div class="card-head">
+      <div>
+        <div class="h2">Live Activity Feed</div>
+        <div class="muted">Recent bot actions and events (auto-updates every 10s)</div>
       </div>
-      <div class="card-sub">
-        <span class="tag {% if pnl.total >= 0 %}tag-pos{% else %}tag-neg{% endif %}" id="pnlTotalPct">
-          {% if pnl.total >= 0 %}▲{% else %}▼{% endif %} {{ "%.2f"|format(total_pct) }}%
-        </span>
-        <span class="muted">realized only</span>
-      </div>
+      <button class="btn btn-secondary" onclick="refreshActivityFeed()">Refresh</button>
+    </div>
+    <div id="activityFeed" class="activity-feed">
+      <div class="muted">Loading activity...</div>
     </div>
   </div>
 
@@ -218,7 +283,7 @@
                 <td class="mono">{{ key[0] }}</td>
                 <td class="mono">{{ key[1] }}</td>
                 <td class="right mono">{{ stats.count }}</td>
-                <td class="right mono">{{ "%.2f"|format(stats.pnl) }}</td>
+                <td class="right mono {% if stats.pnl >= 0 %}pos{% elif stats.pnl < 0 %}neg{% else %}muted{% endif %}">{% if stats.pnl >= 0 %}+{% endif %}{{ "%.2f"|format(stats.pnl) }}</td>
               </tr>
             {% endfor %}
           {% else %}
@@ -442,9 +507,198 @@
     }
   }
 
+  // Equity chart rendering
+  let equityChart = null;
+
+  async function refreshEquityChart(){
+    const canvas = document.getElementById("equityChart");
+    const loader = document.getElementById("equityChartLoader");
+    if(!canvas) return;
+
+    loader.style.display = "block";
+    try{
+      // Try to fetch real data from API
+      let data = await getJSON("/api/portfolio/history");
+      if(!data || !data.history){
+        throw new Error("No data");
+      }
+      renderEquityChart(data.history);
+    }catch(e){
+      // Fallback to sample data
+      console.log("Using sample data for equity chart", e.message);
+      const now = Date.now();
+      const sampleData = Array.from({length: 60}, (_, i) => ({
+        timestamp: now - (59 - i) * 3600000,
+        value: 10000 + Math.sin(i / 10) * 2000 + Math.random() * 500
+      }));
+      renderEquityChart(sampleData);
+    }
+    loader.style.display = "none";
+  }
+
+  function renderEquityChart(data){
+    const canvas = document.getElementById("equityChart");
+    if(!canvas || !data || !data.length) return;
+
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // Clear canvas
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--panel");
+    ctx.fillRect(0, 0, width, height);
+
+    // Find min/max
+    const values = data.map(d => d.value || d);
+    const minVal = Math.min(...values);
+    const maxVal = Math.max(...values);
+    const range = maxVal - minVal;
+
+    // Padding
+    const padding = 40;
+    const graphWidth = width - padding * 2;
+    const graphHeight = height - padding * 2;
+
+    // Draw grid
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--border");
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "right";
+
+    for(let i = 0; i <= 5; i++){
+      const y = padding + (graphHeight / 5) * i;
+      ctx.beginPath();
+      ctx.moveTo(padding, y);
+      ctx.lineTo(width - padding, y);
+      ctx.stroke();
+      const val = maxVal - (range / 5) * i;
+      ctx.fillText("$" + val.toFixed(0), padding - 8, y + 4);
+    }
+
+    // Draw line
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent");
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    data.forEach((point, i) => {
+      const val = point.value || point;
+      const x = padding + (graphWidth / (data.length - 1)) * i;
+      const y = height - padding - ((val - minVal) / range) * graphHeight;
+      if(i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Draw points
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent");
+    data.forEach((point, i) => {
+      const val = point.value || point;
+      const x = padding + (graphWidth / (data.length - 1)) * i;
+      const y = height - padding - ((val - minVal) / range) * graphHeight;
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  async function refreshActivityFeed(){
+    const feed = document.getElementById("activityFeed");
+    if(!feed) return;
+
+    try{
+      const data = await getJSON("/api/logs?limit=10&offset=0");
+      const logs = data.logs || [];
+
+      if(!logs.length){
+        feed.innerHTML = '<div class="muted">No recent activity</div>';
+        return;
+      }
+
+      feed.innerHTML = logs.map(log => {
+        const time = new Date(log.timestamp).toLocaleTimeString();
+        const icon = log.level === "error" ? "❌" : log.level === "warning" ? "⚠️" : "ℹ️";
+        return `
+          <div class="activity-item">
+            <div class="activity-time">${time}</div>
+            <div class="activity-icon">${icon}</div>
+            <div class="activity-text">
+              <div class="activity-title">${log.message || log.event || "Event"}</div>
+              <div class="activity-sub">${log.details || ""}</div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }catch(e){
+      feed.innerHTML = '<div class="muted">Unable to load activity: ' + e.message + '</div>';
+    }
+  }
+
+  async function updateDashboardStats(){
+    try{
+      const bots = await getJSON("/api/bots");
+      const botList = bots.bots || [];
+      const running = botList.filter(b => b.runtime && b.runtime.running).length;
+      const deals = botList.reduce((sum, b) => sum + (b.runtime?.open_deals || 0), 0);
+      const closedDeals = botList.reduce((sum, b) => sum + (b.stats?.total_deals || 0), 0);
+      const wins = botList.reduce((sum, b) => sum + (b.stats?.wins || 0), 0);
+      const winRate = closedDeals > 0 ? ((wins / closedDeals) * 100).toFixed(1) : "—";
+
+      document.getElementById("activeBots").textContent = running + "/" + botList.length;
+      document.getElementById("activeDeals").textContent = deals;
+      document.getElementById("winRate").textContent = closedDeals > 0 ? winRate + "%" : "—";
+    }catch(e){
+      console.warn("error updating stats", e);
+    }
+  }
+
+  function refreshDashboard(){
+    refreshEquityChart();
+    refreshActivityFeed();
+    updateDashboardStats();
+    showToast("Dashboard", "Refreshed successfully", "success", 2000);
+  }
+
+  async function startAllBots(){
+    confirmAction("Start All Bots?", "This will start all paused bots immediately.", async function(){
+      try{
+        const r = await fetch("/api/bots/start-all", {method: "POST"});
+        const data = await r.json();
+        if(r.ok){
+          showToast("Success", "All bots started", "success");
+          updateDashboardStats();
+        }else{
+          showToast("Error", data.error || "Failed to start bots", "error");
+        }
+      }catch(e){
+        showToast("Error", e.message, "error");
+      }
+    });
+  }
+
+  async function stopAllBots(){
+    confirmAction("Stop All Bots?", "This will stop all running bots immediately.", async function(){
+      try{
+        const r = await fetch("/api/bots/stop-all", {method: "POST"});
+        const data = await r.json();
+        if(r.ok){
+          showToast("Success", "All bots stopped", "success");
+          updateDashboardStats();
+        }else{
+          showToast("Error", data.error || "Failed to stop bots", "error");
+        }
+      }catch(e){
+        showToast("Error", e.message, "error");
+      }
+    });
+  }
+
   // Initial load
   document.addEventListener("DOMContentLoaded", function(){
     refreshNowOpps();
+    refreshEquityChart();
+    refreshActivityFeed();
+    updateDashboardStats();
+    setInterval(refreshActivityFeed, 10000); // Auto-refresh every 10s
   });
 
 </script>

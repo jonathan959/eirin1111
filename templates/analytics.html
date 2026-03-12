@@ -1,150 +1,644 @@
 {% extends "layout.html" %}
 {% block title %}Performance Analytics{% endblock %}
 {% block content %}
+<style>
+  .analytics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .chart-container {
+    position: relative;
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+  .stat-card {
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+  .stat-label {
+    font-size: 12px;
+    color: var(--muted, #64748b);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .stat-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text, #0f172a);
+  }
+  .stat-value.positive {
+    color: #10b981;
+  }
+  .stat-value.negative {
+    color: #ef4444;
+  }
+  .stat-subtext {
+    font-size: 12px;
+    color: var(--muted, #64748b);
+    margin-top: 6px;
+  }
+  .full-width {
+    grid-column: 1 / -1;
+  }
+  .two-col {
+    grid-column: span 2;
+  }
+  @media (max-width: 1200px) {
+    .two-col {
+      grid-column: span 1;
+    }
+  }
+  .table-wrap {
+    overflow-x: auto;
+  }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .table th {
+    background: var(--bg, #f5f7fb);
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text, #0f172a);
+    border-bottom: 1px solid var(--border, #e2e8f0);
+  }
+  .table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    color: var(--text, #0f172a);
+  }
+  .table tr:hover {
+    background: var(--bg, #f5f7fb);
+  }
+  .table th.right, .table td.right {
+    text-align: right;
+  }
+  .ratio-badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(79, 70, 229, 0.1);
+    color: #4f46e5;
+  }
+  .streaks-container {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .streak-card {
+    flex: 1;
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+  .streak-number {
+    font-size: 32px;
+    font-weight: 700;
+    margin: 8px 0;
+  }
+  .streak-win { color: #10b981; }
+  .streak-loss { color: #ef4444; }
+  .filter-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .filter-bar select {
+    padding: 8px 12px;
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 6px;
+    background: var(--panel, #ffffff);
+    color: var(--text, #0f172a);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .heatmap-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 4px;
+    margin-top: 12px;
+  }
+  .heatmap-cell {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: help;
+  }
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted, #64748b);
+  }
+  .spinner {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border: 3px solid var(--border, #e2e8f0);
+    border-top-color: #4f46e5;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>
+
 <div class="page">
   <div class="page-head">
     <div>
       <div class="h1">Performance Analytics</div>
-      <div class="muted">Sharpe, Sortino, win rate, drawdown, by strategy & symbol</div>
+      <div class="muted">Portfolio metrics, trade statistics, and performance insights</div>
     </div>
     <select id="daysFilter" class="input w-140">
       <option value="30">Last 30 days</option>
       <option value="90" selected>Last 90 days</option>
       <option value="180">Last 180 days</option>
+      <option value="365">Last year</option>
     </select>
   </div>
 
-  <div class="grid grid-3">
-    <div class="card card-stat">
-      <div class="card-label">Total PnL</div>
-      <div class="card-value" id="totalPnl">—</div>
+  <!-- Key Metrics -->
+  <div class="analytics-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total PnL</div>
+      <div class="stat-value" id="totalPnl">—</div>
+      <div class="stat-subtext" id="totalPnlChange">—</div>
     </div>
-    <div class="card card-stat">
-      <div class="card-label">Win rate</div>
-      <div class="card-value" id="winRate">—</div>
+    <div class="stat-card">
+      <div class="stat-label">Win Rate</div>
+      <div class="stat-value" id="winRate">—</div>
+      <div class="stat-subtext" id="winStats">— wins / — total</div>
     </div>
-    <div class="card card-stat">
-      <div class="card-label">Trades</div>
-      <div class="card-value" id="trades">—</div>
+    <div class="stat-card">
+      <div class="stat-label">Trade Count</div>
+      <div class="stat-value" id="trades">—</div>
+      <div class="stat-subtext" id="tradeAvg">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sharpe Ratio</div>
+      <div class="stat-value" id="sharpe">—</div>
+      <div class="stat-subtext">Risk-adjusted return</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sortino Ratio</div>
+      <div class="stat-value" id="sortino">—</div>
+      <div class="stat-subtext">Downside risk</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Max Drawdown</div>
+      <div class="stat-value negative" id="maxDd">—</div>
+      <div class="stat-subtext">Largest decline</div>
     </div>
   </div>
 
-  <div class="grid grid-3 section">
-    <div class="card card-stat">
-      <div class="card-label">Sharpe ratio</div>
-      <div class="card-value" id="sharpe">—</div>
+  <!-- Streak Tracker -->
+  <div class="streaks-container">
+    <div class="streak-card">
+      <div class="stat-label">Current Win Streak</div>
+      <div class="streak-number streak-win" id="winStreak">—</div>
+      <div style="font-size: 12px; color: var(--muted, #64748b);">consecutive wins</div>
     </div>
-    <div class="card card-stat">
-      <div class="card-label">Sortino ratio</div>
-      <div class="card-value" id="sortino">—</div>
+    <div class="streak-card">
+      <div class="stat-label">Current Loss Streak</div>
+      <div class="streak-number streak-loss" id="lossStreak">—</div>
+      <div style="font-size: 12px; color: var(--muted, #64748b);">consecutive losses</div>
     </div>
-    <div class="card card-stat">
-      <div class="card-label">Max drawdown</div>
-      <div class="card-value neg" id="maxDd">—</div>
+    <div class="streak-card">
+      <div class="stat-label">Best Trade</div>
+      <div class="streak-number" id="bestTrade" style="color: #10b981;">—</div>
+      <div style="font-size: 12px; color: var(--muted, #64748b);">maximum win</div>
+    </div>
+    <div class="streak-card">
+      <div class="stat-label">Worst Trade</div>
+      <div class="streak-number" id="worstTrade" style="color: #ef4444;">—</div>
+      <div style="font-size: 12px; color: var(--muted, #64748b);">maximum loss</div>
     </div>
   </div>
 
-  <div class="card section">
-    <div class="card-head">
-      <div class="h2">PnL heatmap (calendar)</div>
-      <div class="muted">Daily realized PnL</div>
+  <!-- Charts Grid -->
+  <div class="analytics-grid">
+    <!-- Equity Curve (full width) -->
+    <div class="chart-container full-width" style="min-height: 350px;">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Equity Curve</h3>
+      <canvas id="equityChart"></canvas>
+      <div id="equityLoading" class="loading"><div class="spinner"></div> Loading...</div>
     </div>
-    <div id="pnlHeatmap" class="pnl-heatmap" style="display:flex; flex-wrap:wrap; gap:4px; min-height:80px;"></div>
-  </div>
 
-  <div class="grid grid-2 section">
-    <div class="card section">
-      <div class="card-head">
-        <div class="h2">By strategy</div>
-      </div>
+    <!-- Daily P&L Bar Chart -->
+    <div class="chart-container" style="min-height: 300px;">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Daily P&L</h3>
+      <canvas id="dailyPnlChart"></canvas>
+      <div id="dailyLoading" class="loading"><div class="spinner"></div> Loading...</div>
+    </div>
+
+    <!-- Win Rate Pie Chart -->
+    <div class="chart-container" style="min-height: 300px;">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Win Rate</h3>
+      <canvas id="winRateChart"></canvas>
+      <div id="winLoading" class="loading"><div class="spinner"></div> Loading...</div>
+    </div>
+
+    <!-- Avg Win vs Loss -->
+    <div class="chart-container" style="min-height: 300px;">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Avg Win vs Loss</h3>
+      <canvas id="winLossChart"></canvas>
+      <div id="wlLoading" class="loading"><div class="spinner"></div> Loading...</div>
+    </div>
+
+    <!-- Monthly Returns Heatmap -->
+    <div class="chart-container full-width">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Monthly Returns Heatmap</h3>
+      <div id="monthlyHeatmap" class="heatmap-grid"></div>
+      <div id="heatmapLoading" class="loading"><div class="spinner"></div> Loading...</div>
+    </div>
+
+    <!-- Performance by Symbol -->
+    <div class="chart-container full-width">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Top Performers</h3>
       <div class="table-wrap">
         <table class="table">
           <thead>
-            <tr><th>Strategy</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Win %</th><th class="right">PnL</th></tr>
-          </thead>
-          <tbody id="byStrategyBody">
-            <tr><td colspan="5" class="muted">Loading...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-    <div class="card section">
-      <div class="card-head">
-        <div class="h2">By symbol</div>
-      </div>
-      <div class="table-wrap">
-        <table class="table">
-          <thead>
-            <tr><th>Symbol</th><th class="right">Trades</th><th class="right">Wins</th><th class="right">Win %</th><th class="right">PnL</th></tr>
+            <tr>
+              <th>Symbol</th>
+              <th class="right">Trades</th>
+              <th class="right">Wins</th>
+              <th class="right">Win %</th>
+              <th class="right">Total PnL</th>
+              <th class="right">Avg Win</th>
+              <th class="right">Avg Loss</th>
+            </tr>
           </thead>
           <tbody id="bySymbolBody">
-            <tr><td colspan="5" class="muted">Loading...</td></tr>
+            <tr><td colspan="7" class="muted">Loading...</td></tr>
           </tbody>
         </table>
       </div>
     </div>
-  </div>
 
-  <div class="card section">
-    <div class="card-head">
-      <div class="h2">Share performance</div>
-      <div class="muted">Copy to share (no $ amounts)</div>
+    <!-- Best & Worst Trades -->
+    <div class="chart-container full-width">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Best & Worst Trades</h3>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div>
+          <h4 style="color: #10b981; margin: 0 0 12px 0;">Top 5 Wins</h4>
+          <div class="table-wrap">
+            <table class="table" style="font-size: 12px;">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th class="right">Profit</th>
+                  <th class="right">%</th>
+                </tr>
+              </thead>
+              <tbody id="bestTradesBody">
+                <tr><td colspan="3" class="muted">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h4 style="color: #ef4444; margin: 0 0 12px 0;">Top 5 Losses</h4>
+          <div class="table-wrap">
+            <table class="table" style="font-size: 12px;">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th class="right">Loss</th>
+                  <th class="right">%</th>
+                </tr>
+              </thead>
+              <tbody id="worstTradesBody">
+                <tr><td colspan="3" class="muted">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="row gap-8">
-      <input type="text" id="shareText" class="input" style="flex:1" readonly />
-      <button id="copyShare" class="btn btn-purple">Copy</button>
+
+    <!-- Trade Journal -->
+    <div class="chart-container full-width">
+      <h3 style="margin-top: 0; color: var(--text, #0f172a);">Trade Journal</h3>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Symbol</th>
+              <th class="right">Entry</th>
+              <th class="right">Exit</th>
+              <th class="right">Quantity</th>
+              <th class="right">PnL</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody id="journalBody">
+            <tr><td colspan="7" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
 <script>
+  let charts = {};
+
   async function loadAnalytics() {
     const days = document.getElementById('daysFilter').value;
-    const r = await fetch('/api/analytics/performance?days=' + days, _authHeaders());
-    const data = await r.json();
-    if (!data.ok) throw new Error(data.error || 'Failed');
 
+    try {
+      // Show loading states
+      document.querySelectorAll('[id$="Loading"]').forEach(el => el.style.display = 'flex');
+
+      const res = await fetch(`/api/analytics/performance?days=${days}`, _authHeaders());
+      if (!res.ok) throw new Error('Failed to load analytics');
+
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Analytics error');
+
+      // Hide loading states
+      document.querySelectorAll('[id$="Loading"]').forEach(el => el.style.display = 'none');
+
+      updateKeyMetrics(data);
+      updateStreaks(data);
+      updateCharts(data);
+      updateTables(data);
+    } catch (e) {
+      console.error('Analytics load error:', e);
+      document.getElementById('totalPnl').textContent = 'Error loading data';
+    }
+  }
+
+  function updateKeyMetrics(data) {
     const pnl = data.total_pnl ?? 0;
+    const winRate = ((data.win_rate ?? 0) * 100);
+    const trades = data.trades ?? 0;
+
     document.getElementById('totalPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
-    document.getElementById('totalPnl').className = 'card-value ' + (pnl >= 0 ? 'pos' : 'neg');
-    document.getElementById('winRate').textContent = ((data.win_rate ?? 0) * 100).toFixed(1) + '%';
-    document.getElementById('trades').textContent = data.trades ?? 0;
-    document.getElementById('sharpe').textContent = data.sharpe_ratio ?? '—';
-    document.getElementById('sortino').textContent = data.sortino_ratio ?? '—';
-    document.getElementById('maxDd').textContent = (data.max_drawdown ?? 0) >= 0 ? data.max_drawdown.toFixed(2) : '—';
+    document.getElementById('totalPnl').className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
+    document.getElementById('totalPnlChange').textContent = `${pnl > 0 ? 'Profitable' : 'Loss'} · ${data.days} days`;
 
-    const byStrat = data.by_strategy || {};
-    document.getElementById('byStrategyBody').innerHTML = Object.entries(byStrat).map(([s, v]) =>
-      '<tr><td class="mono">' + s + '</td><td class="right">' + v.count + '</td><td class="right">' + v.wins + '</td><td class="right">' + (v.count ? (v.wins/v.count*100).toFixed(0) : 0) + '%</td><td class="right ' + (v.pnl >= 0 ? 'pos' : 'neg') + '">' + (v.pnl >= 0 ? '+' : '') + v.pnl.toFixed(2) + '</td></tr>'
-    ).join('') || '<tr><td colspan="5" class="muted">No data</td></tr>';
+    document.getElementById('winRate').textContent = winRate.toFixed(1) + '%';
+    document.getElementById('winStats').textContent = `${data.wins ?? 0} wins / ${trades} total`;
 
+    document.getElementById('trades').textContent = trades;
+    document.getElementById('tradeAvg').textContent = trades > 0 ? `Avg: ${(pnl / trades).toFixed(2)}` : 'No trades';
+
+    document.getElementById('sharpe').textContent = (data.sharpe_ratio ?? 0).toFixed(2);
+    document.getElementById('sortino').textContent = (data.sortino_ratio ?? 0).toFixed(2);
+    document.getElementById('maxDd').textContent = (data.max_drawdown ?? 0).toFixed(2);
+  }
+
+  function updateStreaks(data) {
+    // Calculate streaks from trade history
+    const pnls = (data.pnl_history || []);
+    let winStreak = 0, maxWinStreak = 0, lossStreak = 0, maxLossStreak = 0;
+    let bestTrade = -Infinity, worstTrade = Infinity;
+
+    pnls.forEach(p => {
+      if (p > 0) {
+        winStreak++;
+        lossStreak = 0;
+        bestTrade = Math.max(bestTrade, p);
+      } else if (p < 0) {
+        lossStreak++;
+        winStreak = 0;
+        worstTrade = Math.min(worstTrade, p);
+      }
+      maxWinStreak = Math.max(maxWinStreak, winStreak);
+      maxLossStreak = Math.max(maxLossStreak, lossStreak);
+    });
+
+    document.getElementById('winStreak').textContent = maxWinStreak || '0';
+    document.getElementById('lossStreak').textContent = maxLossStreak || '0';
+    document.getElementById('bestTrade').textContent = bestTrade !== -Infinity ? '+' + bestTrade.toFixed(2) : '—';
+    document.getElementById('worstTrade').textContent = worstTrade !== Infinity ? worstTrade.toFixed(2) : '—';
+  }
+
+  function updateCharts(data) {
+    // Equity curve
+    const eqData = data.equity_curve || [];
+    createEquityChart(eqData);
+
+    // Daily P&L
+    const dailyPnl = data.daily_pnl || {};
+    createDailyPnlChart(dailyPnl);
+
+    // Win rate pie
+    createWinRateChart(data.wins || 0, (data.trades || 0) - (data.wins || 0));
+
+    // Avg win vs loss
+    const avgWin = eqData.filter(d => d.pnl > 0).reduce((a, b) => a + b.pnl, 0) / Math.max(1, eqData.filter(d => d.pnl > 0).length);
+    const avgLoss = Math.abs(eqData.filter(d => d.pnl < 0).reduce((a, b) => a + b.pnl, 0) / Math.max(1, eqData.filter(d => d.pnl < 0).length));
+    createWinLossChart(avgWin, avgLoss);
+
+    // Monthly heatmap
+    createMonthlyHeatmap(data.daily_pnl || {});
+  }
+
+  function updateTables(data) {
+    // By symbol
     const bySym = data.by_symbol || {};
-    document.getElementById('bySymbolBody').innerHTML = Object.entries(bySym).map(([s, v]) =>
-      '<tr><td class="mono">' + s + '</td><td class="right">' + v.count + '</td><td class="right">' + v.wins + '</td><td class="right">' + (v.count ? (v.wins/v.count*100).toFixed(0) : 0) + '%</td><td class="right ' + (v.pnl >= 0 ? 'pos' : 'neg') + '">' + (v.pnl >= 0 ? '+' : '') + v.pnl.toFixed(2) + '</td></tr>'
-    ).join('') || '<tr><td colspan="5" class="muted">No data</td></tr>';
+    document.getElementById('bySymbolBody').innerHTML = Object.entries(bySym)
+      .sort((a, b) => (b[1].pnl || 0) - (a[1].pnl || 0))
+      .slice(0, 10)
+      .map(([sym, v]) => {
+        const pnl = v.pnl || 0;
+        const avgWin = v.wins > 0 ? (v.total_win || 0) / v.wins : 0;
+        const avgLoss = v.losses > 0 ? Math.abs((v.total_loss || 0) / v.losses) : 0;
+        return `
+          <tr>
+            <td style="font-weight: 600;">${sym}</td>
+            <td class="right">${v.count || 0}</td>
+            <td class="right">${v.wins || 0}</td>
+            <td class="right">${v.count ? ((v.wins / v.count) * 100).toFixed(0) : 0}%</td>
+            <td class="right" style="color: ${pnl >= 0 ? '#10b981' : '#ef4444'}; font-weight: 600;">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</td>
+            <td class="right">${avgWin.toFixed(2)}</td>
+            <td class="right">${avgLoss.toFixed(2)}</td>
+          </tr>
+        `;
+      }).join('') || '<tr><td colspan="7" class="muted">No trade data</td></tr>';
 
-    const wr = ((data.win_rate ?? 0) * 100).toFixed(0);
-    const beat = pnl > 0 ? 'beat' : 'vs';
-    document.getElementById('shareText').value = 'My trading bot: ' + wr + '% win rate over ' + data.days + ' days. ' + beat + ' market.';
+    // Best trades
+    const allTrades = data.trades || [];
+    const bestTrades = allTrades.sort((a, b) => (b.pnl || 0) - (a.pnl || 0)).slice(0, 5);
+    document.getElementById('bestTradesBody').innerHTML = bestTrades.map(t => `
+      <tr>
+        <td>${t.symbol || '—'}</td>
+        <td class="right" style="color: #10b981; font-weight: 600;">+${(t.pnl || 0).toFixed(2)}</td>
+        <td class="right">${((t.pnl_pct || 0) * 100).toFixed(1)}%</td>
+      </tr>
+    `).join('') || '<tr><td colspan="3" class="muted">No data</td></tr>';
 
-    const daily = data.daily_pnl || {};
-    const heatEl = document.getElementById('pnlHeatmap');
-    if (heatEl && Object.keys(daily).length) {
-      const maxAbs = Math.max(1, ...Object.values(daily).map(Math.abs));
-      heatEl.innerHTML = Object.entries(daily).slice(0, 60).map(([k, v]) => {
-        const pct = v >= 0 ? Math.min(100, (v / maxAbs) * 50 + 50) : Math.max(0, 50 + (v / maxAbs) * 50);
-        const bg = v >= 0 ? 'rgba(34,197,94,' + (0.2 + pct/100*0.6) + ')' : 'rgba(248,113,113,' + (0.2 + (100-pct)/100*0.6) + ')';
-        return '<span title="' + k + ': ' + (v >= 0 ? '+' : '') + v.toFixed(2) + '" style="width:28px;height:28px;border-radius:6px;background:' + bg + ';font-size:9px;display:flex;align-items:center;justify-content:center;color:inherit;">' + k.slice(-2) + '</span>';
-      }).join('');
-    } else if (heatEl) heatEl.innerHTML = '<span class="muted">No daily data</span>';
+    // Worst trades
+    const worstTrades = allTrades.sort((a, b) => (a.pnl || 0) - (b.pnl || 0)).slice(0, 5);
+    document.getElementById('worstTradesBody').innerHTML = worstTrades.map(t => `
+      <tr>
+        <td>${t.symbol || '—'}</td>
+        <td class="right" style="color: #ef4444; font-weight: 600;">${(t.pnl || 0).toFixed(2)}</td>
+        <td class="right">${((t.pnl_pct || 0) * 100).toFixed(1)}%</td>
+      </tr>
+    `).join('') || '<tr><td colspan="3" class="muted">No data</td></tr>';
+
+    // Trade journal
+    const journal = data.trade_journal || [];
+    document.getElementById('journalBody').innerHTML = journal.slice(0, 20).map(t => `
+      <tr>
+        <td>${new Date(t.closed_at * 1000).toLocaleDateString()}</td>
+        <td>${t.symbol || '—'}</td>
+        <td class="right">${(t.entry_price || 0).toFixed(4)}</td>
+        <td class="right">${(t.exit_price || 0).toFixed(4)}</td>
+        <td class="right">${(t.quantity || 0).toFixed(2)}</td>
+        <td class="right" style="color: ${(t.pnl || 0) >= 0 ? '#10b981' : '#ef4444'}; font-weight: 600;">${(t.pnl || 0) >= 0 ? '+' : ''}${(t.pnl || 0).toFixed(2)}</td>
+        <td>${t.notes || '—'}</td>
+      </tr>
+    `).join('') || '<tr><td colspan="7" class="muted">No trade journal data</td></tr>';
+  }
+
+  function createEquityChart(data) {
+    const labels = (data || []).map(d => new Date(d.timestamp * 1000).toLocaleDateString());
+    const values = (data || []).map(d => d.value || 0);
+
+    if (charts.equity) charts.equity.destroy();
+    charts.equity = new Chart(document.getElementById('equityChart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Portfolio Value',
+          data: values,
+          borderColor: '#4f46e5',
+          backgroundColor: 'rgba(79, 70, 229, 0.05)',
+          borderWidth: 2,
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: false, ticks: { color: 'rgba(0,0,0,0.5)' } },
+          x: { ticks: { color: 'rgba(0,0,0,0.5)' } }
+        }
+      }
+    });
+  }
+
+  function createDailyPnlChart(dailyPnl) {
+    const dates = Object.keys(dailyPnl).sort().slice(-30);
+    const values = dates.map(d => dailyPnl[d] || 0);
+    const colors = values.map(v => v >= 0 ? '#10b981' : '#ef4444');
+
+    if (charts.dailyPnl) charts.dailyPnl.destroy();
+    charts.dailyPnl = new Chart(document.getElementById('dailyPnlChart'), {
+      type: 'bar',
+      data: {
+        labels: dates,
+        datasets: [{
+          label: 'Daily P&L',
+          data: values,
+          backgroundColor: colors
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        indexAxis: 'x',
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: true, ticks: { color: 'rgba(0,0,0,0.5)' } },
+          x: { ticks: { color: 'rgba(0,0,0,0.5)' } }
+        }
+      }
+    });
+  }
+
+  function createWinRateChart(wins, losses) {
+    if (charts.winRate) charts.winRate.destroy();
+    charts.winRate = new Chart(document.getElementById('winRateChart'), {
+      type: 'doughnut',
+      data: {
+        labels: ['Wins', 'Losses'],
+        datasets: [{
+          data: [wins, losses],
+          backgroundColor: ['#10b981', '#ef4444'],
+          borderColor: 'white',
+          borderWidth: 2
+        }]
+      },
+      options: { responsive: true, maintainAspectRatio: true }
+    });
+  }
+
+  function createWinLossChart(avgWin, avgLoss) {
+    if (charts.winLoss) charts.winLoss.destroy();
+    charts.winLoss = new Chart(document.getElementById('winLossChart'), {
+      type: 'bar',
+      data: {
+        labels: ['Avg Win', 'Avg Loss'],
+        datasets: [{
+          data: [avgWin, avgLoss],
+          backgroundColor: ['#10b981', '#ef4444']
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        indexAxis: 'y',
+        plugins: { legend: { display: false } },
+        scales: { x: { beginAtZero: true, ticks: { color: 'rgba(0,0,0,0.5)' } } }
+      }
+    });
+  }
+
+  function createMonthlyHeatmap(dailyPnl) {
+    const heatmapEl = document.getElementById('monthlyHeatmap');
+    const monthlyData = {};
+
+    Object.entries(dailyPnl).forEach(([date, pnl]) => {
+      const d = new Date(date);
+      const month = d.toLocaleDateString('en', { month: 'short', year: '2-digit' });
+      monthlyData[month] = (monthlyData[month] || 0) + pnl;
+    });
+
+    heatmapEl.innerHTML = Object.entries(monthlyData).map(([month, pnl]) => {
+      const color = pnl >= 0
+        ? `rgba(16, 185, 129, ${Math.min(1, Math.abs(pnl) / 1000)})`
+        : `rgba(239, 68, 68, ${Math.min(1, Math.abs(pnl) / 1000)})`;
+      return `
+        <div class="heatmap-cell" style="background: ${color}; color: white;" title="${month}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}">
+          ${month}
+        </div>
+      `;
+    }).join('');
   }
 
   document.getElementById('daysFilter').addEventListener('change', loadAnalytics);
-  document.getElementById('copyShare').addEventListener('click', () => {
-    document.getElementById('shareText').select();
-    navigator.clipboard?.writeText(document.getElementById('shareText').value);
-  });
-
   loadAnalytics();
 </script>
 {% endblock %}

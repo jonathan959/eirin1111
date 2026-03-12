@@ -1,8 +1,9 @@
 """
-Autopilot: Set-and-forget automation.
-- Auto-scan recommendations, create bots for top picks
+Autopilot: Set-and-forget automation with purposed-entry filtering.
+- Auto-scan recommendations, create bots ONLY for READY candidates
+- WATCH candidates go to watchlist, not live bots
 - Close/demote when score drops
-- Watchlist for 65-74 scores
+- Enforces execution gate preflight before bot creation
 """
 import json
 import logging
@@ -14,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 AUTOPILOT_SCAN_INTERVAL_SEC = int(os.getenv("AUTOPILOT_SCAN_FREQUENCY", "14400"))  # 4 hours
-AUTOPILOT_MIN_SCORE = float(os.getenv("AUTOPILOT_MIN_SCORE", "75"))
+AUTOPILOT_MIN_SCORE = float(os.getenv("AUTOPILOT_MIN_SCORE", "80"))
 AUTOPILOT_DEMOTE_SCORE = float(os.getenv("AUTOPILOT_DEMOTE_SCORE", "60"))
 AUTOPILOT_WATCH_SCORE_LO = float(os.getenv("AUTOPILOT_WATCH_SCORE_LO", "65"))
 AUTOPILOT_WATCH_SCORE_HI = float(os.getenv("AUTOPILOT_WATCH_SCORE_HI", "74"))
@@ -32,6 +33,11 @@ AUTOPILOT_COOLDOWN_HOURS = float(os.getenv("AUTOPILOT_COOLDOWN_HOURS", "6"))
 
 # Max bots per sector (stocks); crypto treated as one "sector"
 AUTOPILOT_MAX_BOTS_PER_SECTOR = int(os.getenv("AUTOPILOT_MAX_BOTS_PER_SECTOR", "2"))
+
+# Purposed-entry mode: STRICT_READY | ALLOW_WATCH_DRYRUN
+AUTOPILOT_MODE = os.getenv("AUTOPILOT_MODE", "STRICT_READY").strip().upper()
+WATCHLIST_ENABLED = os.getenv("WATCHLIST_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+MIN_ENTRY_CONFIDENCE = float(os.getenv("MIN_ENTRY_CONFIDENCE", "0.65"))
 
 
 def _get_setting(key: str, default: str = "") -> str:
@@ -67,7 +73,7 @@ def _capital_for_score(score: float) -> float:
 
 def get_top_recommendations(
     horizon: str = "long",
-    min_score: float = 75,
+    min_score: float = 80,
     max_count: int = 10,
     asset_filter: Optional[str] = None,
     sectors_avoid: Optional[List[str]] = None,
@@ -196,6 +202,17 @@ def get_now_opportunities(
             if not market:
                 market = "stocks" if (len(sym) < 6 and "/" not in sym) else "crypto"
             reason = metrics.get("explanation") or metrics.get("reason") or metrics.get("recommended_strategy") or ""
+            # Skip stock opportunities when Alpaca is not connected
+            if market == "stocks":
+                try:
+                    from worker_api import _alpaca_any_ready
+                    if not _alpaca_any_ready():
+                        continue
+                except Exception:
+                    pass
+            # Skip if score is 100 with no reason - likely a data artifact
+            if score >= 99.5 and not reason:
+                continue
             strategy = metrics.get("recommended_strategy") or metrics.get("strategy") or "smart_dca"
             created_ts = r.get("created_ts") or r.get("ts") or None
 
@@ -244,11 +261,25 @@ def run_autopilot_cycle(
 
 
 def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_bot_fn, get_portfolio_total_fn, notify_fn, force_run):
-    # LIVE-HARDENED: heartbeat written at end of cycle for watchdog
     logger.info("Autopilot checking... [%s]", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
     cfg = get_autopilot_config()
-    total_capital = float(cfg.get("total_capital", 10000))
-    # Profile defaults when not in config: conservative 4/80, balanced 6/75, aggressive 8/70
+    # Use actual portfolio value if available, otherwise config (never phantom $10000)
+    _actual_capital = 0
+    if get_portfolio_total_fn:
+        try:
+            _actual_capital = float(get_portfolio_total_fn() or 0)
+        except Exception:
+            pass
+    config_capital = float(cfg.get("total_capital", 0))
+    # Use the smaller of configured capital and actual portfolio to prevent over-leveraging
+    if _actual_capital > 0 and config_capital > 0:
+        total_capital = min(_actual_capital, config_capital)
+    elif _actual_capital > 0:
+        total_capital = _actual_capital
+    elif config_capital > 0:
+        total_capital = config_capital
+    else:
+        total_capital = 50.0  # Safe minimum default
     _profile_defaults = {
         "conservative": (4, 80.0),
         "balanced": (6, 75.0),
@@ -257,7 +288,6 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
     _def_slots, _def_score = _profile_defaults.get(AUTOPILOT_PROFILE, (6, 75.0))
     max_positions = int(cfg.get("max_positions") or os.getenv("DEFAULT_MAX_POSITIONS", str(_def_slots)))
     max_positions = min(max_positions, AUTOPILOT_MAX_BOTS)
-    # Limit positions to what capital can support ($5 minimum per bot)
     min_capital_per = float(os.getenv("MIN_CAPITAL_PER_BOT", "5.0"))
     capital_affordable_slots = max(1, int(total_capital / min_capital_per))
     if max_positions > capital_affordable_slots:
@@ -268,7 +298,15 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
     if isinstance(sectors_avoid, str):
         sectors_avoid = [s.strip() for s in sectors_avoid.split(",") if s.strip()]
 
-    results = {"created": 0, "closed": 0, "errors": []}
+    results: Dict[str, Any] = {
+        "created": 0, "closed": 0, "errors": [],
+        "created_bots": [],
+        "skipped": [],
+        "candidates_considered": 0,
+        "slots_used": 0,
+        "max_positions": max_positions,
+        "no_candidates_reason": None,
+    }
     try:
         from db import list_bots, get_setting, set_setting, get_recommendation
         portfolio = get_portfolio_total_fn() if get_portfolio_total_fn else total_capital
@@ -277,6 +315,7 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
         active_bots = [b for b in list_bots() if int(b.get("enabled", 0)) == 1]
         symbols_with_bots = {str(b.get("symbol", "")).upper() for b in active_bots}
         slots_used = len(symbols_with_bots)
+        results["slots_used"] = slots_used
 
         # Min score: config override or profile default or env
         min_score = float(cfg.get("min_score") or cfg.get("min_score_threshold") or AUTOPILOT_MIN_SCORE)
@@ -301,8 +340,8 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                     pass
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
-        max_bots_per_sector = int(cfg.get("max_bots_per_sector") or os.getenv("AUTOPILOT_MAX_BOTS_PER_SECTOR", "2"))
-        max_bots_per_sector = max(1, min(10, max_bots_per_sector))
+        max_bots_per_sector = int(cfg.get("max_bots_per_sector") or os.getenv("AUTOPILOT_MAX_BOTS_PER_SECTOR", "5"))
+        max_bots_per_sector = max(1, min(20, max_bots_per_sector))
 
         # Cooldown: last add per symbol (JSON map symbol -> ts)
         cooldown_sec = int(AUTOPILOT_COOLDOWN_HOURS * 3600)
@@ -315,7 +354,6 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
             pass
         now_ts = int(time.time())
 
-        # 1. Get top recommendations
         top = get_top_recommendations(
             horizon="long",
             min_score=min_score,
@@ -323,16 +361,20 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
             asset_filter=asset_filter,
             sectors_avoid=sectors_avoid,
         )
+        results["candidates_considered"] = len(top)
         logger.info(
             "Autopilot: portfolio=%.2f max_positions=%d slots_used=%d recommendations_above_%.0f=%d",
             portfolio, max_positions, slots_used, min_score, len(top)
         )
         if not top:
-            logger.info("Autopilot: Signal HOLD — No recommendations with score >= %.0f (run /api/reco/scan to populate)", min_score)
+            results["no_candidates_reason"] = f"No recommendations with score >= {min_score:.0f}. Run a scan first (/api/recommendations/scan) or lower min_score."
+            logger.info("Autopilot: Signal HOLD — %s", results["no_candidates_reason"])
 
-        # 2. Create bots for new top picks (up to max_positions)
         slots_full_logged = False
         for rec in top:
+            sym = str(rec.get("symbol") or "")
+            if not sym:
+                continue
             if slots_used >= max_positions:
                 if not slots_full_logged:
                     try:
@@ -341,33 +383,71 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                         slots_full_logged = True
                     except Exception:
                         pass
-                break
-            sym = str(rec.get("symbol") or "")
-            if not sym or sym.upper() in symbols_with_bots:
-                if sym:
-                    try:
-                        from db import add_autopilot_audit_log
-                        add_autopilot_audit_log("skip_symbol_has_bot", symbol=sym, reason="already has active bot")
-                    except Exception:
-                        pass
+                results["skipped"].append({"symbol": sym, "reason": f"slots_full ({slots_used}/{max_positions})"})
                 continue
-            # Cooldown: skip if we added this symbol recently
+            if sym.upper() in symbols_with_bots:
+                try:
+                    from db import add_autopilot_audit_log
+                    add_autopilot_audit_log("skip_symbol_has_bot", symbol=sym, reason="already has active bot")
+                except Exception:
+                    pass
+                results["skipped"].append({"symbol": sym, "reason": "already_has_bot"})
+                continue
             if sym.upper() in last_add_by_symbol and (now_ts - last_add_by_symbol.get(sym.upper(), 0)) < cooldown_sec:
                 try:
                     from db import add_autopilot_audit_log
                     add_autopilot_audit_log("skip_cooldown", symbol=sym, reason=f"cooldown {AUTOPILOT_COOLDOWN_HOURS}h")
                 except Exception:
                     pass
+                results["skipped"].append({"symbol": sym, "reason": f"cooldown ({AUTOPILOT_COOLDOWN_HOURS}h)"})
                 continue
             metrics = rec.get("metrics") or {}
             sector = "crypto" if "/" in sym else (metrics.get("sector") or "unknown").strip()
-            if sector_counts.get(sector, 0) >= max_bots_per_sector:
+            # For unknown sectors, try to look up sector dynamically
+            if sector == "unknown" and "/" not in sym:
                 try:
-                    from db import add_autopilot_audit_log
-                    add_autopilot_audit_log("skip_sector_cap", symbol=sym, reason=f"sector {sector} at cap {max_bots_per_sector}")
+                    from stock_metadata import get_sector
+                    looked_up = get_sector(sym)
+                    if looked_up and looked_up != "unknown":
+                        sector = looked_up
                 except Exception:
                     pass
+            # Crypto and unknown sectors get generous caps
+            if sector == "crypto":
+                effective_cap = max(max_bots_per_sector * 3, 15)
+            elif sector == "unknown":
+                effective_cap = max(max_bots_per_sector, 8)
+            else:
+                effective_cap = max_bots_per_sector
+            if sector_counts.get(sector, 0) >= effective_cap:
+                try:
+                    from db import add_autopilot_audit_log
+                    add_autopilot_audit_log("skip_sector_cap", symbol=sym, reason=f"sector {sector} at cap {effective_cap}")
+                except Exception:
+                    pass
+                results["skipped"].append({"symbol": sym, "reason": f"sector_cap ({sector})"})
                 continue
+
+            # ── Purposed-entry: scanner readiness check ──────────────
+            scanner_setup = _evaluate_candidate_readiness(sym, metrics)
+            if scanner_setup and not scanner_setup.get("ready_now", False):
+                ready_reason = scanner_setup.get("ready_reason", "not_ready")
+                if WATCHLIST_ENABLED:
+                    _add_to_watchlist(sym, metrics, scanner_setup)
+                if AUTOPILOT_MODE == "ALLOW_WATCH_DRYRUN":
+                    logger.info("Autopilot: %s not READY (%s), creating dry-run bot", sym, ready_reason)
+                else:
+                    try:
+                        from db import add_autopilot_audit_log
+                        add_autopilot_audit_log("skip_not_ready", symbol=sym,
+                                                reason=f"scanner: {ready_reason}",
+                                                details={"edge_score": scanner_setup.get("edge_score", 0),
+                                                         "confidence": scanner_setup.get("confidence", 0)})
+                    except Exception:
+                        pass
+                    results["skipped"].append({"symbol": sym, "reason": f"not_ready: {ready_reason}"})
+                    continue
+
             score = float(rec.get("score") or 0)
             config_cap = float(cfg.get("capital_per_bot") or 0)
             per_slot_share = total_capital / max_positions if max_positions else total_capital
@@ -394,18 +474,22 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                 market = "stocks"
             try:
                 profile = str(cfg.get("risk_profile") or os.getenv("AUTOPILOT_PROFILE", "balanced")).lower()
+                # Default: 5% stop loss, 15% take profit; profile tweaks
                 _profile_params = {
-                    "conservative": {"tp": 0.02, "stop_loss_pct": 0.05, "trailing_activation_pct": 0.015, "trailing_distance_pct": 0.008, "max_safety": 2, "max_drawdown_pct": 0.10, "daily_loss_limit_pct": 0.03, "per_symbol_exposure_pct": 0.08},
-                    "balanced":     {"tp": 0.03, "stop_loss_pct": 0.08, "trailing_activation_pct": 0.020, "trailing_distance_pct": 0.010, "max_safety": 3, "max_drawdown_pct": 0.15, "daily_loss_limit_pct": 0.05, "per_symbol_exposure_pct": 0.10},
-                    "aggressive":   {"tp": 0.05, "stop_loss_pct": 0.12, "trailing_activation_pct": 0.030, "trailing_distance_pct": 0.015, "max_safety": 5, "max_drawdown_pct": 0.20, "daily_loss_limit_pct": 0.08, "per_symbol_exposure_pct": 0.15},
+                    "conservative": {"tp": 0.10, "stop_loss_pct": 0.05, "trailing_activation_pct": 0.015, "trailing_distance_pct": 0.008, "max_safety": 2, "max_drawdown_pct": 0.10, "daily_loss_limit_pct": 0.03, "per_symbol_exposure_pct": 0.08},
+                    "balanced":     {"tp": 0.15, "stop_loss_pct": 0.05, "trailing_activation_pct": 0.020, "trailing_distance_pct": 0.010, "max_safety": 3, "max_drawdown_pct": 0.15, "daily_loss_limit_pct": 0.05, "per_symbol_exposure_pct": 0.10},
+                    "aggressive":   {"tp": 0.20, "stop_loss_pct": 0.05, "trailing_activation_pct": 0.030, "trailing_distance_pct": 0.015, "max_safety": 5, "max_drawdown_pct": 0.15, "daily_loss_limit_pct": 0.08, "per_symbol_exposure_pct": 0.15},
                 }
                 pp = _profile_params.get(profile, _profile_params["balanced"])
+                _force_dry = (AUTOPILOT_MODE == "ALLOW_WATCH_DRYRUN"
+                              and scanner_setup and not scanner_setup.get("ready_now", True))
+                _dry_run_val = 1 if _force_dry else int(cfg.get("dry_run", 1))
                 bot_id = create_bot_fn({
                     "name": f"Autopilot {sym}",
                     "symbol": sym,
                     "bot_type": "autopilot",
                     "enabled": 1,
-                    "dry_run": int(cfg.get("dry_run", 1)),
+                    "dry_run": _dry_run_val,
                     "strategy_mode": strategy,
                     "forced_strategy": "",
                     "base_quote": base_order,
@@ -445,6 +529,7 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                 symbols_with_bots.add(sym.upper())
                 slots_used += 1
                 results["created"] += 1
+                results["created_bots"].append({"id": bot_id, "symbol": sym, "name": f"Autopilot {sym}", "score": score})
                 last_add_by_symbol[sym.upper()] = now_ts
                 try:
                     set_setting("autopilot_last_add_by_symbol", json.dumps(last_add_by_symbol))
@@ -458,7 +543,14 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                 except Exception:
                     pass
                 if notify_fn:
-                    notify_fn("autopilot_bot_created", {"symbol": sym, "score": score, "bot_id": bot_id})
+                    _notify_payload = {"symbol": sym, "score": score, "bot_id": bot_id}
+                    if scanner_setup:
+                        _notify_payload["entry_type"] = scanner_setup.get("entry_type", "")
+                        _notify_payload["confidence"] = scanner_setup.get("confidence", 0)
+                        _notify_payload["evidence"] = (scanner_setup.get("evidence") or [])[:3]
+                        _notify_payload["target_levels"] = scanner_setup.get("target_levels", {})
+                        _notify_payload["invalidation_level"] = scanner_setup.get("invalidation_level", 0)
+                    notify_fn("autopilot_bot_created", _notify_payload)
             except Exception as e:
                 results["errors"].append(f"Create {sym}: {e}")
                 logger.warning("Autopilot create bot failed %s: %s", sym, e)
@@ -468,6 +560,16 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
                     log_error("autopilot", "create_bot_failed", f"Create {sym}: {e}", details={"symbol": sym})
                 except Exception:
                     pass
+
+        # 2b. Recheck watchlist: promote WATCH symbols that are now READY
+        try:
+            recheck_watchlist(
+                create_bot_fn=create_bot_fn,
+                start_bot_fn=start_bot_fn,
+                notify_fn=notify_fn,
+            )
+        except Exception as wl_err:
+            logger.warning("Autopilot: recheck_watchlist failed: %s", wl_err)
 
         # 3. Check active bots: close if score dropped below threshold
         for bot in active_bots:
@@ -514,6 +616,158 @@ def _run_autopilot_cycle_impl(create_bot_fn, delete_bot_fn, start_bot_fn, stop_b
         pass
     logger.info("Autopilot cycle done: created=%d closed=%d errors=%d", results.get("created", 0), results.get("closed", 0), len(results.get("errors", [])))
     return results
+
+
+def _evaluate_candidate_readiness(symbol: str, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Run the market scanner on a candidate symbol and return the setup dict.
+    Returns None if scanner is not available or fails (graceful degradation).
+    """
+    try:
+        from market_scanner import analyze_symbol, MarketSetup
+        import pandas as pd
+    except ImportError:
+        logger.debug("market_scanner not available, skipping readiness check")
+        return None
+
+    try:
+        market_type = (metrics.get("market_type") or "crypto").strip().lower()
+        if market_type == "stock":
+            market_type = "stocks"
+
+        candles = _fetch_candles_for_scanner(symbol, market_type)
+        if candles is None or len(candles) < 50:
+            return {"ready_now": False, "ready_reason": "insufficient_candle_data",
+                    "confidence": 0, "edge_score": 0}
+
+        setup = analyze_symbol(
+            symbol=symbol,
+            candles_df=candles,
+            market_type=market_type,
+            run_preflight=True,
+            min_confidence=MIN_ENTRY_CONFIDENCE,
+        )
+        return setup.to_dict()
+    except Exception as e:
+        logger.debug("Scanner evaluation failed for %s: %s", symbol, e)
+        return None
+
+
+def _fetch_candles_for_scanner(symbol: str, market_type: str) -> Optional["pd.DataFrame"]:
+    """Fetch recent candles for scanner analysis using existing exchange adapters."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+
+    try:
+        if market_type == "crypto":
+            try:
+                from worker_api import _safe_kraken_client
+                kc = _safe_kraken_client()
+                if kc:
+                    ohlcv = kc.fetch_ohlcv(symbol, timeframe="1h", limit=200)
+                    if ohlcv and len(ohlcv) > 50:
+                        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                        return df
+            except Exception as e:
+                logger.debug("Kraken candle fetch for scanner failed %s: %s", symbol, e)
+        else:
+            try:
+                from worker_api import _safe_alpaca_data_client
+                ac = _safe_alpaca_data_client()
+                if ac:
+                    from datetime import datetime, timedelta
+                    end = datetime.utcnow()
+                    start = end - timedelta(days=30)
+                    bars = ac.get_stock_bars(symbol, timeframe="1Hour", start=start, end=end)
+                    if bars:
+                        df = pd.DataFrame([{
+                            "timestamp": b.timestamp, "open": b.open, "high": b.high,
+                            "low": b.low, "close": b.close, "volume": b.volume,
+                        } for b in bars])
+                        return df if len(df) > 50 else None
+            except Exception as e:
+                logger.debug("Alpaca candle fetch for scanner failed %s: %s", symbol, e)
+    except Exception as e:
+        logger.debug("Candle fetch for scanner failed %s: %s", symbol, e)
+
+    return None
+
+
+def _add_to_watchlist(symbol: str, metrics: Dict[str, Any], scanner_setup: Dict[str, Any]) -> None:
+    """Add a WATCH candidate to the scanner watchlist DB table."""
+    try:
+        from db import upsert_watchlist_entry
+        market_type = (metrics.get("market_type") or "crypto").strip().lower()
+        if market_type == "stock":
+            market_type = "stocks"
+        upsert_watchlist_entry(
+            symbol=symbol,
+            market_type=market_type,
+            setup_json=json.dumps(scanner_setup),
+            trigger_conditions=scanner_setup.get("trigger_conditions", ""),
+            regime=scanner_setup.get("regime", ""),
+            entry_type=scanner_setup.get("entry_type", ""),
+            confidence=float(scanner_setup.get("confidence", 0)),
+            edge_score=float(scanner_setup.get("edge_score", 0)),
+        )
+        logger.info("Autopilot: Added %s to watchlist (edge=%.3f, reason=%s)",
+                     symbol, scanner_setup.get("edge_score", 0),
+                     scanner_setup.get("ready_reason", ""))
+    except Exception as e:
+        logger.debug("Failed to add %s to watchlist: %s", symbol, e)
+
+
+def recheck_watchlist(
+    create_bot_fn=None,
+    start_bot_fn=None,
+    notify_fn=None,
+) -> Dict[str, Any]:
+    """
+    Re-evaluate watchlist entries: promote to bot if now READY, expire if stale.
+    Called during autopilot cycle.
+    """
+    result = {"promoted": 0, "expired": 0, "still_watching": 0}
+    if not WATCHLIST_ENABLED:
+        return result
+
+    try:
+        from db import list_watchlist, mark_watchlist_triggered, remove_watchlist_entry, cleanup_old_watchlist
+        cleanup_old_watchlist(max_age_hours=72)
+
+        entries = list_watchlist(status="watching", limit=50)
+        for entry in entries:
+            sym = str(entry.get("symbol", ""))
+            if not sym:
+                continue
+            market_type = str(entry.get("market_type", "crypto"))
+            setup = _evaluate_candidate_readiness(sym, {"market_type": market_type})
+            if setup and setup.get("ready_now", False):
+                logger.info("Autopilot watchlist: %s now READY, promoting", sym)
+                mark_watchlist_triggered(sym)
+                result["promoted"] += 1
+                if notify_fn:
+                    notify_fn("watchlist_triggered", {
+                        "symbol": sym,
+                        "confidence": setup.get("confidence", 0),
+                        "entry_type": setup.get("entry_type", ""),
+                    })
+            else:
+                result["still_watching"] += 1
+    except Exception as e:
+        logger.debug("Watchlist recheck failed: %s", e)
+
+    return result
+
+
+def get_scanner_watchlist(limit: int = 50) -> List[Dict[str, Any]]:
+    """Get the current scanner watchlist (symbols waiting for trigger)."""
+    try:
+        from db import list_watchlist
+        return list_watchlist(status="watching", limit=limit)
+    except Exception:
+        return []
 
 
 def get_watchlist(

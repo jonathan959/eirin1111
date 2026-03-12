@@ -38,7 +38,7 @@ $SshArgs = @(
 $Files = @(
   "one_server.py", "one_server_v2.py", "worker_api.py", "worker.py", "bot_manager.py", "executor.py",
   "strategies.py", "symbol_classifier.py", "alpaca_adapter.py", "alpaca_client.py",
-  "stock_metadata.py", "market_data.py", "risk_circuit_breaker.py",
+  "stock_metadata.py", "stock_universe.py", "market_data.py", "risk_circuit_breaker.py",
   "price_predictor.py", "strategy_optimizer.py", "portfolio_optimizer.py",
   "anomaly_detector.py", "db.py", "kraken_client.py", "intelligence_layer.py", "phase1_intelligence.py",
   "data_validator.py", "circuit_breaker.py", "health_monitor.py", "autopilot.py",
@@ -65,7 +65,7 @@ $Scripts = @(
   "validate_before_restart.sh", "fix_service.sh", "quick_fix_502.sh",
   "deploy_restart.sh", "health_watchdog.sh",
   "check_nginx.sh", "setup_nginx.sh", "fix_port80.sh",
-  "deploy_backup.sh", "deploy_restore.sh", "server_stability_diagnostic.sh",
+  "deploy_backup.sh", "deploy_restore.sh", "restore_db_from_backup.sh", "server_stability_diagnostic.sh",
   "disk_cleanup_cron.sh", "free_disk_space.sh", "smoke_test.sh", "phase0_discovery.sh", "install_ai_bot.sh"
 )
 
@@ -131,8 +131,10 @@ if (Test-Path $envPath) {
 } else {
   Write-Host "  WARNING: .env not found locally. Server may have stale/missing API keys." -ForegroundColor Yellow
 }
-# Ensure templates and static dirs are writable (fixes deploy permission denied)
-& ssh @SshArgs -i $KeyPath "$User@$HostName" "sudo chown -R ubuntu:ubuntu $RemoteDir/templates $RemoteDir/static 2>/dev/null; sudo chmod -R u+w $RemoteDir/templates $RemoteDir/static 2>/dev/null; mkdir -p $RemoteDir/templates $RemoteDir/static"
+# Ensure project dir and DB are writable (prevents "readonly database" after deploy)
+& ssh @SshArgs -i $KeyPath "$User@$HostName" "sudo chown -R ubuntu:ubuntu $RemoteDir 2>/dev/null; sudo chmod u+w $RemoteDir 2>/dev/null"
+# Ensure templates and static dirs exist and are writable
+& ssh @SshArgs -i $KeyPath "$User@$HostName" "sudo chmod -R u+w $RemoteDir/templates $RemoteDir/static 2>/dev/null; mkdir -p $RemoteDir/templates $RemoteDir/static"
 & scp @SshArgs -i $KeyPath -r (Join-Path $LocalRoot "templates") "$User@${HostName}:$RemoteDir/"
 & scp @SshArgs -i $KeyPath -r (Join-Path $LocalRoot "static") "$User@${HostName}:$RemoteDir/"
 if (Test-Path (Join-Path $LocalRoot "scripts")) {
@@ -156,9 +158,9 @@ if (Test-Path $journalConf) {
 Write-Host "Installing service + Nginx..." -ForegroundColor Cyan
 # Fix temp dirs (often broken/full after EC2 reboot) - run inline, no file copy needed
 Invoke-Ssh "sudo chmod 1777 /tmp 2>/dev/null; mkdir -p $RemoteDir/tmp; chmod 700 $RemoteDir/tmp"
-# Use ai-bot.service (one_server_v2) as primary; stop tradingserver to avoid port conflict
-Invoke-Ssh "sudo systemctl stop tradingserver 2>/dev/null; sudo systemctl disable tradingserver 2>/dev/null; sudo fuser -k 8000/tcp 2>/dev/null; sleep 2"
-Invoke-Ssh "sudo cp $RemoteDir/ai-bot.service /etc/systemd/system/ai-bot.service; sudo systemctl daemon-reload; sudo systemctl enable --now ai-bot"
+# Use tradingserver (one_server) for full UI including Explore; stop ai-bot to avoid port conflict
+Invoke-Ssh "sudo systemctl stop ai-bot 2>/dev/null; sudo systemctl disable ai-bot 2>/dev/null; sudo fuser -k 8000/tcp 2>/dev/null; sleep 2"
+Invoke-Ssh "sudo cp $RemoteDir/tradingserver.service /etc/systemd/system/tradingserver.service; sudo systemctl daemon-reload; sudo systemctl enable --now tradingserver"
 Invoke-Ssh "sudo mkdir -p /etc/systemd/journald.conf.d; sudo cp $RemoteDir/journald_size_limit.conf /etc/systemd/journald.conf.d/ 2>/dev/null; sudo systemctl restart systemd-journald 2>/dev/null || true"
 Invoke-Ssh "sed -i 's/\r$//' $RemoteDir/check_nginx.sh $RemoteDir/setup_nginx.sh $RemoteDir/install_ai_bot.sh $RemoteDir/scripts/*.sh 2>/dev/null; chmod +x $RemoteDir/scripts/*.sh $RemoteDir/install_ai_bot.sh 2>/dev/null; chmod +x $RemoteDir/check_nginx.sh $RemoteDir/setup_nginx.sh; bash $RemoteDir/setup_nginx.sh"
 # Install daily disk cleanup cron (4am UTC) - prevents disk fill from logs

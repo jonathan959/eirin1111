@@ -356,6 +356,55 @@
   </div>
 </div>
 
+<!-- Global Exposure Summary -->
+<div class="card section" style="margin: 0 20px; background: linear-gradient(135deg, rgba(59,130,246,.08) 0%, transparent 100%);">
+  <div class="row gap-20 row-wrap">
+    <div>
+      <div class="card-label">Total Portfolio Value</div>
+      <div class="card-value" id="globalPortfolioValue">—</div>
+    </div>
+    <div>
+      <div class="card-label">Total Exposure</div>
+      <div class="card-value" id="globalExposure">—</div>
+      <div class="sub-text" id="globalExposurePercent">0% of portfolio</div>
+    </div>
+    <div>
+      <div class="card-label">Largest Position</div>
+      <div class="card-value" id="largestPosition">—</div>
+      <div class="sub-text" id="largestPositionPercent">0% of portfolio</div>
+    </div>
+  </div>
+</div>
+
+<!-- Correlation Risk Warning -->
+<div id="correlationWarning" style="margin: 20px; display: none;">
+  <div class="card" style="background: rgba(255, 165, 0, 0.1); border: 1px solid rgba(255, 165, 0, 0.5);">
+    <div style="display: flex; align-items: start; gap: 12px;">
+      <span style="font-size: 20px;">⚠️</span>
+      <div>
+        <div class="card-title">Correlation Risk Detected</div>
+        <div id="correlationMessage" style="font-size: 14px; color: var(--text-primary);">Multiple bots trading correlated assets</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Circuit Breaker Status -->
+<div id="circuitBreakerStatus" style="margin: 20px; display: none;">
+  <div class="card" style="background: rgba(242, 54, 69, 0.1); border: 1px solid rgba(242, 54, 69, 0.5);">
+    <div style="display: flex; align-items: start; gap: 12px; justify-content: space-between;">
+      <div style="display: flex; align-items: start; gap: 12px;">
+        <span style="font-size: 20px;">🛑</span>
+        <div>
+          <div class="card-title">Daily Circuit Breaker Active</div>
+          <div id="circuitBreakerMessage" style="font-size: 14px; color: var(--text-primary);"></div>
+        </div>
+      </div>
+      <button class="btn btn-sm" onclick="acknowledgeCircuitBreaker()" style="margin-top: 0;">Acknowledge</button>
+    </div>
+  </div>
+</div>
+
 <div class="dashboard-grid">
   <!-- Portfolio Overview -->
   <div class="card">

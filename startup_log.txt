@@ -1,0 +1,23 @@
+﻿py : scikit-learn not available - ML predictions disabled
+At C:\Users\jonat\AppData\Local\Temp\ps-script-69f62ac0-db2d-447a-8466-1cfb84ecd36b.ps1:73 char:61
++ ... omas_clone_v2"; py -m uvicorn one_server:app --port 8000 2>&1 | Out-F ...
++                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (scikit-learn no...ctions disabled:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+xgboost not available - XGBoost predictions disabled
+tensorflow not available - LSTM predictions disabled
+scikit-learn not available
+xgboost not available
+tensorflow not available - LSTM disabled
+UI_SESSION_SECRET not set; generated ephemeral secret. Sessions will not persist across restarts. Set 
+UI_SESSION_SECRET for production.
+INFO:     Started server process [16436]
+INFO:     Waiting for application startup.
+WORKER_API_TOKEN not set. API auth disabled; fine for localhost only.
+Health check FAILED: ['Autopilot is disabled']
+INFO:     Application startup complete.
+ERROR:    [Errno 10048] error while attempting to bind on address ('127.0.0.1', 8000): [winerror 10048] only one usage 
+of each socket address (protocol/network address/port) is normally permitted
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.

@@ -1,8 +1,11 @@
 # db.py  (REPLACE ENTIRE FILE)
+import logging
 import os
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Allow override via env; default keeps compatibility with your existing file
 DB_NAME = os.getenv("BOT_DB_PATH", "botdb.sqlite3")
@@ -18,6 +21,8 @@ _ALLOWED_TABLES = frozenset({
     "insider_transactions", "ml_predictions", "ml_model_versions", "execution_quality",
     "data_quality_log", "error_log", "trade_journal", "portfolio_snapshots",
     "autopilot_audit_log",  # LIVE-HARDENED: autopilot decision traceability
+    "scanner_watchlist",  # Purposed-entry watchlist: symbols awaiting trigger
+    "notifications",  # User-facing notifications: trades, alerts, summaries
 })
 _ALLOWED_COLUMNS = frozenset({"bot_id", "id"})
 
@@ -500,6 +505,7 @@ def init_db() -> None:
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts ON portfolio_snapshots(timestamp)"
     )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_latest_horizon ON recommendations_latest(horizon)")
 
     # --- market_events (earnings, Fed, etc. - avoid entries day before)
     cur.execute(
@@ -654,6 +660,48 @@ def init_db() -> None:
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_journal_deal ON trade_journal(deal_id);")
 
+    # --- scanner_watchlist: symbols identified by market_scanner but not yet ready
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scanner_watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            market_type TEXT NOT NULL DEFAULT 'crypto',
+            setup_json TEXT NOT NULL DEFAULT '{}',
+            trigger_conditions TEXT NOT NULL DEFAULT '',
+            regime TEXT NOT NULL DEFAULT '',
+            entry_type TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            edge_score REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'watching',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            triggered_at INTEGER,
+            bot_id INTEGER
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_symbol ON scanner_watchlist(symbol, status);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON scanner_watchlist(status);")
+
+    # --- notifications: in-app alerts for trades, profits, losses, errors
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            bot_id INTEGER,
+            read INTEGER DEFAULT 0
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_ts ON notifications(timestamp);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);")
+
     # Helpful indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_ts ON bot_logs(bot_id, ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bots_symbol ON bots(symbol);")
@@ -713,7 +761,7 @@ def init_db() -> None:
         _ensure_column(con, "bots", "trailing_distance_pct", "REAL NOT NULL DEFAULT 0.01")
         
         # Phase 1: Cooldown After Stop Loss
-        _ensure_column(con, "bots", "stop_loss_cooldown_sec", "INTEGER NOT NULL DEFAULT 3600")
+        _ensure_column(con, "bots", "stop_loss_cooldown_sec", "INTEGER NOT NULL DEFAULT 172800")  # 48h after SL
         _ensure_column(con, "bots", "last_stop_loss_at", "INTEGER")
         
         # Phase 1: Volatility-Based TP Scaling
@@ -781,6 +829,7 @@ def init_db() -> None:
         _ensure_column(con, "strategy_perf_trades", "regime", "TEXT")
         _ensure_column(con, "strategy_perf_trades", "pnl_pct", "REAL")
         _ensure_column(con, "recommendations_snapshots", "scoring_version", "TEXT NOT NULL DEFAULT 'v1'")
+        _ensure_column(con, "recommendations_snapshots", "score_breakdown_json", "TEXT")
         # Indexes that depend on migrated columns
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_perf_bot_ts ON strategy_perf_trades(bot_id, ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_perf_sym ON strategy_perf_trades(symbol, ts);")
@@ -1623,6 +1672,78 @@ def bot_performance_stats(bot_id: int) -> Dict[str, Any]:
     }
 
 
+def get_global_consecutive_losses(n: int = 10) -> int:
+    """
+    Last N closed deals across ALL bots. Returns negative streak: -3 means 3 consecutive losses.
+    Used for 3-loss circuit breaker (pause autopilot 24h).
+    """
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT realized_pnl_quote
+        FROM deals
+        WHERE state='CLOSED' AND closed_at IS NOT NULL
+        ORDER BY closed_at DESC
+        LIMIT ?
+        """,
+        (int(n),),
+    ).fetchall()
+    con.close()
+    streak = 0
+    for r in rows:
+        pnl = float(r["realized_pnl_quote"] or 0)
+        o = 1 if pnl > 0 else -1
+        if streak == 0:
+            streak = o
+        elif (streak > 0 and o > 0) or (streak < 0 and o < 0):
+            streak += o
+        else:
+            break
+    return streak
+
+
+def get_rolling_trade_stats_last_n(n: int = 30) -> Dict[str, Any]:
+    """
+    Rolling stats from last N closed deals (all bots). For Kelly position sizing.
+    Returns: total_trades, winning_trades, avg_profit_pct, avg_loss_pct, win_rate
+    """
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT realized_pnl_quote, entry_avg, base_amount
+        FROM deals
+        WHERE state='CLOSED' AND closed_at IS NOT NULL
+        ORDER BY closed_at DESC
+        LIMIT ?
+        """,
+        (int(n),),
+    ).fetchall()
+    con.close()
+    pnls: List[float] = []
+    pnl_pcts: List[float] = []
+    for r in rows:
+        try:
+            pnl = float(r["realized_pnl_quote"] or 0)
+            entry = float(r["entry_avg"] or 0)
+            base = float(r["base_amount"] or 0)
+            pnls.append(pnl)
+            cost = entry * base if entry > 0 and base > 0 else 0
+            if cost > 0:
+                pnl_pcts.append(pnl / cost)
+        except Exception:
+            continue
+    wins = sum(1 for x in pnls if x > 0)
+    win_pcts = [p for p in pnl_pcts if p > 0]
+    loss_pcts = [abs(p) for p in pnl_pcts if p < 0]
+    return {
+        "total_trades": len(pnls),
+        "winning_trades": wins,
+        "win_rate": wins / len(pnls) if pnls else 0.5,
+        "avg_profit_pct": sum(win_pcts) / len(win_pcts) if win_pcts else 0.05,
+        "avg_loss_pct": sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.03,
+    }
+
+
 def get_bot_recent_streak(bot_id: int, n: int = 5) -> int:
     """
     Last N deal outcomes: positive = wins, negative = losses.
@@ -2000,15 +2121,25 @@ def get_expected_edge(
     }
 
 
-def count_orders_today(bot_id: int) -> int:
-    """Count order events for bot in last 24h. Used by risk engine."""
+def count_orders_today(bot_id: int, live_only: bool = True) -> int:
+    """Count order events for bot in last 24h. Used by risk engine.
+    
+    live_only=True (default): only count real orders (is_live=1),
+    so dry-run simulations don't inflate the counter and block trading.
+    """
     try:
         start = int(time.time()) - (24 * 3600)
         con = _conn()
-        row = con.execute(
-            "SELECT COUNT(*) as n FROM order_events WHERE bot_id=? AND ts>=?",
-            (int(bot_id), start),
-        ).fetchone()
+        if live_only:
+            row = con.execute(
+                "SELECT COUNT(*) as n FROM order_events WHERE bot_id=? AND ts>=? AND is_live=1",
+                (int(bot_id), start),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT COUNT(*) as n FROM order_events WHERE bot_id=? AND ts>=?",
+                (int(bot_id), start),
+            ).fetchone()
         con.close()
         return int(row["n"]) if row else 0
     except Exception:
@@ -2125,14 +2256,15 @@ def save_recommendation_snapshot(
     metrics_json: str,
     reasons_json: str,
     risk_flags_json: str,
+    score_breakdown_json: str = "",
 ) -> int:
     con = _conn()
     cur = con.cursor()
     cur.execute(
         """
         INSERT INTO recommendations_snapshots(
-            symbol, horizon, score, regime_json, metrics_json, reasons_json, risk_flags_json, created_ts
-        ) VALUES (?,?,?,?,?,?,?,?)
+            symbol, horizon, score, regime_json, metrics_json, reasons_json, risk_flags_json, created_ts, score_breakdown_json
+        ) VALUES (?,?,?,?,?,?,?,?,?)
         """,
         (
             str(symbol),
@@ -2143,6 +2275,7 @@ def save_recommendation_snapshot(
             str(reasons_json or ""),
             str(risk_flags_json or ""),
             now_ts(),
+            str(score_breakdown_json or ""),
         ),
     )
     snapshot_id = int(cur.lastrowid)
@@ -2157,6 +2290,23 @@ def save_recommendation_snapshot(
     con.commit()
     con.close()
     return snapshot_id
+
+
+def count_recommendations_by_horizon() -> Dict[str, int]:
+    """Return {horizon: count} for short, medium, long. Used for API logging and UI."""
+    out: Dict[str, int] = {"short": 0, "medium": 0, "long": 0}
+    try:
+        con = _conn()
+        for h in ("short", "medium", "long"):
+            n = con.execute(
+                "SELECT COUNT(*) FROM recommendations_latest WHERE horizon=?",
+                (str(h),),
+            ).fetchone()[0]
+            out[h] = int(n) if n is not None else 0
+        con.close()
+    except Exception as e:
+        logger.error("count_recommendations_by_horizon error: %s", e)
+    return out
 
 
 def list_recommendations(
@@ -2227,6 +2377,32 @@ def delete_recommendations_for_blocklist(bases: List[str]) -> int:
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning("delete_recommendations_for_blocklist: %s", e)
+        return 0
+
+
+def cleanup_invalid_scores() -> int:
+    """Remove recommendations with score >= 98 and empty/null reasons (data artifacts).
+    Also remove stock recommendations older than 24h with no valid metrics."""
+    try:
+        con = _conn()
+        cur = con.cursor()
+        # Remove perfect scores with no reasons (artifacts)
+        cur.execute(
+            "DELETE FROM recommendations_latest WHERE score >= 98 AND (reasons_json IS NULL OR reasons_json = '[]' OR reasons_json = '')"
+        )
+        deleted = cur.rowcount
+        # Remove very old recommendations (>48h) to prevent stale data
+        cur.execute(
+            "DELETE FROM recommendations_latest WHERE created_ts < ? AND created_ts > 0",
+            (int(time.time()) - 48 * 3600,),
+        )
+        deleted += cur.rowcount
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("cleanup_invalid_scores: %s", e)
         return 0
 
 
@@ -2846,3 +3022,134 @@ def backup_db(dest_path: Optional[str] = None) -> str:
     dest = dest_path or f"{DB_NAME}.backup_{now_ts()}"
     shutil.copy2(DB_NAME, dest)
     return dest
+
+
+# =========================================================
+# Scanner Watchlist
+# =========================================================
+
+def upsert_watchlist_entry(
+    symbol: str,
+    market_type: str,
+    setup_json: str,
+    trigger_conditions: str,
+    regime: str = "",
+    entry_type: str = "",
+    confidence: float = 0.0,
+    edge_score: float = 0.0,
+) -> int:
+    """Insert or update a watchlist entry for a symbol. Returns row id."""
+    con = _conn()
+    ts = now_ts()
+    existing = con.execute(
+        "SELECT id FROM scanner_watchlist WHERE symbol=? AND status='watching' LIMIT 1",
+        (str(symbol),),
+    ).fetchone()
+    if existing:
+        con.execute(
+            """UPDATE scanner_watchlist
+               SET setup_json=?, trigger_conditions=?, regime=?, entry_type=?,
+                   confidence=?, edge_score=?, updated_at=?, market_type=?
+               WHERE id=?""",
+            (setup_json, trigger_conditions, regime, entry_type,
+             confidence, edge_score, ts, market_type, int(existing["id"])),
+        )
+        row_id = int(existing["id"])
+    else:
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO scanner_watchlist(
+                   symbol, market_type, setup_json, trigger_conditions,
+                   regime, entry_type, confidence, edge_score, status, created_at, updated_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(symbol), market_type, setup_json, trigger_conditions,
+             regime, entry_type, confidence, edge_score, "watching", ts, ts),
+        )
+        row_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return row_id
+
+
+def list_watchlist(status: str = "watching", limit: int = 50) -> List[Dict[str, Any]]:
+    """List watchlist entries by status."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT * FROM scanner_watchlist WHERE status=? ORDER BY edge_score DESC LIMIT ?",
+        (str(status), int(limit)),
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def get_watchlist_entry(symbol: str, status: str = "watching") -> Optional[Dict[str, Any]]:
+    """Get a specific watchlist entry by symbol."""
+    con = _conn()
+    row = con.execute(
+        "SELECT * FROM scanner_watchlist WHERE symbol=? AND status=? LIMIT 1",
+        (str(symbol), str(status)),
+    ).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def mark_watchlist_triggered(symbol: str, bot_id: Optional[int] = None) -> None:
+    """Mark a watchlist entry as triggered (converted to bot)."""
+    con = _conn()
+    con.execute(
+        """UPDATE scanner_watchlist
+           SET status='triggered', triggered_at=?, bot_id=?, updated_at=?
+           WHERE symbol=? AND status='watching'""",
+        (now_ts(), bot_id, now_ts(), str(symbol)),
+    )
+    con.commit()
+    con.close()
+
+
+def remove_watchlist_entry(symbol: str) -> None:
+    """Remove a watchlist entry (expired or manually removed)."""
+    con = _conn()
+    con.execute(
+        "UPDATE scanner_watchlist SET status='expired', updated_at=? WHERE symbol=? AND status='watching'",
+        (now_ts(), str(symbol)),
+    )
+    con.commit()
+    con.close()
+
+
+def cleanup_old_watchlist(max_age_hours: int = 72) -> int:
+    """Expire watchlist entries older than max_age_hours. Returns count expired."""
+    con = _conn()
+    cutoff = now_ts() - (max_age_hours * 3600)
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE scanner_watchlist SET status='expired', updated_at=? WHERE status='watching' AND created_at < ?",
+        (now_ts(), cutoff),
+    )
+    count = cur.rowcount
+    con.commit()
+    con.close()
+    return count
+
+
+def cleanup_old_portfolio_snapshots(keep_days: int = 90) -> int:
+    """Delete portfolio_snapshots older than keep_days. Returns count deleted."""
+    if keep_days < 1 or keep_days > 3650:
+        keep_days = 90
+    con = _conn()
+    try:
+        cur = con.cursor()
+        # Modifier must be literal; keep_days is code-controlled, not user input
+        cur.execute(
+            "DELETE FROM portfolio_snapshots WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')",
+            (keep_days,),
+        )
+        count = cur.rowcount
+        con.commit()
+        return count
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("cleanup_old_portfolio_snapshots: %s", e)
+        return 0
+    finally:
+        con.close()

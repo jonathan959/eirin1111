@@ -14,7 +14,10 @@ import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from smart_entry import SmartEntryFilter
 
 from kraken_client import KrakenClient, _userref_from_client_order_id
 
@@ -28,6 +31,13 @@ from intelligence_layer import IntelligenceDecision, ExecutionPolicyResult
 from db import add_order_event, add_intelligence_decision, log_error
 from alpaca_adapter import AlpacaAdapter
 from symbol_classifier import is_stock_symbol
+
+# Smart Entry Filter - optional intelligence module
+try:
+    from smart_entry import SmartEntryFilter
+    SMART_ENTRY_AVAILABLE = True
+except ImportError:
+    SMART_ENTRY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +132,15 @@ class OrderExecutor:
         self._IDEMPOTENCY_MAX = 500
         self._IDEMPOTENCY_TTL = 3600  # 1 hour
 
+        # Initialize SmartEntryFilter if available
+        self.smart_entry_filter: Optional[SmartEntryFilter] = None
+        if SMART_ENTRY_AVAILABLE and os.getenv("ENABLE_SMART_ENTRY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            try:
+                self.smart_entry_filter = SmartEntryFilter()
+                logger.info("SmartEntryFilter enabled for trade validation")
+            except Exception as e:
+                logger.warning("SmartEntryFilter initialization failed: %s", e)
+
     def _check_kraken_balance_before_order(
         self,
         symbol: str,
@@ -171,7 +190,62 @@ class OrderExecutor:
                     f"(have {free_base} free)."
                 )
         return None
-    
+
+    def _validate_entry_with_smart_filters(
+        self,
+        symbol: str,
+        market_type: str,
+        proposed_order: Dict[str, Any],
+        **candles_data: Any,
+    ) -> Optional[str]:
+        """
+        Optional: Validate entry using SmartEntryFilter before order placement.
+
+        Args:
+            symbol: Trading pair
+            market_type: 'crypto' or 'stocks'
+            proposed_order: The proposed order dict
+            candles_data: Optional kwargs with candles_1h, candles_4h, candles_1d
+
+        Returns:
+            Error message if validation fails, None if passes
+        """
+        if not self.smart_entry_filter:
+            return None
+
+        # Only validate BUY orders (entries)
+        if proposed_order.get("side", "").lower() != "buy":
+            return None
+
+        try:
+            candles_1h = candles_data.get("candles_1h", [])
+            candles_4h = candles_data.get("candles_4h", [])
+            candles_1d = candles_data.get("candles_1d", [])
+
+            # If we don't have candles, skip this validation
+            if not (candles_1h and candles_4h and candles_1d):
+                return None
+
+            # Run smart entry filter
+            should_enter, reason = self.smart_entry_filter.should_enter(
+                symbol=symbol,
+                market_type=market_type,
+                candles_1h=candles_1h,
+                candles_4h=candles_4h,
+                candles_1d=candles_1d,
+            )
+
+            if not should_enter:
+                logger.info(f"[{symbol}] SmartEntryFilter blocked entry: {reason}")
+                return f"SmartEntryFilter: {reason}"
+
+            logger.debug(f"[{symbol}] SmartEntryFilter approved entry: {reason}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"SmartEntryFilter validation error for {symbol}: {e}")
+            return None  # Fail-safe: don't block on filter error
+
     def execute_decision(
         self,
         decision: IntelligenceDecision,
@@ -248,6 +322,20 @@ class OrderExecutor:
                     pass
             
             for proposed_order in decision.proposed_orders:
+                # Optional: SmartEntryFilter validation for BUY orders
+                market_type = "stocks" if is_stock_symbol(symbol) else "crypto"
+                smart_filter_error = self._validate_entry_with_smart_filters(
+                    symbol=symbol,
+                    market_type=market_type,
+                    proposed_order=proposed_order,
+                    candles_1h=kwargs.get("candles_1h"),
+                    candles_4h=kwargs.get("candles_4h"),
+                    candles_1d=kwargs.get("candles_1d"),
+                )
+                if smart_filter_error:
+                    result["errors"].append(smart_filter_error)
+                    continue  # Skip this order
+
                 order_result = self._execute_proposed_order(
                     proposed_order, bot_id, symbol, dry_run, decision.execution_policy
                 )
@@ -340,7 +428,30 @@ class OrderExecutor:
         if side not in ["buy", "sell"]:
             return {"error": f"Invalid side: {side}"}
 
-        # Stale quote protection (0 = disabled; STALE_QUOTE_MAX_AGE_SECONDS in .env)
+        # Unified Execution Gate (spread + stale + price feed + slippage)
+        try:
+            from execution_gate import check_execution_gate
+            _gate = check_execution_gate(
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                bid=float(proposed_order.get("bid_price") or proposed_order.get("bid") or 0) or None,
+                ask=float(proposed_order.get("ask_price") or proposed_order.get("ask") or 0) or None,
+                last_price=float(proposed_order.get("price") or 0) or None,
+                ticker_ts=float(proposed_order.get("quote_ts") or 0) or None,
+                bot_spread_guard_pct=float(proposed_order.get("spread_guard_pct") or 0) or None,
+                volatility_pct=float(proposed_order.get("volatility_pct") or 0) or None,
+                quote_amount=float(size_quote),
+                dry_run=dry_run,
+            )
+            if not _gate.allowed:
+                return {"error": _gate.reason or "Execution gate blocked"}
+        except ImportError:
+            pass
+        except Exception as _gate_err:
+            logger.debug("execution_gate in executor: %s", _gate_err)
+
+        # Legacy stale quote protection (fallback if gate didn't catch it)
         try:
             max_age = STALE_QUOTE_MAX_AGE_SECONDS
             if max_age > 0:
@@ -606,52 +717,58 @@ class OrderExecutor:
                 )
                 if err:
                     return {"error": err}
-                try:
-                    if side == "buy":
-                        order = self.kc.create_market_buy_quote(
-                            symbol, final_amount_quote, client_order_id
-                        )
-                        # Estimate fill price
-                        try:
-                            ticker = self.kc.fetch_ticker(symbol)
-                            fill_price = float(ticker.get("last", 0))
-                            est_amount = final_amount_quote / fill_price if fill_price > 0 else 0
-                        except Exception:
+                # Retry market orders with exponential backoff (transient errors only)
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        if side == "buy":
+                            order = self.kc.create_market_buy_quote(
+                                symbol, final_amount_quote, client_order_id
+                            )
+                            try:
+                                ticker = self.kc.fetch_ticker(symbol)
+                                fill_price = float(ticker.get("last", 0))
+                                est_amount = final_amount_quote / fill_price if fill_price > 0 else 0
+                            except Exception:
+                                fill_price = 0.0
+                                est_amount = 0.0
+                        else:
+                            order = self.kc.create_market_sell_base(
+                                symbol, final_amount_base, client_order_id
+                            )
                             fill_price = 0.0
-                            est_amount = 0.0
-                    else:
-                        order = self.kc.create_market_sell_base(
-                            symbol, final_amount_base, client_order_id
+                            est_amount = final_amount_base
+                        
+                        if est_amount <= 0:
+                            return {"error": f"Order placed but estimated amount is 0: {est_amount}"}
+                        
+                        add_order_event(
+                            bot_id, symbol, side, "market", fill_price,
+                            est_amount,
+                            order.get("id"), "intelligence", "placed", "Intelligence Layer decision",
+                            is_live=1,
                         )
-                        fill_price = 0.0
-                        est_amount = final_amount_base
-                    
-                    if est_amount <= 0:
-                        return {"error": f"Order placed but estimated amount is 0: {est_amount}"}
-                    
-                    add_order_event(
-                        bot_id, symbol, side, "market", fill_price,
-                        est_amount,
-                        order.get("id"), "intelligence", "placed", "Intelligence Layer decision",
-                        is_live=1,
-                    )
-                    if ORDER_IDEMPOTENCY_ENABLED:
-                        self._idempotency_seen[idem_key] = time.time()
-                    intended = float(proposed_order.get("price") or 0)
-                    if intended <= 0:
-                        intended = fill_price if side == "buy" and fill_price > 0 else (final_amount_quote / est_amount if side == "buy" and est_amount > 0 else fill_price)
-                    if intended <= 0:
-                        try:
-                            t = self.kc.fetch_ticker(symbol)
-                            intended = float(t.get("last") or t.get("ask") or 0)
-                        except Exception:
-                            intended = fill_price
-                    _record_execution_quality(bot_id, order.get("id"), symbol, side, intended, fill_price if fill_price > 0 else intended)
-                    return {"order": order}
-                except Exception as e:
-                    if _is_insufficient_funds(e):
-                        return {"error": f"Insufficient funds (Kraken): {e}. Reduce order size or add USD/base."}
-                    return {"error": f"Order placement failed: {type(e).__name__}: {e}"}
+                        if ORDER_IDEMPOTENCY_ENABLED:
+                            self._idempotency_seen[idem_key] = time.time()
+                        intended = float(proposed_order.get("price") or 0)
+                        if intended <= 0:
+                            intended = fill_price if side == "buy" and fill_price > 0 else (final_amount_quote / est_amount if side == "buy" and est_amount > 0 else fill_price)
+                        if intended <= 0:
+                            try:
+                                t = self.kc.fetch_ticker(symbol)
+                                intended = float(t.get("last") or t.get("ask") or 0)
+                            except Exception:
+                                intended = fill_price
+                        _record_execution_quality(bot_id, order.get("id"), symbol, side, intended, fill_price if fill_price > 0 else intended)
+                        return {"order": order}
+                    except Exception as e:
+                        last_err = e
+                        if _is_insufficient_funds(e):
+                            return {"error": f"Insufficient funds (Kraken): {e}. Reduce order size or add USD/base."}
+                        logger.warning("Market order attempt %d/3 failed for %s: %s", attempt + 1, symbol, e)
+                        if attempt < 2:
+                            time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+                return {"error": f"Market order failed after 3 attempts: {type(last_err).__name__}: {last_err}"}
         
         else:
             return {"error": f"Unsupported order type: {execution_policy.order_type}"}

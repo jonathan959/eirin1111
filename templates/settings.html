@@ -1,0 +1,660 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Settings</div>
+      <div class="muted">Configure API keys, trading parameters, notifications, and UI preferences.</div>
+    </div>
+  </div>
+
+  <div class="card section">
+    <!-- Tab Navigation -->
+    <div class="tabs-nav" style="display: flex; border-bottom: 1px solid var(--border); margin-bottom: 20px; gap: 0;">
+      <button class="tab-btn active" data-tab="api-keys" onclick="switchTab(event, 'api-keys')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">API Keys</button>
+      <button class="tab-btn" data-tab="default-params" onclick="switchTab(event, 'default-params')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">Default Parameters</button>
+      <button class="tab-btn" data-tab="notifications" onclick="switchTab(event, 'notifications')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">Notifications</button>
+      <button class="tab-btn" data-tab="ui-prefs" onclick="switchTab(event, 'ui-prefs')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">UI Preferences</button>
+      <button class="tab-btn" data-tab="risk-limits" onclick="switchTab(event, 'risk-limits')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">Risk Limits</button>
+      <button class="tab-btn" data-tab="system" onclick="switchTab(event, 'system')" style="padding: 12px 16px; border-bottom: 2px solid transparent; cursor: pointer; font-weight: 500;">System</button>
+    </div>
+
+    <!-- API Keys Tab -->
+    <div id="api-keys" class="tab-content active">
+      <div class="h2" style="margin-bottom: 16px;">API Keys & Connections</div>
+
+      <div class="grid grid-2" style="gap: 16px;">
+        <div class="card">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+            <span id="kraken-status" class="status-dot" style="width: 12px; height: 12px; border-radius: 50%; background-color: #ef4444;"></span>
+            <div class="card-label">Kraken</div>
+          </div>
+          <div class="muted" style="font-size: 12px; margin-bottom: 8px;">Status: <span id="kraken-status-text">Not Connected</span></div>
+          <div class="muted" style="font-size: 12px;">Last connection: <span id="kraken-last-time">—</span></div>
+        </div>
+
+        <div class="card">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+            <span id="alpaca-paper-status" class="status-dot" style="width: 12px; height: 12px; border-radius: 50%; background-color: #ef4444;"></span>
+            <div class="card-label">Alpaca Paper</div>
+          </div>
+          <div class="muted" style="font-size: 12px; margin-bottom: 8px;">Status: <span id="alpaca-paper-status-text">Not Connected</span></div>
+          <div class="muted" style="font-size: 12px;">Last connection: <span id="alpaca-paper-last-time">—</span></div>
+        </div>
+
+        <div class="card">
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+            <span id="alpaca-live-status" class="status-dot" style="width: 12px; height: 12px; border-radius: 50%; background-color: #ef4444;"></span>
+            <div class="card-label">Alpaca Live</div>
+          </div>
+          <div class="muted" style="font-size: 12px; margin-bottom: 8px;">Status: <span id="alpaca-live-status-text">Not Connected</span></div>
+          <div class="muted" style="font-size: 12px;">Last connection: <span id="alpaca-live-last-time">—</span></div>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top: 12px; font-size: 12px;">API keys are not displayed for security. Configure them in your .env file.</div>
+    </div>
+
+    <!-- Default Parameters Tab -->
+    <div id="default-params" class="tab-content" style="display: none;">
+      <div class="h2" style="margin-bottom: 16px;">Default Bot Parameters</div>
+
+      <div class="grid grid-2" style="gap: 16px;">
+        <div>
+          <label class="form-label">Default Capital Per Bot ($)</label>
+          <input type="number" id="default-capital" class="input" step="1" min="0" placeholder="100" />
+        </div>
+        <div>
+          <label class="form-label">Default Take Profit (%)</label>
+          <input type="number" id="default-tp" class="input" step="0.1" min="0" placeholder="1.5" />
+        </div>
+        <div>
+          <label class="form-label">Default Max Safety Orders</label>
+          <input type="number" id="default-safety-orders" class="input" step="1" min="1" placeholder="5" />
+        </div>
+        <div>
+          <label class="form-label">Default Safety Order Size ($)</label>
+          <input type="number" id="default-so-size" class="input" step="0.1" min="0" placeholder="25" />
+        </div>
+        <div>
+          <label class="form-label">Default First Deviation (%)</label>
+          <input type="number" id="default-first-dev" class="input" step="0.1" min="0" placeholder="1.0" />
+        </div>
+        <div>
+          <label class="form-label">Default Step Multiplier</label>
+          <input type="number" id="default-step-mult" class="input" step="0.1" min="0" placeholder="1.2" />
+        </div>
+        <div style="grid-column: 1 / -1;">
+          <label class="form-label">Default Strategy Mode</label>
+          <select id="default-strategy" class="input">
+            <option value="Classic DCA">Classic DCA</option>
+            <option value="Smart DCA">Smart DCA</option>
+            <option value="Trend Follow">Trend Follow</option>
+            <option value="Range Mean Reversion">Range Mean Reversion</option>
+            <option value="Strategy Router">Strategy Router</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notifications Tab -->
+    <div id="notifications" class="tab-content" style="display: none;">
+      <div class="h2" style="margin-bottom: 16px;">Notification Settings</div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label" style="display: flex; align-items: center; gap: 8px;">
+          <input type="checkbox" id="notifications-enabled" />
+          Browser Notifications
+        </label>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label">Discord Webhook URL</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="password" id="discord-webhook" class="input" placeholder="https://discordapp.com/api/webhooks/..." />
+          <button class="btn" onclick="testDiscord()">Test</button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label">Telegram Bot Token</label>
+        <input type="password" id="telegram-token" class="input" placeholder="Bot token" />
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label">Telegram Chat ID</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="telegram-chat-id" class="input" placeholder="Chat ID" />
+          <button class="btn" onclick="testTelegram()">Test</button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <div class="form-label" style="margin-bottom: 8px;">Notify On</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-trade-executed" />
+            Trade Executed
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-tp-hit" />
+            Take Profit Hit
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-sl-hit" />
+            Stop Loss Hit
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-bot-error" />
+            Bot Error
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-drawdown" />
+            Large Drawdown
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px;">
+            <input type="checkbox" id="notify-daily-summary" />
+            Daily Summary
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- UI Preferences Tab -->
+    <div id="ui-prefs" class="tab-content" style="display: none;">
+      <div class="h2" style="margin-bottom: 16px;">UI Preferences</div>
+
+      <div style="margin-bottom: 16px;">
+        <div class="form-label" style="margin-bottom: 8px;">Theme</div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn" id="theme-dark" onclick="setTheme('dark')" style="flex: 1;">Dark</button>
+          <button class="btn" id="theme-light" onclick="setTheme('light')" style="flex: 1;">Light</button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label">Default Chart Timeframe</label>
+        <select id="default-timeframe" class="input">
+          <option value="1H">1H</option>
+          <option value="4H">4H</option>
+          <option value="1D">1D</option>
+          <option value="1W">1W</option>
+          <option value="1M">1M</option>
+        </select>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label">Auto-Refresh Interval (seconds)</label>
+        <input type="number" id="auto-refresh-interval" class="input" step="1" min="5" max="300" placeholder="15" />
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label class="form-label" style="display: flex; align-items: center; gap: 8px;">
+          <input type="checkbox" id="show-debug-logs" />
+          Show Strategy Debug in Logs
+        </label>
+      </div>
+    </div>
+
+    <!-- Risk Limits Tab -->
+    <div id="risk-limits" class="tab-content" style="display: none;">
+      <div class="h2" style="margin-bottom: 16px;">Risk Management</div>
+
+      <div class="grid grid-2" style="gap: 16px;">
+        <div>
+          <label class="form-label">Max Drawdown Before Pause (%)</label>
+          <input type="number" id="max-drawdown" class="input" step="0.1" min="0" placeholder="10" />
+        </div>
+        <div>
+          <label class="form-label">Max Single Position (% of portfolio)</label>
+          <input type="number" id="max-position-pct" class="input" step="0.1" min="0" max="100" placeholder="20" />
+        </div>
+        <div>
+          <label class="form-label">Max Correlated Exposure (%)</label>
+          <input type="number" id="max-correlated" class="input" step="0.1" min="0" max="100" placeholder="50" />
+        </div>
+        <div>
+          <label class="form-label">Cooldown After Loss (minutes)</label>
+          <input type="number" id="cooldown-loss" class="input" step="1" min="0" placeholder="30" />
+        </div>
+        <div>
+          <label class="form-label">Max Deals Per Day Per Bot</label>
+          <input type="number" id="max-deals-day" class="input" step="1" min="1" placeholder="5" />
+        </div>
+      </div>
+    </div>
+
+    <!-- System Tab -->
+    <div id="system" class="tab-content" style="display: none;">
+      <div class="h2" style="margin-bottom: 16px;">System Information</div>
+
+      <div class="grid grid-2" style="gap: 16px;">
+        <div>
+          <div class="card-label">Database Path</div>
+          <div class="input" style="background-color: var(--bg-secondary); padding: 8px; border-radius: 4px;">
+            <code id="db-path" style="font-size: 12px;">—</code>
+          </div>
+        </div>
+        <div>
+          <label class="form-label">Log Level</label>
+          <select id="log-level" class="input">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO</option>
+            <option value="WARNING">WARNING</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+        </div>
+        <div>
+          <div class="card-label">Worker URL</div>
+          <div class="input" style="background-color: var(--bg-secondary); padding: 8px; border-radius: 4px;">
+            <code id="worker-url" style="font-size: 12px;">—</code>
+          </div>
+        </div>
+        <div>
+          <div class="card-label">Version</div>
+          <div class="input" style="background-color: var(--bg-secondary); padding: 8px; border-radius: 4px;">
+            <span id="version-text" style="font-size: 12px;">v2.0.0</span>
+          </div>
+        </div>
+        <div>
+          <div class="card-label">Uptime</div>
+          <div class="input" style="background-color: var(--bg-secondary); padding: 8px; border-radius: 4px;">
+            <span id="uptime-text" style="font-size: 12px;">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 16px;">
+        <button class="btn" onclick="checkHealth()" style="width: 100%;">Check Health</button>
+        <div id="health-status" class="muted" style="margin-top: 8px; font-size: 12px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Save Settings Button -->
+  <div style="display: flex; gap: 8px; margin-top: 20px;">
+    <button class="btn btn-purple" onclick="saveSettings()" style="flex: 1;">Save Settings</button>
+    <button class="btn btn-ghost" onclick="resetSettings()" style="flex: 1;">Reset</button>
+  </div>
+
+  <div id="save-result" class="muted" style="margin-top: 8px; text-align: center;"></div>
+</div>
+
+<script>
+  let currentTheme = localStorage.getItem("theme") || "dark";
+
+  function switchTab(e, tabId) {
+    e.preventDefault();
+
+    // Hide all tabs
+    const contents = document.querySelectorAll(".tab-content");
+    contents.forEach(c => c.style.display = "none");
+
+    // Remove active class from buttons
+    const buttons = document.querySelectorAll(".tab-btn");
+    buttons.forEach(b => b.style.borderBottomColor = "transparent");
+
+    // Show selected tab
+    const tab = document.getElementById(tabId);
+    if (tab) {
+      tab.style.display = "block";
+      e.target.style.borderBottomColor = "var(--primary, #7c3aed)";
+    }
+  }
+
+  function setTheme(theme) {
+    currentTheme = theme;
+    document.getElementById("theme-dark").className = theme === "dark" ? "btn btn-primary" : "btn";
+    document.getElementById("theme-light").className = theme === "light" ? "btn btn-primary" : "btn";
+  }
+
+  async function loadSettings() {
+    try {
+      const resp = await fetch("/api/settings");
+      if (!resp.ok) throw new Error("Failed to load settings");
+      const data = await resp.json();
+
+      // Load API status
+      const health = await fetch("/health").then(r => r.json()).catch(() => ({}));
+      updateAPIStatus(health);
+
+      // Load default parameters
+      document.getElementById("default-capital").value = data.default_capital || 100;
+      document.getElementById("default-tp").value = data.default_tp || 1.5;
+      document.getElementById("default-safety-orders").value = data.default_safety_orders || 5;
+      document.getElementById("default-so-size").value = data.default_so_size || 25;
+      document.getElementById("default-first-dev").value = data.default_first_dev || 1.0;
+      document.getElementById("default-step-mult").value = data.default_step_mult || 1.2;
+      document.getElementById("default-strategy").value = data.default_strategy || "Classic DCA";
+
+      // Load notifications
+      document.getElementById("notifications-enabled").checked = data.notifications_enabled !== false;
+      document.getElementById("discord-webhook").value = data.discord_webhook || "";
+      document.getElementById("telegram-token").value = data.telegram_token || "";
+      document.getElementById("telegram-chat-id").value = data.telegram_chat_id || "";
+      document.getElementById("notify-trade-executed").checked = data.notify_trade_executed !== false;
+      document.getElementById("notify-tp-hit").checked = data.notify_tp_hit !== false;
+      document.getElementById("notify-sl-hit").checked = data.notify_sl_hit !== false;
+      document.getElementById("notify-bot-error").checked = data.notify_bot_error !== false;
+      document.getElementById("notify-drawdown").checked = data.notify_drawdown !== false;
+      document.getElementById("notify-daily-summary").checked = data.notify_daily_summary !== false;
+
+      // Load UI preferences
+      setTheme(data.theme || currentTheme);
+      document.getElementById("default-timeframe").value = data.default_timeframe || "1H";
+      document.getElementById("auto-refresh-interval").value = data.auto_refresh_interval || 15;
+      document.getElementById("show-debug-logs").checked = data.show_debug_logs !== false;
+
+      // Load risk limits
+      document.getElementById("max-drawdown").value = data.max_drawdown || 10;
+      document.getElementById("max-position-pct").value = data.max_position_pct || 20;
+      document.getElementById("max-correlated").value = data.max_correlated || 50;
+      document.getElementById("cooldown-loss").value = data.cooldown_loss || 30;
+      document.getElementById("max-deals-day").value = data.max_deals_day || 5;
+
+      // Load system info
+      document.getElementById("db-path").textContent = data.db_path || "botdb.sqlite3";
+      document.getElementById("log-level").value = data.log_level || "INFO";
+      document.getElementById("worker-url").textContent = data.worker_url || "http://127.0.0.1:9001";
+
+    } catch (e) {
+      console.error("Error loading settings:", e);
+      showToast("Error", "Failed to load settings", "error");
+    }
+  }
+
+  function updateAPIStatus(health) {
+    const kraken = health.kraken_ready;
+    const alpaca_paper = health.alpaca_paper_ready;
+    const alpaca_live = health.alpaca_live_ready;
+
+    // Kraken
+    document.getElementById("kraken-status").style.backgroundColor = kraken ? "#22c55e" : "#ef4444";
+    document.getElementById("kraken-status-text").textContent = kraken ? "Connected" : "Not Connected";
+
+    // Alpaca Paper
+    document.getElementById("alpaca-paper-status").style.backgroundColor = alpaca_paper ? "#22c55e" : "#ef4444";
+    document.getElementById("alpaca-paper-status-text").textContent = alpaca_paper ? "Connected" : "Not Connected";
+
+    // Alpaca Live
+    document.getElementById("alpaca-live-status").style.backgroundColor = alpaca_live ? "#22c55e" : "#ef4444";
+    document.getElementById("alpaca-live-status-text").textContent = alpaca_live ? "Connected" : "Not Connected";
+  }
+
+  async function saveSettings() {
+    try {
+      const settings = {
+        default_capital: parseFloat(document.getElementById("default-capital").value) || 100,
+        default_tp: parseFloat(document.getElementById("default-tp").value) || 1.5,
+        default_safety_orders: parseInt(document.getElementById("default-safety-orders").value) || 5,
+        default_so_size: parseFloat(document.getElementById("default-so-size").value) || 25,
+        default_first_dev: parseFloat(document.getElementById("default-first-dev").value) || 1.0,
+        default_step_mult: parseFloat(document.getElementById("default-step-mult").value) || 1.2,
+        default_strategy: document.getElementById("default-strategy").value || "Classic DCA",
+        notifications_enabled: document.getElementById("notifications-enabled").checked,
+        discord_webhook: document.getElementById("discord-webhook").value,
+        telegram_token: document.getElementById("telegram-token").value,
+        telegram_chat_id: document.getElementById("telegram-chat-id").value,
+        notify_trade_executed: document.getElementById("notify-trade-executed").checked,
+        notify_tp_hit: document.getElementById("notify-tp-hit").checked,
+        notify_sl_hit: document.getElementById("notify-sl-hit").checked,
+        notify_bot_error: document.getElementById("notify-bot-error").checked,
+        notify_drawdown: document.getElementById("notify-drawdown").checked,
+        notify_daily_summary: document.getElementById("notify-daily-summary").checked,
+        theme: currentTheme,
+        default_timeframe: document.getElementById("default-timeframe").value || "1H",
+        auto_refresh_interval: parseInt(document.getElementById("auto-refresh-interval").value) || 15,
+        show_debug_logs: document.getElementById("show-debug-logs").checked,
+        max_drawdown: parseFloat(document.getElementById("max-drawdown").value) || 10,
+        max_position_pct: parseFloat(document.getElementById("max-position-pct").value) || 20,
+        max_correlated: parseFloat(document.getElementById("max-correlated").value) || 50,
+        cooldown_loss: parseInt(document.getElementById("cooldown-loss").value) || 30,
+        max_deals_day: parseInt(document.getElementById("max-deals-day").value) || 5,
+        log_level: document.getElementById("log-level").value || "INFO",
+      };
+
+      const resp = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings)
+      });
+
+      if (!resp.ok) throw new Error("Failed to save settings");
+      const data = await resp.json();
+
+      if (data.ok) {
+        showToast("Success", "Settings saved successfully", "success");
+        document.getElementById("save-result").textContent = "✓ Saved";
+        setTimeout(() => {
+          document.getElementById("save-result").textContent = "";
+        }, 3000);
+      } else {
+        throw new Error(data.error || "Unknown error");
+      }
+    } catch (e) {
+      console.error("Error saving settings:", e);
+      showToast("Error", "Failed to save settings: " + e.message, "error");
+    }
+  }
+
+  function resetSettings() {
+    if (confirm("Reset all settings to defaults?")) {
+      loadSettings();
+      showToast("Info", "Settings reset to last saved values", "info");
+    }
+  }
+
+  async function testDiscord() {
+    try {
+      const webhook = document.getElementById("discord-webhook").value;
+      if (!webhook) {
+        showToast("Error", "Discord webhook URL is empty", "error");
+        return;
+      }
+
+      const resp = await fetch("/api/settings/test-discord", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ webhook_url: webhook })
+      });
+
+      const data = await resp.json();
+      if (data.ok) {
+        showToast("Success", "Discord webhook is valid", "success");
+      } else {
+        showToast("Error", data.error || "Invalid webhook", "error");
+      }
+    } catch (e) {
+      showToast("Error", "Failed to test Discord: " + e.message, "error");
+    }
+  }
+
+  async function testTelegram() {
+    try {
+      const token = document.getElementById("telegram-token").value;
+      const chatId = document.getElementById("telegram-chat-id").value;
+
+      if (!token || !chatId) {
+        showToast("Error", "Bot token and chat ID are required", "error");
+        return;
+      }
+
+      const resp = await fetch("/api/settings/test-telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token, chat_id: chatId })
+      });
+
+      const data = await resp.json();
+      if (data.ok) {
+        showToast("Success", "Telegram is valid", "success");
+      } else {
+        showToast("Error", data.error || "Invalid credentials", "error");
+      }
+    } catch (e) {
+      showToast("Error", "Failed to test Telegram: " + e.message, "error");
+    }
+  }
+
+  async function checkHealth() {
+    try {
+      const resp = await fetch("/health");
+      const data = await resp.json();
+
+      const statusEl = document.getElementById("health-status");
+      if (data.ok) {
+        statusEl.textContent = "✓ System healthy";
+        statusEl.style.color = "var(--success, #22c55e)";
+      } else {
+        statusEl.textContent = "✗ System issues detected";
+        statusEl.style.color = "var(--danger, #ef4444)";
+      }
+
+      updateAPIStatus(data);
+    } catch (e) {
+      document.getElementById("health-status").textContent = "Error: " + e.message;
+    }
+  }
+
+  // Load settings on page load
+  loadSettings();
+
+  // Refresh API status every 30 seconds
+  setInterval(() => {
+    fetch("/health").then(r => r.json()).then(updateAPIStatus).catch(() => {});
+  }, 30000);
+</script>
+
+<style>
+  .form-label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .input {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background-color: var(--bg-input, var(--bg-secondary));
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .input:focus {
+    outline: none;
+    border-color: var(--primary, #7c3aed);
+    box-shadow: 0 0 0 2px rgba(124, 58, 237, 0.1);
+  }
+
+  select.input {
+    cursor: pointer;
+  }
+
+  .btn {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background-color: transparent;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn:hover {
+    background-color: var(--bg-secondary);
+  }
+
+  .btn-primary {
+    background-color: var(--primary, #7c3aed);
+    color: white;
+    border-color: var(--primary, #7c3aed);
+  }
+
+  .btn-primary:hover {
+    opacity: 0.9;
+  }
+
+  .btn-purple {
+    background-color: var(--primary, #7c3aed);
+    color: white;
+    border-color: var(--primary, #7c3aed);
+  }
+
+  .btn-purple:hover {
+    opacity: 0.9;
+  }
+
+  .btn-ghost {
+    background-color: transparent;
+  }
+
+  .btn-ghost:hover {
+    background-color: var(--bg-secondary);
+  }
+
+  .tab-btn.active {
+    border-bottom-color: var(--primary, #7c3aed);
+  }
+
+  .grid {
+    display: grid;
+    gap: 16px;
+  }
+
+  .grid-2 {
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  }
+
+  .status-dot {
+    display: inline-block;
+    border-radius: 50%;
+  }
+
+  .card {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background-color: var(--bg-secondary);
+  }
+
+  .card-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .muted {
+    color: var(--text-secondary);
+  }
+
+  .tabs-nav {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+    gap: 0;
+  }
+
+  .tab-btn {
+    padding: 12px 16px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--text-primary);
+    transition: all 0.2s;
+  }
+
+  .tab-btn:hover {
+    color: var(--primary, #7c3aed);
+  }
+</style>
+
+{% endblock %}

@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>{% block title %}Eirin Bot{% endblock %}</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   {% if enable_pwa %}
   <link rel="manifest" href="/static/manifest.json" />
   {% endif %}
@@ -29,6 +29,7 @@
   {% if enable_voice_alerts %}
   <script src="/static/voice_alerts.js"></script>
   {% endif %}
+  <script src="/static/app.js" defer></script>
 
   {% if enable_pwa %}
   <script>
@@ -41,59 +42,171 @@
 <body>
   <div class="app">
     <div class="layout">
-      <aside class="sidebar">
-        <div class="sidebar-brand">
-          <div class="brand-badge">EB</div>
-          <div class="brand-text">
-            <div class="brand-name">Eirin Bot</div>
-            <div class="brand-sub">Local trading dashboard</div>
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div class="sidebar-brand">
+            <div class="brand-badge">EB</div>
+            <div class="brand-text">
+              <div class="brand-name">Eirin Bot</div>
+              <div class="brand-sub">v2.0.0</div>
+            </div>
           </div>
+          <button id="sidebarToggle" class="btn-sidebar-toggle" type="button" title="Toggle sidebar">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="3" y1="5" x2="17" y2="5"></line>
+              <line x1="3" y1="10" x2="17" y2="10"></line>
+              <line x1="3" y1="15" x2="17" y2="15"></line>
+            </svg>
+          </button>
         </div>
 
         <nav class="sidebar-nav">
           <div class="sidebar-group">
             <div class="sidebar-label">Main</div>
-            <a class="navlink navlink-vert" href="/dashboard">Dashboard</a>
-            <a class="navlink navlink-vert" href="/dca">DCA Dashboard</a>
-            <a class="navlink navlink-vert" href="/explore">Explore</a>
-          </div>
-          <div class="sidebar-group">
-            <div class="sidebar-label">Tools</div>
-            <a class="navlink navlink-vert" href="/strategies">Strategy Leaderboard</a>
-            <a class="navlink navlink-vert" href="/journal">Trade Journal</a>
-            <a class="navlink navlink-vert" href="/analytics">Analytics</a>
-            <a class="navlink navlink-vert" href="/scenario-simulator">Scenario Simulator</a>
-            <a class="navlink navlink-vert" href="/safety">Safety</a>
-            <a class="navlink navlink-vert" href="/bots">Bots</a>
+            <a class="navlink navlink-vert {% if active_page == 'dashboard' %}active{% endif %}" href="/dashboard">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="12 3 20 7.5 20 16.5 12 21 4 16.5 4 7.5 12 3"></polyline>
+                <line x1="12" y1="12" x2="20" y2="7.5"></line>
+                <line x1="12" y1="12" x2="12" y2="21"></line>
+                <line x1="12" y1="12" x2="4" y2="7.5"></line>
+              </svg>
+              <span>Dashboard</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'bots' %}active{% endif %}" href="/bots">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="2" width="18" height="20" rx="2" ry="2"></rect>
+                <line x1="9" y1="2" x2="9" y2="22"></line>
+                <line x1="15" y1="2" x2="15" y2="22"></line>
+              </svg>
+              <span>Bots</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'explore' %}active{% endif %}" href="/explore">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"></circle>
+                <path d="m21 21-4.35-4.35"></path>
+              </svg>
+              <span>Explore</span>
+            </a>
           </div>
           <div class="sidebar-group">
             <div class="sidebar-label">Autopilot</div>
-            <a class="navlink navlink-vert" href="/autopilot" title="Dashboard: run automation, manage positions">Autopilot</a>
-            <a class="navlink navlink-vert" href="/setup-autopilot" title="One-time setup: capital &amp; rules">Setup Autopilot</a>
+            <a class="navlink navlink-vert {% if active_page == 'autopilot' %}active{% endif %}" href="/autopilot" title="Dashboard: run automation, manage positions">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="1"></circle>
+                <path d="M12 1v6m0 6v6"></path>
+                <path d="M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24"></path>
+                <path d="M1 12h6m6 0h6"></path>
+                <path d="M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"></path>
+              </svg>
+              <span>Autopilot</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'setup-autopilot' %}active{% endif %}" href="/setup-autopilot" title="One-time setup: capital &amp; rules">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M12 1v6m0 6v6"></path>
+                <path d="M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24"></path>
+                <path d="M1 12h6m6 0h6"></path>
+              </svg>
+              <span>Setup</span>
+            </a>
+          </div>
+          <div class="sidebar-group">
+            <div class="sidebar-label">Tools</div>
+            <a class="navlink navlink-vert {% if active_page == 'dca' %}active{% endif %}" href="/dca">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+              </svg>
+              <span>DCA</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'strategies' %}active{% endif %}" href="/strategies">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="12 3 20 7.5 20 16.5 12 21 4 16.5 4 7.5 12 3"></polyline>
+              </svg>
+              <span>Strategies</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'journal' %}active{% endif %}" href="/journal">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+              </svg>
+              <span>Journal</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'analytics' %}active{% endif %}" href="/analytics">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="2" x2="12" y2="22"></line>
+                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+              </svg>
+              <span>Analytics</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'scenario-simulator' %}active{% endif %}" href="/scenario-simulator">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+                <polyline points="13 2 13 9 20 9"></polyline>
+              </svg>
+              <span>Scenario</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'safety' %}active{% endif %}" href="/safety">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              </svg>
+              <span>Safety</span>
+            </a>
+            <a class="navlink navlink-vert {% if active_page == 'settings' %}active{% endif %}" href="/settings">
+              <svg class="navlink-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M12 1v6m0 6v6"></path>
+                <path d="M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24"></path>
+                <path d="M1 12h6m6 0h6"></path>
+                <path d="M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"></path>
+              </svg>
+              <span>Settings</span>
+            </a>
           </div>
         </nav>
 
         <div class="sidebar-footer">
-          <button id="themeToggle" class="btn btn-ghost w-full" type="button" title="Toggle dark/light mode">☀️ Dark</button>
-          <select id="langSelect" class="input input-sm w-full" style="font-size:12px; padding:6px 8px;" title="Language">
-            <option value="en" {% if (language or 'en') == 'en' %}selected{% endif %}>English</option>
-            <option value="es" {% if (language or 'en') == 'es' %}selected{% endif %}>Español</option>
-            <option value="zh" {% if (language or 'en') == 'zh' %}selected{% endif %}>中文</option>
-            <option value="ko" {% if (language or 'en') == 'ko' %}selected{% endif %}>한국어</option>
-            <option value="ja" {% if (language or 'en') == 'ja' %}selected{% endif %}>日本語</option>
-          </select>
-          <div id="installPwaBanner" class="pwa-install-banner hidden">
-            <button id="installPwaBtn" class="btn btn-purple w-full">📲 Install App</button>
+          <div id="botSummary" class="status-pill w-full" style="font-size:12px;">Bots: —</div>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <button id="themeToggle" class="btn btn-ghost" type="button" title="Toggle dark/light mode" style="flex:1; font-size:11px; padding:6px;">Dark</button>
+            <select id="langSelect" class="input input-sm" style="font-size:11px; padding:4px 6px; flex:1;" title="Language">
+              <option value="en" {% if (language or 'en') == 'en' %}selected{% endif %}>EN</option>
+              <option value="es" {% if (language or 'en') == 'es' %}selected{% endif %}>ES</option>
+              <option value="zh" {% if (language or 'en') == 'zh' %}selected{% endif %}>ZH</option>
+              <option value="ko" {% if (language or 'en') == 'ko' %}selected{% endif %}>KO</option>
+              <option value="ja" {% if (language or 'en') == 'ja' %}selected{% endif %}>JA</option>
+            </select>
           </div>
-          <div id="botSummary" class="status-pill w-full">Bots: —</div>
-          <button id="pauseAllBtn" class="btn btn-neg w-full">Pause all</button>
+          <div id="installPwaBanner" class="pwa-install-banner hidden">
+            <button id="installPwaBtn" class="btn btn-purple w-full" style="font-size:11px;">Install App</button>
+          </div>
+          <button id="pauseAllBtn" class="btn btn-neg w-full" style="font-size:11px;">Pause all</button>
           {% if request.state.user %}
-            <a class="navlink navlink-vert" href="/logout">Logout</a>
+            <a class="navlink navlink-vert" href="/logout" style="font-size:12px; text-align:center;">Logout</a>
           {% endif %}
         </div>
       </aside>
 
       <main class="main">
+        <div class="topbar-main">
+          <button id="globalSearchBtn" class="global-search-btn" title="Global search (Cmd+K)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.35-4.35"></path>
+            </svg>
+            <span>Search bots, symbols...</span>
+            <kbd>⌘K</kbd>
+          </button>
+          <div class="topbar-right-main">
+            <div class="notification-bell" id="notificationBell">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+              </svg>
+              <span class="notification-badge" id="notificationBadge" style="display:none;">0</span>
+            </div>
+          </div>
+        </div>
         <div class="container">
           {% block content %}{% endblock %}
         </div>
@@ -107,7 +220,98 @@
     </div>
   </div>
 
+  <div id="toastContainer" class="toast-container"></div>
+
+  <div id="globalSearchModal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-search">
+      <input id="globalSearchInput" type="text" placeholder="Search bots, symbols, strategies..." class="global-search-input" autofocus>
+      <div id="globalSearchResults" class="global-search-results"></div>
+    </div>
+  </div>
+
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-confirm">
+      <div class="modal-header">
+        <h3 id="confirmTitle">Confirm action</h3>
+      </div>
+      <div class="modal-body">
+        <p id="confirmMessage"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="confirmCancel" class="btn btn-ghost">Cancel</button>
+        <button id="confirmOk" class="btn btn-purple">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Keyboard Shortcuts Modal -->
+  <div id="keyboardShortcutsModal" class="modal hidden">
+    <div class="modal-backdrop" onclick="closeKeyboardShortcuts()"></div>
+    <div class="modal-content" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3>Keyboard Shortcuts</h3>
+        <button class="btn" onclick="closeKeyboardShortcuts()">Close</button>
+      </div>
+      <div class="modal-body" style="padding: 20px;">
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>?</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Show this keyboard shortcuts list</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>Cmd/Ctrl</kbd> + <kbd>K</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Open global search</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>G</kbd> then <kbd>D</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Go to Dashboard</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>G</kbd> then <kbd>B</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Go to Bots</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>G</kbd> then <kbd>E</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Go to Explore</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>G</kbd> then <kbd>A</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Go to Analytics</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>G</kbd> then <kbd>S</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Go to Settings</div>
+        </div>
+        <div class="shortcut-item" style="margin-bottom: 0;">
+          <div style="font-family: monospace; font-weight: 600; margin-bottom: 4px;"><kbd>Esc</kbd></div>
+          <div style="color: var(--text-secondary); font-size: 13px;">Close modal/dialog</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
+    /* Toast notification system */
+    function showToast(title, message, type, duration) {
+      type = type || 'info';
+      duration = duration || 4000;
+      var icons = { success: '\u2705', error: '\u274C', warning: '\u26A0\uFE0F', info: '\u2139\uFE0F' };
+      var container = document.getElementById('toastContainer');
+      if (!container) return;
+      var toast = document.createElement('div');
+      toast.className = 'toast toast-' + type;
+      toast.innerHTML = '<span class="toast-icon">' + (icons[type] || icons.info) + '</span>'
+        + '<div class="toast-body"><div class="toast-title">' + (title || '') + '</div>'
+        + (message ? '<div class="toast-message">' + message + '</div>' : '')
+        + '</div><button class="toast-close" onclick="this.parentElement.remove()">&times;</button>';
+      container.appendChild(toast);
+      setTimeout(function() {
+        toast.style.animation = 'toast-out 0.3s ease forwards';
+        setTimeout(function() { toast.remove(); }, 300);
+      }, duration);
+    }
+
     window.__API_TOKEN = {{ (api_token or "") | tojson }};
     (function(){
       const _f = window.fetch;
@@ -247,6 +451,228 @@
 
     refreshBotSummary();
     setInterval(refreshBotSummary, 8000);
+
+    /* Global UI utilities */
+    window.__APP_VERSION = "v2.0.0";
+
+    /* Sidebar toggle */
+    const sidebarToggle = document.getElementById("sidebarToggle");
+    const sidebar = document.getElementById("sidebar");
+    if(sidebarToggle && sidebar){
+      sidebarToggle.addEventListener("click", function(){
+        sidebar.classList.toggle("collapsed");
+        localStorage.setItem("sidebarCollapsed", sidebar.classList.contains("collapsed"));
+      });
+      if(localStorage.getItem("sidebarCollapsed") === "true"){
+        sidebar.classList.add("collapsed");
+      }
+    }
+
+    /* Global search modal */
+    const globalSearchModal = document.getElementById("globalSearchModal");
+    const globalSearchBtn = document.getElementById("globalSearchBtn");
+    const globalSearchInput = document.getElementById("globalSearchInput");
+    const globalSearchResults = document.getElementById("globalSearchResults");
+
+    if(globalSearchBtn){
+      globalSearchBtn.addEventListener("click", function(){
+        globalSearchModal.classList.remove("hidden");
+        setTimeout(() => globalSearchInput?.focus(), 0);
+      });
+    }
+
+    if(globalSearchModal){
+      globalSearchModal.addEventListener("click", function(e){
+        if(e.target === globalSearchModal){
+          globalSearchModal.classList.add("hidden");
+        }
+      });
+    }
+
+    if(globalSearchInput){
+      globalSearchInput.addEventListener("keydown", function(e){
+        if(e.key === "Escape"){
+          globalSearchModal.classList.add("hidden");
+        }
+      });
+      globalSearchInput.addEventListener("input", debounce(function(){
+        const q = globalSearchInput.value.trim();
+        if(!q || q.length < 2){
+          globalSearchResults.innerHTML = "";
+          return;
+        }
+        searchBots(q);
+      }, 200));
+    }
+
+    /* Keyboard shortcut Cmd+K or Ctrl+K for search */
+    document.addEventListener("keydown", function(e){
+      if((e.ctrlKey || e.metaKey) && e.key === "k"){
+        e.preventDefault();
+        globalSearchModal.classList.remove("hidden");
+        setTimeout(() => globalSearchInput?.focus(), 0);
+      }
+    });
+
+    function debounce(fn, ms){
+      let timer;
+      return function(...args){
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), ms);
+      };
+    }
+
+    async function searchBots(query){
+      try{
+        const r = await fetch("/api/bots?search=" + encodeURIComponent(query));
+        if(!r.ok) return;
+        const data = await r.json();
+        const bots = data.bots || [];
+        if(!bots.length){
+          globalSearchResults.innerHTML = '<div class="search-empty">No results found</div>';
+          return;
+        }
+        globalSearchResults.innerHTML = bots.map(b => `
+          <a href="/bots/${b.id}" class="search-result" onclick="document.getElementById('globalSearchModal').classList.add('hidden')">
+            <div class="search-result-icon">🤖</div>
+            <div class="search-result-text">
+              <div class="search-result-title">${b.name}</div>
+              <div class="search-result-sub">${b.symbol} • ${b.dry_run ? "DRY" : "LIVE"}</div>
+            </div>
+          </a>
+        `).join("");
+      }catch(e){
+        console.warn("search error", e);
+      }
+    }
+
+    /* Confirmation modal */
+    window.confirmAction = function(title, message, onConfirm){
+      const modal = document.getElementById("confirmModal");
+      const titleEl = document.getElementById("confirmTitle");
+      const msgEl = document.getElementById("confirmMessage");
+      const okBtn = document.getElementById("confirmOk");
+      const cancelBtn = document.getElementById("confirmCancel");
+
+      if(!modal) return;
+      titleEl.textContent = title;
+      msgEl.textContent = message;
+
+      const handleConfirm = function(){
+        modal.classList.add("hidden");
+        okBtn.removeEventListener("click", handleConfirm);
+        cancelBtn.removeEventListener("click", handleCancel);
+        if(onConfirm) onConfirm();
+      };
+      const handleCancel = function(){
+        modal.classList.add("hidden");
+        okBtn.removeEventListener("click", handleConfirm);
+        cancelBtn.removeEventListener("click", handleCancel);
+      };
+
+      okBtn.addEventListener("click", handleConfirm);
+      cancelBtn.addEventListener("click", handleCancel);
+      modal.classList.remove("hidden");
+    };
+
+    /* Notification bell update */
+    const notificationBell = document.getElementById("notificationBell");
+    const notificationBadge = document.getElementById("notificationBadge");
+    setInterval(function(){
+      fetch("/api/activity/unread", _authHeaders()).then(r => r.json()).then(d => {
+        const count = d.count || 0;
+        if(count > 0){
+          notificationBadge.textContent = count > 99 ? "99+" : count;
+          notificationBadge.style.display = "block";
+        } else {
+          notificationBadge.style.display = "none";
+        }
+      }).catch(() => {});
+    }, 5000);
+
+    /* Keyboard Shortcuts */
+    let gPressed = false;
+    let lastGTime = 0;
+    document.addEventListener("keydown", function(e) {
+      // ? = Show keyboard shortcuts
+      if (e.key === "?" || (e.shiftKey && e.key === "/")) {
+        e.preventDefault();
+        openKeyboardShortcuts();
+        return;
+      }
+
+      // Cmd/Ctrl + K = Global search
+      if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+        e.preventDefault();
+        document.getElementById("globalSearchInput").focus();
+        document.getElementById("globalSearchModal").classList.remove("hidden");
+        return;
+      }
+
+      // Esc = Close modals
+      if (e.key === "Escape") {
+        document.getElementById("globalSearchModal").classList.add("hidden");
+        document.getElementById("keyboardShortcutsModal").classList.add("hidden");
+        if (document.getElementById("modal") && !document.getElementById("modal").classList.contains("hidden")) {
+          closeModal();
+        }
+        return;
+      }
+
+      // G = Navigation mode
+      if (e.key === "g" || e.key === "G") {
+        const now = Date.now();
+        if (gPressed && now - lastGTime < 1500) {
+          // Second G press within 1.5s
+          e.preventDefault();
+          gPressed = false;
+          return;
+        }
+        gPressed = true;
+        lastGTime = now;
+        setTimeout(() => { gPressed = false; }, 1500);
+        return;
+      }
+
+      // G + navigation keys
+      if (gPressed && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        switch (e.key.toLowerCase()) {
+          case "d":
+            e.preventDefault();
+            gPressed = false;
+            window.location.href = "/dashboard";
+            break;
+          case "b":
+            e.preventDefault();
+            gPressed = false;
+            window.location.href = "/bots";
+            break;
+          case "e":
+            e.preventDefault();
+            gPressed = false;
+            window.location.href = "/explore";
+            break;
+          case "a":
+            e.preventDefault();
+            gPressed = false;
+            window.location.href = "/analytics";
+            break;
+          case "s":
+            e.preventDefault();
+            gPressed = false;
+            window.location.href = "/settings";
+            break;
+        }
+      }
+    });
+
+    function openKeyboardShortcuts() {
+      document.getElementById("keyboardShortcutsModal").classList.remove("hidden");
+    }
+
+    function closeKeyboardShortcuts() {
+      document.getElementById("keyboardShortcutsModal").classList.add("hidden");
+    }
   </script>
 </body>
 </html>

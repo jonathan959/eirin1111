@@ -22,24 +22,47 @@
   </div>
   </div>
 
-  <!-- Top stats -->
-  <div class="grid grid-3">
-    <div class="card">
+  <!-- Top stats in hero cards -->
+  <div class="grid grid-4">
+    <div class="card card-stat">
       <div class="card-label">Status</div>
       <div id="statusBox" class="card-value">Loading…</div>
       <div class="card-sub muted" id="statusSub">—</div>
     </div>
 
-    <div class="card">
-      <div class="card-label">Last price</div>
+    <div class="card card-stat">
+      <div class="card-label">Last Price</div>
       <div id="priceBox" class="card-value">—</div>
       <div class="card-sub muted">Live from snapshot</div>
     </div>
 
-    <div class="card">
-      <div class="card-label">Symbol</div>
-      <div id="symbolBox" class="card-value mono">{{ bot.symbol }}</div>
-      <div class="card-sub muted" id="symbolSub">Validated via Kraken markets</div>
+    <div class="card card-stat">
+      <div class="card-label" title="Profit and Loss - the total money gained or lost on this position">P&L ($)</div>
+      <div id="pnlQuoteBox" class="card-value mono">—</div>
+      <div class="card-sub muted" id="pnlBadge">—</div>
+    </div>
+
+    <div class="card card-stat">
+      <div class="card-label" title="Percentage of closed deals that were profitable">Win Rate</div>
+      <div id="winRateStatBox" class="card-value">—</div>
+      <div class="card-sub muted">Closed deals</div>
+    </div>
+  </div>
+
+  <!-- Bot Health Score -->
+  <div class="card section" style="background: linear-gradient(135deg, rgba(79,70,229,.08) 0%, transparent 100%);">
+    <div class="row gap-12 row-wrap row-between">
+      <div>
+        <div class="h2">Bot Health Score</div>
+        <div class="muted">Overall performance health and readiness</div>
+      </div>
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div style="text-align:right;">
+          <div style="font-size:32px; font-weight:900; color:var(--accent);" id="healthScore">—</div>
+          <div class="muted" style="font-size:12px;">out of 100</div>
+        </div>
+        <div id="healthGauge" class="health-gauge"></div>
+      </div>
     </div>
   </div>
 
@@ -57,6 +80,7 @@
   <div class="card section">
     <div class="row gap-12 row-wrap">
       <span id="statusTag" class="tag">Loading…</span>
+      <span class="regime-indicator" id="regimeIndicator" style="display:none;"></span>
       <span class="muted">Next: <span class="mono" id="nextActionHeader">—</span></span>
       <span class="muted">Cooldown: <span class="mono" id="cooldownHeader">—</span></span>
     </div>
@@ -67,7 +91,16 @@
     </div>
   </div>
 
-  <div class="grid bot-layout bot-layout-narrow section">
+  <!-- Tabbed Interface -->
+  <div class="tab-group">
+    <button class="tab-button active" data-tab="overview">Overview</button>
+    <button class="tab-button" data-tab="strategy">Strategy</button>
+    <button class="tab-button" data-tab="orders">Orders</button>
+    <button class="tab-button" data-tab="analytics">Analytics</button>
+    <button class="tab-button" data-tab="logs">Logs</button>
+  </div>
+
+  <div class="grid bot-layout bot-layout-narrow section" id="tab-overview" style="display:grid;">
     <div class="bot-main">
       <!-- Chart -->
       <div class="card">
@@ -82,19 +115,28 @@
 
           <div class="row gap-8 row-wrap row-end">
             <select id="tf" class="input input-sm w-140">
-              <option value="1m">1min</option>
-              <option value="5m" selected>5min</option>
-              <option value="15m">15min</option>
-              <option value="30m">30min</option>
-              <option value="1h">1h</option>
-              <option value="4h">4h</option>
-              <option value="1d">1d</option>
+              <option value="1h">1H</option>
+              <option value="4h">4H</option>
+              <option value="1d" selected>1D</option>
+              <option value="1w">1W</option>
+              <option value="1M">1M</option>
             </select>
             <button id="chartRefresh" class="btn">Refresh</button>
           </div>
         </div>
 
+        <div class="row gap-8 row-wrap mb-8" id="chartControls">
+          <button class="chip" data-toggle="ema" title="EMA 20/50/200">EMA</button>
+          <button class="chip" data-toggle="bb" title="Bollinger Bands">BB</button>
+          <button class="chip" data-toggle="rsi" title="RSI (14)">RSI</button>
+          <button class="chip" data-toggle="macd" title="MACD">MACD</button>
+          <button class="chip" data-toggle="vol" title="Volume">Vol</button>
+          <button class="chip" id="chartFullscreen" title="Fullscreen">⛶</button>
+        </div>
+
         <div id="tvChart" class="chart-candle"></div>
+        <div id="tvChartRSI" class="chart-rsi hidden"></div>
+        <div id="tvChartMACD" class="chart-macd hidden"></div>
 
         <div class="muted text-xs mt-8">
           Green/Red markers = live, Purple = dry run. If Kraken isn’t ready, chart will show an error instead of staying blank.
@@ -128,6 +170,15 @@
           <div>
             <div class="card-label">Avg entry</div>
             <div class="card-value mono" id="avgEntryBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Unrealized PnL ($)</div>
+            <div class="card-value mono" id="uPnlQuoteBox">—</div>
+          </div>
+          <div>
+            <div class="card-label">Unrealized PnL (%)</div>
+            <div class="card-value mono" id="uPnlPctBox">—</div>
+            <div class="card-sub" id="uPnlBadge" style="display:none;font-weight:700;font-size:13px;margin-top:4px;">—</div>
           </div>
           <div>
             <div class="card-label">TP target</div>
@@ -253,8 +304,22 @@
           <button class="btn btn-purple" onclick="startBot({{ bot.id }})">Start Bot</button>
           <button class="btn" onclick="stopBot({{ bot.id }})">Stop Bot</button>
           <button class="btn btn-neg" id="btnClosePosition" onclick="closePosition({{ bot.id }})" title="Sell full position and close deal">Close Position</button>
+          <button class="btn" onclick="openAddFundsModal()" title="Add more capital to this bot">Add Funds</button>
           <a class="btn" href="/dca">DCA Dashboard</a>
           <a class="btn" href="/bots">All Bots</a>
+        </div>
+      </div>
+
+      <!-- Entry Confirmation Panel -->
+      <div class="card section" id="entryConfirmationCard" style="display:none;">
+        <div class="card-head">
+          <div>
+            <div class="h2">Entry Status</div>
+            <div class="muted">Why the bot hasn't entered yet</div>
+          </div>
+        </div>
+        <div id="entryConfirmationContent" class="text-sm">
+          <div class="muted">Loading entry conditions...</div>
         </div>
       </div>
 
@@ -389,6 +454,55 @@
     </div>
   </div>
 
+</div>
+
+<!-- Add Funds Modal -->
+<div id="addFundsModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1100; align-items:center; justify-content:center;">
+  <div style="background:var(--panel, #1e222d); padding:24px; border-radius:12px; width:380px; border:1px solid var(--border, #2a2e39);">
+    <h3 style="margin-top:0; color:var(--text, #d1d4dc);">Add Funds to Bot</h3>
+    
+    <div style="margin-bottom:16px;">
+      <div class="card-label">Current Investment</div>
+      <div class="mono" id="currentInvestment" style="font-size:18px; font-weight:600;">$—</div>
+    </div>
+    
+    <div style="margin-bottom:16px;">
+      <label style="display:block; color:var(--muted, #787b86); margin-bottom:8px; font-size:13px;">Additional Amount (USD)</label>
+      <input type="number" id="addFundsAmount" value="50" min="5" step="5"
+        style="width:100%; padding:10px; background:var(--bg, #131722); border:1px solid var(--border, #2a2e39); color:var(--text, #d1d4dc); border-radius:6px;">
+      <div style="font-size:11px; color:var(--muted, #787b86); margin-top:4px;">
+        This will increase the bot's investment amount and scale safety order sizes.
+      </div>
+    </div>
+    
+    <div id="addSafetyOrdersRow" style="margin-bottom:16px; display:none;">
+      <div style="padding:12px; background:rgba(8,153,129,0.1); border-radius:8px; border:1px solid rgba(8,153,129,0.3);">
+        <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
+          <input type="checkbox" id="chkAddSafetyOrders" style="accent-color:#089981;">
+          <span style="color:var(--text, #d1d4dc); font-size:13px;">
+            Add <strong id="additionalSoCount">0</strong> more safety orders
+          </span>
+        </label>
+        <div style="font-size:11px; color:var(--muted, #787b86); margin-top:4px; margin-left:26px;">
+          The additional capital can support more safety orders for better DCA.
+        </div>
+      </div>
+    </div>
+    
+    <div style="margin-bottom:16px; padding:12px; background:var(--bg, #131722); border-radius:8px;">
+      <div class="card-label">New Total Investment</div>
+      <div class="mono" id="newTotalInvestment" style="font-size:18px; font-weight:600; color:#089981;">$—</div>
+    </div>
+    
+    <div style="display:flex; gap:10px;">
+      <button onclick="closeAddFundsModal()"
+        style="flex:1; padding:12px; background:none; border:1px solid var(--border, #2a2e39); color:var(--muted, #787b86); border-radius:6px; cursor:pointer;">Cancel</button>
+      <button onclick="confirmAddFunds()"
+        style="flex:1; padding:12px; background:#089981; border:none; color:#fff; border-radius:6px; cursor:pointer; font-weight:600;">Add Funds</button>
+    </div>
+    
+    <div id="addFundsMsg" class="muted text-xs mt-8"></div>
+  </div>
 </div>
 
 <!-- ===== Live status/deals/logs JS (kept). Chart JS is moved to /static/bot_chart.js ===== -->
@@ -604,6 +718,49 @@
     if (dealIdBox) dealIdBox.textContent = snap.deal_id || "—";
     if (tpPriceBox) tpPriceBox.textContent = snap.tp_price != null ? Number(snap.tp_price).toFixed(2) : "—";
     if (posBox) posBox.textContent = snap.base_pos != null ? Number(snap.base_pos).toFixed(8) : "—";
+
+    var uPnlQuoteBox = $("uPnlQuoteBox");
+    var uPnlPctBox = $("uPnlPctBox");
+    var uPnlBadge = $("uPnlBadge");
+    var upQ = snap.unrealized_pnl_quote;
+    var upP = snap.unrealized_pnl_pct;
+    if (upQ == null || upP == null) {
+      var ae = Number(snap.avg_entry || 0);
+      var bp = Number(snap.base_pos || 0);
+      var lp = Number(snap.last_price || 0);
+      if (ae > 0 && bp > 0 && lp > 0) {
+        upQ = (lp - ae) * bp;
+        upP = ((lp / ae) - 1.0) * 100.0;
+      }
+    }
+    if (upQ != null && upP != null) {
+      var sign = upQ >= 0 ? "+" : "";
+      if (uPnlQuoteBox) {
+        uPnlQuoteBox.textContent = sign + Number(upQ).toFixed(2);
+        uPnlQuoteBox.className = "card-value mono " + (upQ >= 0 ? "pos" : "neg");
+      }
+      if (uPnlPctBox) {
+        uPnlPctBox.textContent = sign + Number(upP).toFixed(2) + "%";
+        uPnlPctBox.className = "card-value mono " + (upP >= 0 ? "pos" : "neg");
+      }
+      if (uPnlBadge) {
+        uPnlBadge.style.display = "inline-block";
+        if (upQ > 0) {
+          uPnlBadge.textContent = "▲ UP";
+          uPnlBadge.style.color = "var(--success)";
+        } else if (upQ < 0) {
+          uPnlBadge.textContent = "▼ DOWN";
+          uPnlBadge.style.color = "var(--danger)";
+        } else {
+          uPnlBadge.textContent = "— FLAT";
+          uPnlBadge.style.color = "var(--muted)";
+        }
+      }
+    } else {
+      if (uPnlQuoteBox) { uPnlQuoteBox.textContent = "—"; uPnlQuoteBox.className = "card-value mono muted"; }
+      if (uPnlPctBox) { uPnlPctBox.textContent = "—"; uPnlPctBox.className = "card-value mono muted"; }
+      if (uPnlBadge) uPnlBadge.style.display = "none";
+    }
   }
 
   function setDataHealthUI(dh){
@@ -802,11 +959,12 @@
     body.innerHTML = deals.map(d => {
       const pnl = d.realized_pnl_quote == null ? null : Number(d.realized_pnl_quote);
       const pnlClass = pnl == null ? "muted" : (pnl > 0 ? "pos" : pnl < 0 ? "neg" : "muted");
+      const pnlSign = pnl > 0 ? "+" : "";
       return `
         <tr>
           <td class="mono">${d.id}</td>
           <td class="mono">${d.state}</td>
-          <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnl.toFixed(2)}</td>
+          <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnlSign + pnl.toFixed(2)}</td>
         </tr>
       `;
     }).join("");
@@ -936,11 +1094,12 @@
         body.innerHTML = deals.map(d => {
           const pnl = d.realized_pnl_quote == null ? null : Number(d.realized_pnl_quote);
           const pnlClass = pnl == null ? "muted" : (pnl > 0 ? "pos" : pnl < 0 ? "neg" : "muted");
+          const pnlSign = pnl > 0 ? "+" : "";
           return `
             <tr>
               <td class="mono">${d.id}</td>
               <td class="mono">${d.state}</td>
-              <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnl.toFixed(2)}</td>
+              <td class="right mono ${pnlClass}">${pnl == null ? "—" : pnlSign + pnl.toFixed(2)}</td>
               <td class="right"><a class="btn" href="/deals/${d.id}">View</a></td>
             </tr>
           `;
@@ -1177,6 +1336,289 @@
   setInterval(() => {
     refreshLive().catch(e => console.error(e));
   }, 10000);
+
+  // ═══ Add Funds Modal ═══
+  let _currentBotConfig = null;
+  
+  function openAddFundsModal() {
+    const modal = document.getElementById('addFundsModal');
+    const currentEl = document.getElementById('currentInvestment');
+    const newTotalEl = document.getElementById('newTotalInvestment');
+    const amountInput = document.getElementById('addFundsAmount');
+    
+    // Fetch current bot config
+    getJSON(`/api/bots/${BOT_ID}`).then(data => {
+      if (data.ok && data.bot) {
+        _currentBotConfig = data.bot;
+        const current = parseFloat(data.bot.max_spend_quote || data.bot.base_quote || 0);
+        if (currentEl) currentEl.textContent = '$' + current.toFixed(2);
+        updateNewTotal();
+      }
+    }).catch(e => {
+      console.error('Failed to fetch bot config:', e);
+    });
+    
+    if (modal) modal.style.display = 'flex';
+  }
+  
+  function closeAddFundsModal() {
+    const modal = document.getElementById('addFundsModal');
+    if (modal) modal.style.display = 'none';
+  }
+  
+  function updateNewTotal() {
+    const currentEl = document.getElementById('currentInvestment');
+    const newTotalEl = document.getElementById('newTotalInvestment');
+    const amountInput = document.getElementById('addFundsAmount');
+    const soRow = document.getElementById('addSafetyOrdersRow');
+    const soCountEl = document.getElementById('additionalSoCount');
+    
+    const current = _currentBotConfig ? parseFloat(_currentBotConfig.max_spend_quote || _currentBotConfig.base_quote || 0) : 0;
+    const add = parseFloat(amountInput?.value || 0);
+    const newTotal = current + add;
+    
+    if (newTotalEl) newTotalEl.textContent = '$' + newTotal.toFixed(2);
+    
+    // Check if additional safety orders could be added
+    if (_currentBotConfig) {
+      const currentSo = parseInt(_currentBotConfig.max_safety || 3);
+      const safetyQuote = parseFloat(_currentBotConfig.safety_quote || 10);
+      const baseQuote = parseFloat(_currentBotConfig.base_quote || 20);
+      
+      // Calculate how many more safety orders could be supported
+      const additionalSoCapacity = Math.floor(add / safetyQuote);
+      
+      if (additionalSoCapacity >= 1 && soRow && soCountEl) {
+        soRow.style.display = 'block';
+        soCountEl.textContent = additionalSoCapacity;
+      } else if (soRow) {
+        soRow.style.display = 'none';
+      }
+    }
+  }
+  
+  // Bind input change
+  document.getElementById('addFundsAmount')?.addEventListener('input', updateNewTotal);
+  
+  async function confirmAddFunds() {
+    const amountInput = document.getElementById('addFundsAmount');
+    const msgEl = document.getElementById('addFundsMsg');
+    const chkAddSo = document.getElementById('chkAddSafetyOrders');
+    const soCountEl = document.getElementById('additionalSoCount');
+    
+    const addAmount = parseFloat(amountInput?.value || 0);
+    if (addAmount < 5) {
+      if (msgEl) msgEl.textContent = 'Amount must be at least $5';
+      return;
+    }
+    
+    if (msgEl) msgEl.textContent = 'Processing...';
+    
+    try {
+      const payload = { amount: addAmount };
+      if (chkAddSo?.checked && soCountEl) {
+        payload.add_safety_orders = parseInt(soCountEl.textContent || 0);
+      }
+      
+      const data = await getJSON(`/api/bots/${BOT_ID}/add_funds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      if (data.ok) {
+        if (msgEl) msgEl.textContent = 'Funds added successfully!';
+        setTimeout(() => {
+          closeAddFundsModal();
+          refreshLive();
+        }, 1500);
+      } else {
+        if (msgEl) msgEl.textContent = 'Error: ' + (data.error || 'Unknown error');
+      }
+    } catch (e) {
+      if (msgEl) msgEl.textContent = 'Failed: ' + (e.message || e);
+    }
+  }
+
+  // ═══ Entry Confirmation Indicator ═══
+  function updateEntryConfirmation(snap, logs) {
+    const card = document.getElementById('entryConfirmationCard');
+    const content = document.getElementById('entryConfirmationContent');
+    if (!card || !content) return;
+    
+    // Only show if bot has no position
+    const hasPosition = snap && (snap.base_pos > 0 || snap.position_size > 0);
+    if (hasPosition) {
+      card.style.display = 'none';
+      return;
+    }
+    
+    // Check recent logs for entry-related messages
+    const entryReasons = [];
+    const recentLogs = (logs || []).slice(-50);
+    
+    for (const log of recentLogs) {
+      const msg = (log.message || '').toLowerCase();
+      
+      if (msg.includes('entry not confirmed') || msg.includes('not suitable for entry')) {
+        // Parse specific conditions
+        if (msg.includes('trend follow entry not confirmed')) {
+          entryReasons.push({
+            condition: 'Trend Follow Entry',
+            status: 'waiting',
+            detail: 'Waiting for higher timeframe (4H) and lower timeframe (1H) trends to align. Requires EMA12 > EMA26 on both timeframes with ADX ≥ 18.'
+          });
+        }
+        if (msg.includes('regime') && msg.includes('risk_off')) {
+          entryReasons.push({
+            condition: 'Market Regime',
+            status: 'blocked',
+            detail: 'Risk-Off regime detected. The strategy is pausing entries until market conditions improve.'
+          });
+        }
+        if (msg.includes('regime') && msg.includes('not suitable')) {
+          entryReasons.push({
+            condition: 'Market Regime',
+            status: 'waiting',
+            detail: 'Current market regime is not suitable for this strategy. Waiting for regime change.'
+          });
+        }
+      }
+      
+      if (msg.includes('cooldown')) {
+        entryReasons.push({
+          condition: 'Cooldown Active',
+          status: 'waiting',
+          detail: 'Bot is in cooldown period after recent activity. Will resume after cooldown expires.'
+        });
+      }
+      
+      if (msg.includes('not enough data')) {
+        entryReasons.push({
+          condition: 'Insufficient Data',
+          status: 'blocked',
+          detail: 'Not enough historical candles for analysis. Waiting for more market data.'
+        });
+      }
+      
+      if (msg.includes('range') && msg.includes('invalidated')) {
+        entryReasons.push({
+          condition: 'Range Strategy',
+          status: 'waiting',
+          detail: 'Range invalidated by strong trend or volatility. Waiting for range conditions to return.'
+        });
+      }
+    }
+    
+    // Check decision_reason from snapshot
+    const decisionReason = snap?.decision_reason || '';
+    if (decisionReason && !hasPosition) {
+      const reason = decisionReason.toLowerCase();
+      if (reason.includes('hold') || reason.includes('wait') || reason.includes('not confirmed')) {
+        if (!entryReasons.some(r => r.condition === 'Strategy Decision')) {
+          entryReasons.push({
+            condition: 'Strategy Decision',
+            status: 'waiting',
+            detail: decisionReason
+          });
+        }
+      }
+    }
+    
+    // Show the card if we have reasons
+    if (entryReasons.length > 0) {
+      card.style.display = 'block';
+      content.innerHTML = entryReasons.map(r => `
+        <div style="margin-bottom:10px; padding:10px; background:var(--bg, #131722); border-radius:6px; border-left:3px solid ${r.status === 'blocked' ? '#f23645' : '#eab308'};">
+          <div style="font-weight:600; color:var(--text, #d1d4dc); margin-bottom:4px;">
+            ${r.status === 'blocked' ? '🚫' : '⏳'} ${r.condition}
+          </div>
+          <div style="font-size:12px; color:var(--muted, #787b86);">${r.detail}</div>
+        </div>
+      `).join('');
+    } else if (!hasPosition) {
+      card.style.display = 'block';
+      content.innerHTML = `
+        <div style="padding:10px; background:var(--bg, #131722); border-radius:6px; border-left:3px solid #089981;">
+          <div style="font-weight:600; color:#089981; margin-bottom:4px;">✓ Ready to Enter</div>
+          <div style="font-size:12px; color:var(--muted, #787b86);">Bot is monitoring for entry signals.</div>
+        </div>
+      `;
+    } else {
+      card.style.display = 'none';
+    }
+  }
+  
+  // Hook into refreshLive to update entry confirmation
+  const _originalRefreshLive = refreshLive;
+  refreshLive = async function() {
+    const result = await _originalRefreshLive.apply(this, arguments);
+    if (result) {
+      updateEntryConfirmation(result.snap, result.logs);
+      updateHealthScore(result.snap);
+      updateRegimeIndicator(result.snap);
+    }
+    return result;
+  };
+
+  /* Tab switching */
+  document.querySelectorAll(".tab-button").forEach(btn => {
+    btn.addEventListener("click", function(){
+      const tabName = this.dataset.tab;
+      document.querySelectorAll(".tab-button").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll("[id^='tab-']").forEach(t => t.style.display = "none");
+      this.classList.add("active");
+      const tabEl = document.getElementById("tab-" + tabName);
+      if(tabEl) tabEl.style.display = "grid";
+    });
+  });
+  if(document.querySelectorAll(".tab-button").length > 0){
+    document.querySelector(".tab-button").classList.add("active");
+  }
+
+  /* Health score calculation */
+  function updateHealthScore(snap){
+    if(!snap) return;
+    let score = 50; // base score
+
+    // Status: running = +20, stopped = -10
+    if(snap.running) score += 20; else score -= 10;
+
+    // PnL: positive = +15, negative = -15
+    const upnl = snap.unrealized_pnl_quote || 0;
+    if(upnl > 0) score += 15; else if(upnl < 0) score -= 15;
+
+    // Win rate: > 50% = +10, < 40% = -10
+    if(snap.win_rate){
+      if(snap.win_rate > 0.5) score += 10;
+      else if(snap.win_rate < 0.4) score -= 10;
+    }
+
+    // Risk state: ok = +5, warn = -5, crit = -15
+    if(snap.risk_state === "ok") score += 5;
+    else if(snap.risk_state === "warn") score -= 5;
+    else if(snap.risk_state === "crit") score -= 15;
+
+    // No trades yet: -10
+    if(!snap.total_deals) score -= 10;
+
+    score = Math.max(0, Math.min(100, score));
+    document.getElementById("healthScore").textContent = Math.round(score);
+  }
+
+  function updateRegimeIndicator(snap){
+    if(!snap || !snap.regime_label) return;
+    const indicator = document.getElementById("regimeIndicator");
+    const regime = (snap.regime_label || "").toLowerCase();
+
+    indicator.style.display = "inline-flex";
+    indicator.className = "regime-indicator";
+    indicator.textContent = "Regime: " + snap.regime_label;
+
+    if(regime.includes("uptrend") || regime.includes("up")) indicator.classList.add("uptrend");
+    else if(regime.includes("downtrend") || regime.includes("down")) indicator.classList.add("downtrend");
+    else indicator.classList.add("ranging");
+  }
 </script>
 
 <!-- ===== Chart scripts (single include, single init) ===== -->

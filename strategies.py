@@ -49,10 +49,18 @@ def safe_float(x, default: float = 0.0) -> float:
 # =========================
 # Indicators
 # =========================
+def _clean_values(values: List[float]) -> List[float]:
+    """Filter out NaN and Inf values from a list of floats."""
+    return [v for v in values if not (math.isnan(v) or math.isinf(v))]
+
+
 def sma(values: List[float], n: int) -> Optional[float]:
     if n <= 0 or len(values) < n:
         return None
-    return sum(values[-n:]) / n
+    window = _clean_values(values[-n:])
+    if len(window) < n:
+        return None
+    return sum(window) / n
 
 
 def ema(values: List[float], n: int) -> Optional[float]:
@@ -61,9 +69,12 @@ def ema(values: List[float], n: int) -> Optional[float]:
     """
     if n <= 0 or len(values) < n:
         return None
+    clean = _clean_values(values)
+    if len(clean) < n:
+        return None
     k = 2.0 / (n + 1.0)
-    e = values[0]
-    for v in values[1:]:
+    e = clean[0]
+    for v in clean[1:]:
         e = (v * k) + (e * (1.0 - k))
     return float(e)
 
@@ -71,11 +82,14 @@ def ema(values: List[float], n: int) -> Optional[float]:
 def ema_series(values: List[float], n: int) -> List[float]:
     if n <= 0 or not values:
         return []
+    clean = _clean_values(values)
+    if not clean:
+        return []
     k = 2.0 / (n + 1.0)
     out = []
-    e = values[0]
+    e = clean[0]
     out.append(float(e))
-    for v in values[1:]:
+    for v in clean[1:]:
         e = (v * k) + (e * (1.0 - k))
         out.append(float(e))
     return out
@@ -84,10 +98,13 @@ def ema_series(values: List[float], n: int) -> List[float]:
 def rsi(values: List[float], n: int = 14) -> Optional[float]:
     if n <= 0 or len(values) < n + 1:
         return None
+    clean = _clean_values(values)
+    if len(clean) < n + 1:
+        return None
     gains = []
     losses = []
     for i in range(-n, 0):
-        diff = values[i] - values[i - 1]
+        diff = clean[i] - clean[i - 1]
         if diff >= 0:
             gains.append(diff)
             losses.append(0.0)
@@ -137,7 +154,9 @@ def adx(candles: List[List[float]], n: int = 14) -> Optional[float]:
 def bollinger(values: List[float], n: int = 20, k: float = 2.0) -> Optional[Tuple[float, float, float, float]]:
     if n <= 0 or len(values) < n:
         return None
-    window = values[-n:]
+    window = _clean_values(values[-n:])
+    if len(window) < n:
+        return None
     mid = sum(window) / n
     st = statistics.pstdev(window)
     upper = mid + (k * st)
@@ -616,13 +635,13 @@ def _detect_regime_impl(closes: List[float], candles: List[List[float]]) -> Regi
             why.extend(["adx_low", "bb_squeeze"])
             confidence = max(confidence, 0.68)
 
-    # Risk off if extreme drawdown or missing indicators
+    # Insufficient history: default to RANGING (not RISK_OFF — that kills scores)
     if atr14 is None or sma200 is None:
-        regime = "RISK_OFF"
-        legacy = "HIGH_VOLATILITY"
+        if regime in ("", None):
+            regime = "RANGING"
+            legacy = "RANGE"
         why.append("insufficient_history")
         confidence = min(confidence, 0.4)
-        high_vol_score = max(high_vol_score, 0.6)
 
     snapshot = {
         "price": price,

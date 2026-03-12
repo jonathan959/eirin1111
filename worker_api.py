@@ -7,6 +7,8 @@ import threading
 import re
 import json
 import logging
+import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 # =========================================================
 # Env loader: MUST RUN BEFORE importing KrakenClient/BotManager
 # =========================================================
-from env_utils import load_env
+from env_utils import load_env, get_last_load_result
 load_env()
 
 # NOW import project modules that may read env vars
@@ -52,6 +54,7 @@ from db import (
     add_order_event,
     save_recommendation_snapshot,
     list_recommendations,
+    count_recommendations_by_horizon,
     get_recommendation,
     link_recommendation_to_bot,
     get_recommendation_performance_stats,
@@ -112,6 +115,7 @@ _thread_started: Dict[str, bool] = {}
 _thread_start_lock = threading.Lock()
 _last_portfolio_ts: float = 0.0
 _last_reco_short_ts: float = 0.0
+_last_reco_medium_ts: float = 0.0
 _last_reco_long_ts: float = 0.0
 
 kc: Optional[KrakenClient] = None
@@ -140,10 +144,13 @@ _STARTUP_STATUS: Dict[str, Any] = {
     "alpaca_ready": False, "alpaca_buying_power": 0.0,
     "websocket_status": "not_ready", "autopilot_enabled": False, "autopilot_bots": 0,
     "candle_test": None,
+    "env_loaded_paths": [], "db_path": None, "kraken_ready": False, "bm_ready": False,
+    "last_startup_error": None, "timestamp": None,
 }
 
 PORT_HISTORY: List[Dict[str, Any]] = []
 PORT_EVERY_SEC = int(os.getenv("PORT_EVERY_SEC", "60"))
+_last_portfolio_cleanup_ts: float = 0.0
 
 _MARKETS_CACHE: Dict[str, Any] = {"ts": 0.0, "markets": None}
 MARKETS_TTL_SEC = int(os.getenv("MARKETS_TTL_SEC", "300"))  # 5 minutes
@@ -211,17 +218,33 @@ if _ALPACA_KEYS_PRESENT:
         # Industrial / energy
         "BA", "F", "GM", "XOM", "CVX",
     ])
-RECO_MAX_SYMBOLS = int(os.getenv("RECO_MAX_SYMBOLS", "300"))
+RECO_MAX_SYMBOLS = int(os.getenv("RECO_MAX_SYMBOLS", "600"))
 RECO_SHORT_EVERY_SEC = int(os.getenv("RECO_SHORT_EVERY_SEC", "900"))  # 15m
+RECO_MEDIUM_EVERY_SEC = int(os.getenv("RECO_MEDIUM_EVERY_SEC", "1800"))  # 30m
 RECO_LONG_EVERY_SEC = int(os.getenv("RECO_LONG_EVERY_SEC", "3600"))   # 60m
 RECO_SHORT_MIN_DAYS = int(os.getenv("RECO_SHORT_MIN_DAYS", "90"))
+RECO_MEDIUM_MIN_DAYS = int(os.getenv("RECO_MEDIUM_MIN_DAYS", "135"))
 RECO_LONG_MIN_DAYS = int(os.getenv("RECO_LONG_MIN_DAYS", "180"))
 RECO_LONG_MIN_WEEKS = int(os.getenv("RECO_LONG_MIN_WEEKS", "52"))
+RECO_CRYPTO_TOP_30_ONLY = os.getenv("RECO_CRYPTO_TOP_30_ONLY", "0").strip().lower() in ("1", "true", "yes", "y", "on")
 RECO_MAX_SPREAD_PCT = float(os.getenv("RECO_MAX_SPREAD_PCT", "0.004"))
 RECO_MAX_ATR_PCT_SHORT = float(os.getenv("RECO_MAX_ATR_PCT_SHORT", "0.06"))
 RECO_ATR_PCT_MODERATE = float(os.getenv("RECO_ATR_PCT_MODERATE", "0.035"))
-_RECO_STATE: Dict[str, Dict[str, Any]] = {"short": {}, "long": {}}
+_RECO_STATE: Dict[str, Dict[str, Any]] = {"short": {}, "medium": {}, "long": {}}
 _RECO_OHLCV_CACHE: Dict[str, Dict[str, Any]] = {}
+_OHLCV_CACHE_MAX_ENTRIES = int(os.getenv("OHLCV_CACHE_MAX_ENTRIES", "2000"))
+_OHLCV_CACHE_EVICT_AGE_SEC = 3600
+_SCAN_PROGRESS: Dict[str, Any] = {
+    "current_symbol": "",
+    "current_horizon": "",
+    "scan_start_ts": 0,
+    "recent_errors": [],
+    "buy_signals_found": 0,
+    "scan_history": [],
+}
+_SCAN_HISTORY_MAX = 10
+SCAN_PARALLEL_WORKERS = int(os.getenv("SCAN_PARALLEL_WORKERS", "8"))
+_SCAN_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 # Exclude fiat FX pairs from crypto universe (e.g., AUD/USD, EUR/USD)
 FIAT_BASES = {
@@ -230,15 +253,54 @@ FIAT_BASES = {
     "KRW", "PLN", "CZK", "DKK",
 }
 
+# Stablecoins and pegged assets - never appear as buy picks (no price upside)
+STABLECOINS = {"DAI", "BUSD", "TUSD", "USDP", "FRAX", "GUSD", "USDD", "LUSD", "sUSD", "CUSD"}
+CRYPTO_BLOCKLIST_STABLECOINS = STABLECOINS
+
+# Top 50 cryptocurrencies - expanded for better coverage
+# Kraken uses XBT for Bitcoin; we include both BTC and XBT in bases so both pass.
+_TOP_30_BASES_RAW = [
+    "XBT", "ETH", "SOL", "XRP", "ADA", "AVAX", "DOGE", "DOT", "LINK", "MATIC",
+    "UNI", "LTC", "ATOM", "BCH", "ALGO", "XLM", "ICP", "FIL", "VET", "SAND",
+    "MANA", "AXS", "THETA", "EOS", "AAVE", "MKR", "SNX", "COMP", "YFI", "SUSHI",
+    "NEAR", "APT", "ARB", "OP", "IMX", "GRT", "FTM", "CRV", "LDO", "RPL",
+    "RUNE", "INJ", "TIA", "SEI", "SUI", "RENDER", "FET", "OCEAN", "AGIX", "TAO",
+]
+TOP_30_CRYPTO = [f"{b}/USD" for b in _TOP_30_BASES_RAW]
+# Include BTC as alias for XBT (e.g. BTC/USD from other exchanges)
+TOP_30_CRYPTO_BASES = frozenset(b.upper() for b in _TOP_30_BASES_RAW) | {"BTC"}
+
+
+def _crypto_base_from_symbol(sym: str) -> str:
+    """Extract base from BTC/USD, XBT/USD, BTCUSD, BTC-USD, or plain BTC."""
+    s = (sym or "").strip().upper()
+    if not s:
+        return ""
+    if "/" in s:
+        return (s.split("/")[0] or "").strip()
+    if "-" in s:
+        return (s.split("-")[0] or "").strip()
+    for suffix in ("USD", "USDT", "USDC"):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)].strip()
+    return s
+
+# Min liquidity filters for picks (env overridable)
+RECO_MIN_MARKET_CAP = float(os.getenv("RECO_MIN_MARKET_CAP", "50000000"))   # $50M
+RECO_MIN_VOLUME_24H = float(os.getenv("RECO_MIN_VOLUME_24H", "100000"))    # $100K
+RECO_MIN_SCORE_SHORT = float(os.getenv("RECO_MIN_SCORE_SHORT", "45"))
+RECO_MIN_SCORE_MEDIUM = float(os.getenv("RECO_MIN_SCORE_MEDIUM", "40"))
+RECO_MIN_SCORE_LONG = float(os.getenv("RECO_MIN_SCORE_LONG", "42"))
+
 # Crypto bases never recommended (not on Kraken spot or problematic)
 # STABLE: L1 token with long downtrend, poor profit potential; stablecoin-like names
 # Extend via env: RECO_CRYPTO_BLOCKLIST=TOKEN1,TOKEN2,TOKEN3
 # BLOCK_MEME_COINS=1 adds meme coins; DEGEN_MODE=1 disables meme blocking
-_default_blocklist = {"STABLE", "UST", "USTC", "LUNA2", "LUNA"}  # downtrend / dead / misleading
+_default_blocklist = {"STABLE", "UST", "USTC", "LUNA2", "LUNA"} | STABLECOINS  # downtrend / dead / misleading
 _env_blocklist = os.getenv("RECO_CRYPTO_BLOCKLIST", "")
 _meme_block = set()
-if os.getenv("BLOCK_MEME_COINS", "1").strip().lower() in ("1", "true", "yes") and os.getenv("DEGEN_MODE", "0").strip().lower() not in ("1", "true", "yes"):
-    _meme_block = {"DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BRETT", "POPCAT", "TURBO", "WOJAK", "BOME"}
+if os.getenv("BLOCK_MEME_COINS", "0").strip().lower() in ("1", "true", "yes") and os.getenv("DEGEN_MODE", "0").strip().lower() not in ("1", "true", "yes"):
+    _meme_block = {"SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BRETT", "POPCAT", "TURBO", "WOJAK", "BOME"}
 CRYPTO_BLOCKLIST: set = _default_blocklist | _meme_block | {x.strip().upper() for x in _env_blocklist.split(",") if x.strip()}
 
 # Optional API protection (recommended for real money)
@@ -251,9 +313,9 @@ RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 _RATE_LIMIT_STORE: Dict[str, List[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
 
-RECO_SCAN_MAX_PER_RUN = int(os.getenv("RECO_SCAN_MAX_PER_RUN", "400"))
-RECO_SCAN_ERROR_LIMIT = int(os.getenv("RECO_SCAN_ERROR_LIMIT", "8"))
-RECO_SCAN_SYMBOL_SLEEP_SEC = float(os.getenv("RECO_SCAN_SYMBOL_SLEEP_SEC", "0.05"))
+RECO_SCAN_MAX_PER_RUN = int(os.getenv("RECO_SCAN_MAX_PER_RUN", "600"))
+RECO_SCAN_ERROR_LIMIT = int(os.getenv("RECO_SCAN_ERROR_LIMIT", "15"))
+RECO_SCAN_SYMBOL_SLEEP_SEC = float(os.getenv("RECO_SCAN_SYMBOL_SLEEP_SEC", "0.02"))
 
 # Scan profile: conservative (stricter) | balanced | aggressive (looser). Affects thresholds when not overridden by env.
 RECO_PROFILE = (os.getenv("RECO_PROFILE", "balanced") or "balanced").strip().lower()
@@ -264,19 +326,19 @@ def _reco_buy_threshold_stocks() -> float:
     v = os.getenv("RECO_BUY_THRESHOLD_STOCKS", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 65.0, "balanced": 60.0, "aggressive": 52.0}.get(RECO_PROFILE, 60.0)
+    return {"conservative": 55.0, "balanced": 45.0, "aggressive": 35.0}.get(RECO_PROFILE, 45.0)
 
 def _reco_buy_threshold_crypto() -> float:
     v = os.getenv("RECO_BUY_THRESHOLD_CRYPTO", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 45.0, "balanced": 38.0, "aggressive": 32.0}.get(RECO_PROFILE, 38.0)
+    return {"conservative": 35.0, "balanced": 25.0, "aggressive": 18.0}.get(RECO_PROFILE, 25.0)
 
 def _reco_watch_threshold() -> float:
     v = os.getenv("RECO_WATCH_THRESHOLD", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 45.0, "balanced": 40.0, "aggressive": 35.0}.get(RECO_PROFILE, 40.0)
+    return {"conservative": 35.0, "balanced": 20.0, "aggressive": 15.0}.get(RECO_PROFILE, 20.0)
 
 # Legacy names for code that still references them
 RECO_BUY_THRESHOLD_CRYPTO = _reco_buy_threshold_crypto()
@@ -286,6 +348,8 @@ RECO_WATCH_THRESHOLD = _reco_watch_threshold()
 _ALLOWED_TFS = {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"}
 
 
+_background_threads: Dict[str, Dict[str, Any]] = {}
+
 def _start_background_thread(name: str, target) -> None:
     """Start a daemon thread only if not already started (avoids duplicate on hot reload)."""
     with _thread_start_lock:
@@ -293,9 +357,33 @@ def _start_background_thread(name: str, target) -> None:
             logger.warning("thread %s already started, skipping", name)
             return
         _thread_started[name] = True
-    t = threading.Thread(target=target, daemon=True, name=name)
+    def _wrapped():
+        try:
+            target()
+        except Exception:
+            logger.exception("background thread %s crashed — will be restarted by watchdog", name)
+            with _thread_start_lock:
+                _thread_started[name] = False
+    t = threading.Thread(target=_wrapped, daemon=True, name=name)
     t.start()
+    _background_threads[name] = {"thread": t, "target": target, "started_at": time.time()}
     logger.info("started background thread: %s", name)
+
+
+def _thread_watchdog_loop() -> None:
+    """Periodically check background threads and restart any that have crashed."""
+    while True:
+        time.sleep(60)
+        try:
+            for name, info in list(_background_threads.items()):
+                t = info.get("thread")
+                if t and not t.is_alive():
+                    logger.warning("thread_watchdog: %s is dead, restarting", name)
+                    with _thread_start_lock:
+                        _thread_started[name] = False
+                    _start_background_thread(name, info["target"])
+        except Exception:
+            logger.exception("thread_watchdog_loop: iteration failed")
 
 
 # =========================================================
@@ -311,6 +399,23 @@ def _has_live_bots() -> bool:
 
 def _alpaca_any_ready() -> bool:
     return bool(ALPACA_PAPER_READY or ALPACA_LIVE_READY)
+
+
+def _bm_not_ready_reason() -> Optional[str]:
+    """Return human-readable reason why BotManager is not ready (for 503 responses)."""
+    if bm is not None:
+        return None
+    if not KRAKEN_READY and not _alpaca_any_ready():
+        parts = []
+        if not KRAKEN_READY:
+            parts.append(f"Kraken: {KRAKEN_ERROR or 'API keys missing or init failed'}")
+        if not _alpaca_any_ready() and os.getenv("ENABLE_ALPACA", "").strip().lower() in ("1", "true", "yes"):
+            parts.append(f"Alpaca: {ALPACA_ERROR or 'API keys missing or init failed'}")
+        return "; ".join(parts) if parts else "No exchange client (Kraken or Alpaca) available"
+    err = _STARTUP_STATUS.get("last_startup_error")
+    if err:
+        return err
+    return "BotManager initialization failed or not yet complete"
 
 
 def _alpaca_market_open() -> bool:
@@ -402,7 +507,8 @@ async def api_key_middleware(request: Request, call_next):
 async def api_create_bot(request: Request):
     """Single handler for bot creation. Validates symbol, applies caps, returns full bot."""
     if not bm:
-        return _json({"ok": False, "error": "BotManager not initialized"}, 503)
+        reason = _bm_not_ready_reason() or "BotManager not initialized"
+        return _json({"ok": False, "error": "BotManager not initialized", "reason": reason}, 503)
     payload = await request.json()
     if not isinstance(payload, dict):
         return _json({"ok": False, "error": "Invalid payload"}, 400)
@@ -447,9 +553,20 @@ async def api_create_bot(request: Request):
     }
     _sanitize_bot_numbers(data)
     try:
+        from bot_config_validator import validate_bot_config
+        data, validation_issues = validate_bot_config(data)
+        fatal = [i for i in validation_issues if i.startswith("ERROR:")]
+        if fatal:
+            return _json({"ok": False, "error": fatal[0], "validation_issues": validation_issues}, 400)
+    except ImportError:
+        validation_issues = []
+    try:
         bot_id = create_bot(data)
         bot = get_bot(int(bot_id))
-        return _json({"ok": True, "bot": bot})
+        resp: Dict[str, Any] = {"ok": True, "bot": bot}
+        if validation_issues:
+            resp["validation_warnings"] = validation_issues
+        return _json(resp)
     except Exception as e:
         return _json({"ok": False, "error": str(e)}, 500)
 
@@ -879,16 +996,21 @@ def _slope(values: List[float], n: int = 20) -> Optional[float]:
     return num / den
 
 
+_OHLCV_FETCH_LOCKS: Dict[str, threading.Lock] = {}
+_OHLCV_FETCH_LOCKS_LOCK = threading.Lock()
+
+
 def _ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl_sec: int) -> List[List[float]]:
     """
     Fetch OHLCV data for a CRYPTO symbol from Kraken with caching.
+    Thread-safe: uses per-key locks to prevent duplicate API calls
+    when multiple threads request the same data simultaneously.
     
     GUARDRAIL: This function is for CRYPTO symbols only.
     Use AlpacaClient.get_ohlcv() for stock symbols.
     """
-    # Guardrail: Prevent stock symbols from being routed to Kraken
     validate_symbol_type(symbol, "crypto", "_ohlcv_cached")
-    
+
     if not _kraken_ready():
         return []
     key = f"{symbol}|{timeframe}|{limit}"
@@ -898,20 +1020,32 @@ def _ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl_sec: int) -> List
         if cached and (now - float(cached.get("ts", 0.0))) < ttl_sec:
             return cached.get("data") or []
 
-    data = []
-    try:
-        is_crypto = "/" in symbol
-        if not is_crypto and (alpaca_live or alpaca_paper):
-            client = alpaca_live if alpaca_live else alpaca_paper
-            data = client.get_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not data and kc:
-            data = kc.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception:
-        logger.exception("_ohlcv_cached: fetch failed symbol=%s tf=%s", symbol, timeframe)
+    with _OHLCV_FETCH_LOCKS_LOCK:
+        if key not in _OHLCV_FETCH_LOCKS:
+            _OHLCV_FETCH_LOCKS[key] = threading.Lock()
+        fetch_lock = _OHLCV_FETCH_LOCKS[key]
 
-    with _globals_lock:
-        _RECO_OHLCV_CACHE[key] = {"ts": now, "data": data}
-    return data
+    with fetch_lock:
+        now = time.time()
+        with _globals_lock:
+            cached = _RECO_OHLCV_CACHE.get(key)
+            if cached and (now - float(cached.get("ts", 0.0))) < ttl_sec:
+                return cached.get("data") or []
+
+        data = []
+        try:
+            is_crypto = "/" in symbol
+            if not is_crypto and (alpaca_live or alpaca_paper):
+                client = alpaca_live if alpaca_live else alpaca_paper
+                data = client.get_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not data and kc:
+                data = kc.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except Exception:
+            logger.exception("_ohlcv_cached: fetch failed symbol=%s tf=%s", symbol, timeframe)
+
+        with _globals_lock:
+            _RECO_OHLCV_CACHE[key] = {"ts": now, "data": data}
+        return data
 
 
 def _safe_spread_pct(symbol: str) -> Optional[float]:
@@ -939,11 +1073,87 @@ def _btc_context() -> Dict[str, Any]:
         ctx["scores"] = {"4h": r4h.scores or {}, "1d": r1d.scores or {}}
         down = max((r1d.scores or {}).get("downtrend_score", 0.0), (r4h.scores or {}).get("downtrend_score", 0.0))
         hv = max((r1d.scores or {}).get("high_vol_score", 0.0), (r4h.scores or {}).get("high_vol_score", 0.0))
-        if down >= 0.6 or hv >= 0.6 or r1d.regime in ("TREND_DOWN", "HIGH_VOL_RISK", "RISK_OFF"):
+        # Only trigger risk-off for genuinely severe conditions
+        if (down >= 0.8 and hv >= 0.5) or r1d.regime in ("HIGH_VOL_RISK",):
             ctx["risk_off"] = True
+        ctx["btc_down"] = down
+        ctx["btc_hv"] = hv
     except Exception:
         pass
     return ctx
+
+
+def _evict_ohlcv_cache() -> int:
+    """Evict stale entries from OHLCV cache to prevent memory leak."""
+    now = time.time()
+    evicted = 0
+    with _globals_lock:
+        stale_keys = [
+            k for k, v in _RECO_OHLCV_CACHE.items()
+            if (now - float(v.get("ts", 0))) > _OHLCV_CACHE_EVICT_AGE_SEC
+        ]
+        for k in stale_keys:
+            del _RECO_OHLCV_CACHE[k]
+            evicted += 1
+        if len(_RECO_OHLCV_CACHE) > _OHLCV_CACHE_MAX_ENTRIES:
+            sorted_keys = sorted(
+                _RECO_OHLCV_CACHE.keys(),
+                key=lambda k: float(_RECO_OHLCV_CACHE[k].get("ts", 0))
+            )
+            excess = len(_RECO_OHLCV_CACHE) - _OHLCV_CACHE_MAX_ENTRIES
+            for k in sorted_keys[:excess]:
+                del _RECO_OHLCV_CACHE[k]
+                evicted += 1
+    return evicted
+
+
+_PREFILTER_CRYPTO_VOLUME = os.getenv("PREFILTER_CRYPTO_VOLUME", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _prefilter_crypto_symbol(symbol: str) -> Tuple[bool, str]:
+    """
+    Cheap pre-filter for crypto symbols before full scan pipeline.
+    Static checks (stablecoin, fiat) always run. Volume check requires fetch_ticker
+    — disabled by default to avoid rate limit pressure (PREFILTER_CRYPTO_VOLUME=1 to enable).
+    """
+    base = (symbol.split("/")[0] or "").upper()
+    if base in STABLECOINS or base in CRYPTO_BLOCKLIST_STABLECOINS:
+        return False, "stablecoin"
+    if base in FIAT_BASES:
+        return False, "fiat_pair"
+    if not _PREFILTER_CRYPTO_VOLUME:
+        return True, ""
+    if not _kraken_ready():
+        return True, ""
+    try:
+        t = kc.fetch_ticker(symbol) if kc else {}
+        vol_quote = float(t.get("quoteVolume") or 0)
+        last_price = float(t.get("last") or 0)
+        if vol_quote > 0 and vol_quote < RECO_MIN_VOLUME_24H * 0.5:
+            return False, f"low_volume_{vol_quote/1e6:.1f}M"
+        if last_price <= 0:
+            return False, "no_price_data"
+    except Exception:
+        pass
+    return True, ""
+
+
+def _prefilter_stock_symbol(symbol: str) -> Tuple[bool, str]:
+    """Cheap pre-filter for stock symbols."""
+    if len(symbol) > 5:
+        return False, "symbol_too_long"
+    return True, ""
+
+
+def _get_scan_executor() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool for parallel scanning."""
+    global _SCAN_EXECUTOR
+    if _SCAN_EXECUTOR is None:
+        _SCAN_EXECUTOR = ThreadPoolExecutor(
+            max_workers=SCAN_PARALLEL_WORKERS,
+            thread_name_prefix="scan_worker"
+        )
+    return _SCAN_EXECUTOR
 
 
 def _trend_age(ema_fast: List[float], ema_slow: List[float], max_weeks: int = 52) -> int:
@@ -967,33 +1177,37 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
     
     # Route based on symbol type
     if market_type == "stock":
-        # Stock path - use Alpaca
+        # Stock path - Alpaca preferred; Yahoo Finance fallback when Alpaca not configured (minimal mode)
         client = alpaca_live if alpaca_live else alpaca_paper
-        if not client:
-            # Return empty scan with error flag
-            logger.warning(f"Stock symbol {symbol} scanned but Alpaca not configured")
-            return {
-                "symbol": symbol,
-                "score": 0.0,
-                "eligible": False,
-                "data_ok": False,
-                "reasons": ["Stock provider (Alpaca) not configured"],
-                "risk_flags": ["NO_STOCK_PROVIDER"],
-                "metrics": {"market_type": "stock"},
-                "regime": {}
-            }
-        
-        # Fetch stock data: Alpaca first, Yahoo fallback when Alpaca returns no/insufficient data
+        # Fetch stock data: phase2_data_fetcher uses Alpaca first, Yahoo fallback when Alpaca returns no data
+        # When Alpaca is None, fetch_recent_candles still works via Yahoo for stocks
         try:
             from phase2_data_fetcher import fetch_recent_candles
             candles_1h = fetch_recent_candles(symbol, "1h", 300)
             candles_4h = fetch_recent_candles(symbol, "4h", 300)
             candles_1d = fetch_recent_candles(symbol, "1d", 500)
             candles_1w = fetch_recent_candles(symbol, "1w", 300)
-            
-            # Get current price from ticker
-            ticker_data = client.get_ticker(symbol)
-            price = float(ticker_data.get("last", 0.0))
+            if not candles_1d or len(candles_1d) < 20:
+                return {
+                    "symbol": symbol,
+                    "score": 0.0,
+                    "eligible": False,
+                    "data_ok": False,
+                    "reasons": ["Insufficient candle data (Yahoo/Alpaca)"],
+                    "risk_flags": ["DATA_ERROR"],
+                    "metrics": {"market_type": "stocks"},
+                    "regime": {}
+                }
+            # Get price: from Alpaca ticker if available, else from last daily candle
+            price = 0.0
+            if client:
+                try:
+                    ticker_data = client.get_ticker(symbol)
+                    price = float(ticker_data.get("last", 0.0))
+                except Exception:
+                    pass
+            if not price and candles_1d and len(candles_1d[-1]) >= 5:
+                price = float(candles_1d[-1][4])
             spread_pct = 0.001  # Stocks typically have tight spreads (~0.1%)
             
             # Stock-specific metadata for intelligence scoring
@@ -1042,6 +1256,7 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
             try:
                 from stock_profile import get_stock_profile, passes_market_cap_filter, is_recent_ipo
                 p = get_stock_profile(symbol)
+                stock_market_breadth["market_cap"] = p.get("market_cap")
                 stock_market_breadth["market_cap_b"] = p.get("market_cap_b")
                 stock_market_breadth["market_cap_tier"] = p.get("tier")
                 stock_market_breadth["days_listed"] = p.get("days_listed")
@@ -1085,6 +1300,7 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
         
         sym = _resolve_symbol(symbol)
         market_breadth = {}
+        crypto_volume_24h: Optional[float] = None
         
         # Fetch crypto data from Kraken (guardrails will catch any misrouted stocks)
         try:
@@ -1095,6 +1311,11 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
             
             price = _safe_last_price(sym) or 0.0
             spread_pct = _safe_spread_pct(sym)
+            try:
+                t = kc.ex.fetch_ticker(sym) if kc else {}
+                crypto_volume_24h = float(t.get("quoteVolume") or t.get("volume") or 0)
+            except Exception:
+                pass
         except ValueError as e:
             # Guardrail caught a routing error
             logger.error(f"Routing error for {symbol}: {e}")
@@ -1148,9 +1369,35 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
     
     # Generate Recommendation via Intelligence Layer
     recommendation = intelligence_layer.generate_recommendation(context, horizon)
+
+    # Scan logging for diagnostics
+    _r_score = recommendation.get("score", 0)
+    _r_regime = (recommendation.get("metrics") or {}).get("regime", "?")
+    _r_eligible = recommendation.get("eligible", True)
+    _r_reasons = (recommendation.get("reasons") or [])[:3]
+    _r_flags = (recommendation.get("risk_flags") or [])[:3]
+    logger.info("SCAN %s [%s] score=%.1f regime=%s eligible=%s reasons=%s flags=%s",
+                symbol, horizon, _r_score, _r_regime, _r_eligible, _r_reasons, _r_flags)
     
     if "metrics" in recommendation and isinstance(recommendation["metrics"], dict):
         recommendation["metrics"]["market_type"] = "stocks" if market_type == "stock" else "crypto"
+        if market_type == "crypto":
+            if crypto_volume_24h is not None:
+                recommendation["metrics"]["volume_24h_quote"] = crypto_volume_24h
+                if crypto_volume_24h < RECO_MIN_VOLUME_24H:
+                    recommendation["eligible"] = False
+                    recommendation.setdefault("risk_flags", []).append(
+                        f"Low volume: ${crypto_volume_24h/1e6:.1f}M < ${RECO_MIN_VOLUME_24H/1e6:.0f}M min"
+                    )
+        if market_type == "stock" and market_breadth:
+            mc = market_breadth.get("market_cap")
+            if mc is None and market_breadth.get("market_cap_b"):
+                mc = float(market_breadth["market_cap_b"]) * 1e9
+            if mc and mc < RECO_MIN_MARKET_CAP:
+                recommendation["eligible"] = False
+                recommendation.setdefault("risk_flags", []).append(
+                    f"Market cap ${mc/1e9:.2f}B < ${RECO_MIN_MARKET_CAP/1e9:.0f}B min"
+                )
         if market_type == "crypto":
             try:
                 from funding_rate_tracker import get_funding_rate
@@ -1159,6 +1406,12 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                 if fr:
                     recommendation["metrics"]["funding_rate"] = fr.get("rate")
                     recommendation["metrics"]["funding_signal"] = fr.get("signal")
+                    # Warning when funding extremely high (overleveraged long)
+                    rate_val = fr.get("rate") or 0
+                    if isinstance(rate_val, (int, float)) and rate_val >= 0.001:
+                        recommendation.setdefault("risk_flags", []).append(
+                            f"High funding rate: {rate_val*100:.3f}% (overleveraged)"
+                        )
                 cyc = get_cycle_phase()
                 recommendation["metrics"]["cycle_phase"] = cyc.get("phase")
             except Exception:
@@ -1281,7 +1534,7 @@ _MOMENTUM_FILTER_ENABLED = os.getenv("RECO_MOMENTUM_FILTER", "1").strip().lower(
     "on",
 )
 _MOMENTUM_FILTER_MIN_SCORE = float(os.getenv("RECO_MOMENTUM_MIN_SCORE", "60"))
-_MOMENTUM_FILTER_TOP_N_STOCKS = int(os.getenv("RECO_MOMENTUM_TOP_N_STOCKS", "200"))
+_MOMENTUM_FILTER_TOP_N_STOCKS = int(os.getenv("RECO_MOMENTUM_TOP_N_STOCKS", "500"))
 
 
 def _reco_symbols(quote: str = "USD") -> List[str]:
@@ -1328,7 +1581,15 @@ def _reco_symbols(quote: str = "USD") -> List[str]:
     except Exception as e:
         logger.error(f"Error fetching crypto universe: {e}")
 
-    # 3. Stocks via Alpaca – whole market: movers + broad bluechip + active assets
+    # 3. Stocks: expanded universe (S&P 500 + NASDAQ 100 + major ETFs) + Alpaca movers
+    try:
+        from stock_universe import get_expanded_stock_universe
+        expanded = get_expanded_stock_universe()
+        for s in expanded:
+            symbols.add(s)
+        logger.info("[RECO_DEBUG] _reco_symbols: added %d from expanded stock universe (S&P500+NASDAQ100+ETFs)", len(expanded))
+    except Exception as e:
+        logger.warning("[RECO_DEBUG] stock_universe import failed: %s; using legacy bluechips only", e)
     try:
         client = alpaca_live if alpaca_live else alpaca_paper
         if client:
@@ -1339,26 +1600,15 @@ def _reco_symbols(quote: str = "USD") -> List[str]:
                 symbols.add(item["symbol"])
             for item in actives.get("losers", []):
                 symbols.add(item["symbol"])
-            bluechips = [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX",
-                "AMD", "INTC", "QCOM", "CRM", "ADBE", "AVGO", "COIN", "MSTR", "HOOD",
-                "PYPL", "SQ", "SHOP", "JPM", "BAC", "V", "MA", "WFC", "GS", "MS",
-                "BLK", "C", "AXP", "DIS", "BA", "F", "GM", "XOM", "CVX", "JNJ",
-                "PG", "KO", "PEP", "WMT", "COST", "TGT", "HD", "LOW", "MCD", "T",
-                "VZ", "PFE", "MRK", "UNH", "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF",
-                "XLE", "XLV", "XLY", "XLP", "GLD", "SLV", "PLTR", "SOFI", "UBER",
-                "ROKU", "GME", "AMC", "MARA", "RIOT", "CLSK", "HUT", "DKNG", "AFRM",
-            ]
-            for b in bluechips:
-                symbols.add(b)
             try:
                 assets = client.get_active_assets()
-                for a in (assets or [])[:300]:
+                for a in (assets or [])[:200]:
                     sym = (a.get("symbol") or "").strip()
                     if sym and "." not in sym and a.get("tradable"):
                         symbols.add(sym)
             except Exception:
                 logger.exception("_reco_symbols: get_active_assets failed")
+            logger.info("[RECO_DEBUG] _reco_symbols: added movers/actives from Alpaca; total stocks now %d", len([s for s in symbols if "/" not in s and len(s) < 6]))
     except Exception as e:
         logger.error(f"Error fetching stock universe: {e}")
 
@@ -1492,45 +1742,85 @@ def _apply_crypto_momentum_filter(symbols: List[str]) -> List[str]:
     return out
 
 
-def _scan_recommendations(horizon: str) -> None:
-    global _last_reco_short_ts, _last_reco_long_ts
-    if not _kraken_ready() and not (alpaca_live or alpaca_paper):
-        logger.warning(f"Recommendation scan skipped: No trading clients ready (Kraken: {_kraken_ready()}, Alpaca: {bool(alpaca_live or alpaca_paper)})")
-        return
-
-    now = now_ts()
-    error = ""
-    btc_ctx = _btc_context()
-    scanned = 0
-    eligible = 0
-    total_to_scan = 0
+def _scan_one_symbol(sym: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Scan a single symbol — designed to run inside a thread pool.
+    Returns a result dict with status info, or None-equivalent on skip.
+    """
+    result = {"symbol": sym, "status": "skipped", "snap": None, "error": None}
     try:
-        symbols = _reco_symbols(quote="USD")
-        symbols = _apply_momentum_filter_to_universe(symbols)
-        symbols = _apply_crypto_momentum_filter(symbols)
-        logger.info(f"Scanning {len(symbols)} symbols for {horizon} horizon")
-        
-        if len(symbols) == 0:
-            logger.warning("No symbols to scan for recommendations")
-            with _globals_lock:
-                _RECO_STATE[horizon] = {
-                    "last_run_ts": now,
-                    "error": "No symbols available",
-                    "btc_ctx": btc_ctx,
-                    "scanned": 0,
-                    "eligible": 0,
-                }
-                if horizon == "short":
-                    _last_reco_short_ts = time.time()
-                else:
-                    _last_reco_long_ts = time.time()
-            return
-        
-        # Separate crypto and stocks; scan whole market (max RECO_MAX_SYMBOLS)
-        crypto_symbols = [s for s in symbols if ("/" in s or len(s) > 6) and (s.split("/")[0] or "").upper() not in CRYPTO_BLOCKLIST]
-        stock_symbols = [s for s in symbols if len(s) < 6 and "/" not in s]
-        
-        # Kraken uses XBT for Bitcoin; include both for matching
+        if "/" in sym:
+            base = (sym.split("/")[0] or "").upper()
+            if base in CRYPTO_BLOCKLIST:
+                result["status"] = "blocklisted"
+                return result
+            resolved, _ = _validate_crypto_symbol(sym)
+            if not resolved:
+                result["status"] = "invalid_symbol"
+                return result
+        snap = _scan_symbol(sym, horizon, btc_ctx)
+        if not snap:
+            result["status"] = "no_data"
+            return result
+        if snap.get("data_ok") is False:
+            result["status"] = "data_not_ok"
+            return result
+        risk_flags = snap.get("risk_flags") or []
+        if "DATA_INVALID" in risk_flags or "DATA_ERROR" in risk_flags or "ROUTING_ERROR" in risk_flags:
+            result["status"] = "data_error"
+            return result
+        metrics = snap.get("metrics") or {}
+        is_stock = len(sym) < 6 and "/" not in sym
+        metrics["market_type"] = "stocks" if is_stock else "crypto"
+        if not is_stock:
+            try:
+                from meme_coin_detector import should_block_crypto
+                if should_block_crypto(sym, metrics):
+                    result["status"] = "meme_blocked"
+                    return result
+            except Exception:
+                pass
+        snap_eligible = snap.get("eligible", False)
+        metrics["eligible"] = snap_eligible
+        snap_score = float(snap.get("score") or 0.0)
+        buy_thresh = _reco_buy_threshold_stocks() if is_stock else _reco_buy_threshold_crypto()
+        derived_signal = "buy" if snap_score >= buy_thresh else ("watch" if snap_score >= _reco_watch_threshold() else "wait")
+        metrics["signal"] = derived_signal
+        snap["metrics"] = metrics
+
+        result["snap"] = snap
+        result["status"] = "ok"
+        result["eligible"] = snap_eligible
+        result["signal"] = derived_signal
+        result["score"] = snap_score
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)[:200]
+    return result
+
+
+def _build_symbols_to_scan(horizon: str) -> List[str]:
+    """Build the filtered, prioritized symbol list for a scan pass."""
+    symbols = _reco_symbols(quote="USD")
+    logger.info("[RECO_DEBUG] _reco_symbols returned %d symbols (crypto=%d stocks=%d)",
+        len(symbols),
+        len([s for s in symbols if "/" in s]),
+        len([s for s in symbols if "/" not in s and len(s) < 6]))
+    symbols = _apply_momentum_filter_to_universe(symbols)
+    logger.info("[RECO_DEBUG] after momentum filter: %d symbols", len(symbols))
+    symbols = _apply_crypto_momentum_filter(symbols)
+    logger.info("[RECO_DEBUG] after crypto momentum filter: %d symbols for %s horizon", len(symbols), horizon)
+
+    crypto_symbols = [s for s in symbols if ("/" in s or len(s) > 6) and (s.split("/")[0] or "").upper() not in CRYPTO_BLOCKLIST]
+    stock_symbols = [s for s in symbols if len(s) < 6 and "/" not in s]
+    logger.info("[RECO_DEBUG] split: crypto_symbols=%d stock_symbols=%d", len(crypto_symbols), len(stock_symbols))
+
+    if RECO_CRYPTO_TOP_30_ONLY:
+        crypto_selected = [s for s in crypto_symbols if _crypto_base_from_symbol(s) in TOP_30_CRYPTO_BASES]
+        blocked = [s for s in crypto_symbols if s not in crypto_selected]
+        if blocked:
+            logger.info("RECO_CRYPTO_TOP_30_ONLY: blocked %d, kept %d", len(blocked), len(crypto_selected))
+    else:
         priority_crypto = [
             "XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ETC/USD", "ADA/USD",
             "DOGE/USD", "LTC/USD", "BCH/USD", "DOT/USD", "AVAX/USD", "LINK/USD",
@@ -1539,137 +1829,346 @@ def _scan_recommendations(horizon: str) -> None:
         crypto_set = set(crypto_symbols)
         crypto_selected = [pc for pc in priority_crypto if pc in crypto_set]
         crypto_selected += [s for s in crypto_symbols if s not in set(priority_crypto)]
-        
-        priority_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "SPY", "QQQ"]
-        stock_set = set(stock_symbols)
-        stock_selected = [ps for ps in priority_stocks if ps in stock_set]
-        stock_selected += [s for s in stock_symbols if s not in set(priority_stocks)]
-        
-        n_max = min(RECO_MAX_SYMBOLS, 600)
-        n_crypto = min(350, len(crypto_selected))
-        n_stocks = min(n_max - n_crypto, len(stock_selected))
-        symbols_to_scan = crypto_selected[:n_crypto] + stock_selected[:n_stocks]
-        # Drop fiat FX pairs (base in FIAT list)
-        symbols_to_scan = [
-            s for s in symbols_to_scan if not ("/" in s and (s.split("/")[0] or "").upper() in FIAT_BASES)
-        ]
-        if RECO_SCAN_MAX_PER_RUN > 0:
-            symbols_to_scan = symbols_to_scan[: min(len(symbols_to_scan), RECO_SCAN_MAX_PER_RUN)]
-        
-        logger.info(f"Scanning {len(symbols_to_scan)} symbols ({n_crypto} crypto, {n_stocks} stocks) for {horizon} horizon")
-        
+
+    priority_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "SPY", "QQQ"]
+    stock_set = set(stock_symbols)
+    stock_selected = [ps for ps in priority_stocks if ps in stock_set]
+    stock_selected += [s for s in stock_symbols if s not in set(priority_stocks)]
+
+    n_max = min(RECO_MAX_SYMBOLS, 600)
+    n_crypto = min(350, len(crypto_selected))
+    n_stocks = min(n_max - n_crypto, len(stock_selected))
+    symbols_to_scan = crypto_selected[:n_crypto] + stock_selected[:n_stocks]
+    symbols_to_scan = [
+        s for s in symbols_to_scan if not ("/" in s and (s.split("/")[0] or "").upper() in FIAT_BASES)
+    ]
+    if RECO_SCAN_MAX_PER_RUN > 0:
+        symbols_to_scan = symbols_to_scan[: min(len(symbols_to_scan), RECO_SCAN_MAX_PER_RUN)]
+
+    # Pre-filter: skip junk symbols cheaply before full pipeline
+    prefilter_start = time.time()
+    filtered = []
+    prefilter_skipped = {"crypto": 0, "stock": 0}
+    prefilter_reasons: Dict[str, int] = {}
+    for sym in symbols_to_scan:
+        is_crypto = "/" in sym or len(sym) > 6
+        if is_crypto:
+            passes, reason = _prefilter_crypto_symbol(sym)
+            if not passes:
+                prefilter_skipped["crypto"] += 1
+                prefilter_reasons[reason] = prefilter_reasons.get(reason, 0) + 1
+                continue
+        else:
+            passes, reason = _prefilter_stock_symbol(sym)
+            if not passes:
+                prefilter_skipped["stock"] += 1
+                prefilter_reasons[reason] = prefilter_reasons.get(reason, 0) + 1
+                continue
+        filtered.append(sym)
+    prefilter_dur = time.time() - prefilter_start
+    logger.info("[SCAN] Pre-filter: %d -> %d symbols in %.1fs (skipped crypto=%d stocks=%d reasons=%s)",
+        len(symbols_to_scan), len(filtered), prefilter_dur,
+        prefilter_skipped["crypto"], prefilter_skipped["stock"],
+        dict(list(prefilter_reasons.items())[:5]))
+
+    return filtered
+
+
+def _scan_recommendations(horizon: str) -> None:
+    global _last_reco_short_ts, _last_reco_medium_ts, _last_reco_long_ts
+    logger.info("[RECO_DEBUG] _scan_recommendations ENTRY horizon=%s Kraken=%s Alpaca=%s",
+        horizon, _kraken_ready(), bool(alpaca_live or alpaca_paper))
+    has_clients = _kraken_ready() or (alpaca_live or alpaca_paper)
+    if not has_clients:
+        try:
+            syms = _reco_symbols(quote="USD")
+            stock_count = len([s for s in syms if "/" not in s and len(s) < 6])
+            if stock_count == 0:
+                logger.warning("[RECO_DEBUG] SCAN SKIPPED: No trading clients and no stock symbols.")
+                return
+            logger.info("[RECO_DEBUG] No Kraken/Alpaca - scanning %d stocks via Yahoo Finance fallback", stock_count)
+        except Exception as e:
+            logger.warning("[RECO_DEBUG] SCAN SKIPPED: No clients and symbol check failed: %s", e)
+            return
+
+    now = now_ts()
+    error = ""
+    btc_ctx = _btc_context()
+    scanned = 0
+    eligible = 0
+    total_to_scan = 0
+    try:
+        symbols_to_scan = _build_symbols_to_scan(horizon)
+
+        if len(symbols_to_scan) == 0:
+            logger.warning("No symbols to scan for recommendations")
+            with _globals_lock:
+                _RECO_STATE[horizon] = {
+                    "last_run_ts": now, "error": "No symbols available",
+                    "btc_ctx": btc_ctx, "scanned": 0, "eligible": 0,
+                }
+                if horizon == "short": _last_reco_short_ts = time.time()
+                elif horizon == "medium": _last_reco_medium_ts = time.time()
+                else: _last_reco_long_ts = time.time()
+            return
+
         total_to_scan = len(symbols_to_scan)
-        # Set initial state so scan_status can show progress
+        logger.info("[SCAN] %s horizon: scanning %d symbols with %d parallel workers",
+            horizon, total_to_scan, SCAN_PARALLEL_WORKERS)
+
         with _globals_lock:
             _RECO_STATE[horizon] = {
-                "last_run_ts": 0,
-                "error": "",
-                "btc_ctx": btc_ctx,
-                "scanned": 0,
-                "eligible": 0,
-                "total": total_to_scan,
-                "scanning": True,
+                "last_run_ts": 0, "error": "", "btc_ctx": btc_ctx,
+                "scanned": 0, "eligible": 0, "total": total_to_scan, "scanning": True,
             }
-        
-        chunk_size = 25
+
         error_count = 0
-        for chunk_start in range(0, len(symbols_to_scan), chunk_size):
-            chunk = symbols_to_scan[chunk_start:chunk_start + chunk_size]
-            for sym in chunk:
+        buy_signals = 0
+        skip_counts: Dict[str, int] = {}
+        scan_start = time.time()
+        with _globals_lock:
+            _SCAN_PROGRESS["scan_start_ts"] = scan_start
+            _SCAN_PROGRESS["current_horizon"] = horizon
+            _SCAN_PROGRESS["current_symbol"] = ""
+            _SCAN_PROGRESS["buy_signals_found"] = 0
+
+        executor = _get_scan_executor()
+        batch_size = SCAN_PARALLEL_WORKERS * 2
+        for batch_start in range(0, len(symbols_to_scan), batch_size):
+            if error_count >= RECO_SCAN_ERROR_LIMIT:
+                error = f"Stopped after {error_count} errors (rate-limit protection)"
+                logger.error(error)
+                break
+
+            batch = symbols_to_scan[batch_start:batch_start + batch_size]
+            with _globals_lock:
+                _SCAN_PROGRESS["current_symbol"] = f"batch {batch_start//batch_size + 1} ({len(batch)} symbols)"
+
+            futures = {
+                executor.submit(_scan_one_symbol, sym, horizon, btc_ctx): sym
+                for sym in batch
+            }
+
+            for future in as_completed(futures):
+                sym = futures[future]
                 try:
-                    # Skip crypto symbols not on Kraken or in blocklist
-                    if "/" in sym:
-                        base = (sym.split("/")[0] or "").upper()
-                        if base in CRYPTO_BLOCKLIST:
-                            continue
-                        resolved, _ = _validate_crypto_symbol(sym)
-                        if not resolved:
-                            continue
-                    snap = _scan_symbol(sym, horizon, btc_ctx)
-                    if not snap:
-                        continue
-                    # C3: Skip symbols with data failures or invalid data
-                    if snap.get("data_ok") is False:
-                        continue
-                    risk_flags = snap.get("risk_flags") or []
-                    if "DATA_INVALID" in risk_flags or "DATA_ERROR" in risk_flags or "ROUTING_ERROR" in risk_flags:
-                        continue
-                    metrics = snap.get("metrics") or {}
-                    is_stock = len(sym) < 6 and "/" not in sym
-                    metrics["market_type"] = "stocks" if is_stock else "crypto"
-                    if metrics.get("eligible"):
-                        eligible += 1
-                    save_recommendation_snapshot(
-                        symbol=snap["symbol"],
-                        horizon=horizon,
-                        score=float(snap.get("score") or 0.0),
-                        regime_json=json.dumps(snap.get("regime") or {}),
-                        metrics_json=json.dumps(metrics),
-                        reasons_json=json.dumps(snap.get("reasons") or []),
-                        risk_flags_json=json.dumps(snap.get("risk_flags") or []),
-                    )
-                    scanned += 1
-                    if scanned % 10 == 0:
-                        logger.info(f"Scan progress: {scanned}/{len(symbols_to_scan)} symbols processed")
-                        with _globals_lock:
-                            s = _RECO_STATE.get(horizon) or {}
-                            s["scanned"] = scanned
-                            s["eligible"] = eligible
-                            _RECO_STATE[horizon] = s
+                    result = future.result(timeout=60)
                 except Exception as e:
                     error_count += 1
-                    logger.warning(f"Error scanning {sym}: {e}")
-                    if error_count >= RECO_SCAN_ERROR_LIMIT:
-                        error = f"Stopped after {error_count} errors (rate-limit protection)"
-                        logger.error(error)
-                        break
+                    logger.warning("Scan future error %s: %s", sym, e)
+                    with _globals_lock:
+                        errs = _SCAN_PROGRESS.get("recent_errors") or []
+                        errs.append({"ts": int(time.time()), "symbol": sym, "error": str(e)[:200]})
+                        _SCAN_PROGRESS["recent_errors"] = errs[-10:]
                     continue
-                if RECO_SCAN_SYMBOL_SLEEP_SEC > 0:
-                    time.sleep(RECO_SCAN_SYMBOL_SLEEP_SEC)
-            if error_count >= RECO_SCAN_ERROR_LIMIT:
-                break
-            if chunk_start + chunk_size < len(symbols_to_scan):
-                time.sleep(0.4)
-                
-        logger.info(f"Scan complete: {scanned} scanned, {eligible} eligible for {horizon}")
+
+                status = result.get("status", "unknown")
+                if status == "error":
+                    error_count += 1
+                    logger.warning("Error scanning %s: %s", sym, result.get("error"))
+                    with _globals_lock:
+                        errs = _SCAN_PROGRESS.get("recent_errors") or []
+                        errs.append({"ts": int(time.time()), "symbol": sym, "error": result.get("error", "")})
+                        _SCAN_PROGRESS["recent_errors"] = errs[-10:]
+                    continue
+                elif status != "ok":
+                    skip_counts[status] = skip_counts.get(status, 0) + 1
+                    continue
+
+                snap = result["snap"]
+                if not snap:
+                    continue
+
+                if result.get("signal") == "buy":
+                    buy_signals += 1
+                if result.get("eligible"):
+                    eligible += 1
+                save_recommendation_snapshot(
+                    symbol=snap["symbol"],
+                    horizon=horizon,
+                    score=float(snap.get("score") or 0.0),
+                    regime_json=json.dumps(snap.get("regime") or {}),
+                    metrics_json=json.dumps(snap.get("metrics") or {}),
+                    reasons_json=json.dumps(snap.get("reasons") or []),
+                    risk_flags_json=json.dumps(snap.get("risk_flags") or []),
+                    score_breakdown_json=snap.get("score_breakdown_json") or json.dumps(snap.get("score_breakdown") or {}),
+                )
+                scanned += 1
+                with _globals_lock:
+                    s = _RECO_STATE.get(horizon) or {}
+                    s["scanned"] = scanned
+                    s["eligible"] = eligible
+                    _RECO_STATE[horizon] = s
+                    _SCAN_PROGRESS["buy_signals_found"] = buy_signals
+
+        scan_dur = time.time() - scan_start
+        avg_per_sym = scan_dur / max(scanned, 1)
+        logger.info("[SCAN] %s complete: %d/%d scanned, %d eligible, %d buy signals, "
+            "%d errors in %.1fs (%.2fs/symbol). Skip reasons: %s",
+            horizon, scanned, total_to_scan, eligible, buy_signals,
+            error_count, scan_dur, avg_per_sym, skip_counts)
+        if total_to_scan - scanned - error_count - sum(skip_counts.values()) > 5:
+            logger.warning("[SCAN] %s: %d symbols unaccounted for (total=%d scanned=%d errors=%d skipped=%d)",
+                horizon, total_to_scan - scanned - error_count - sum(skip_counts.values()),
+                total_to_scan, scanned, error_count, sum(skip_counts.values()))
+
+        # Calibration logging: distribution check after scan
+        try:
+            rows = list_recommendations(horizon=horizon, limit=500)
+            cal_buy = sum(1 for r in rows if float(r.get("score") or 0) >= 70)
+            cal_watch = sum(1 for r in rows if 45 <= float(r.get("score") or 0) < 70)
+            cal_avoid = sum(1 for r in rows if float(r.get("score") or 0) < 45)
+            cal_total = len(rows)
+            buy_pct = (cal_buy / cal_total * 100) if cal_total else 0
+            watch_pct = (cal_watch / cal_total * 100) if cal_total else 0
+            logger.info(
+                "CALIBRATION [%s]: %d symbols — BUY(70+): %d (%.1f%%) WATCH(45-69): %d (%.1f%%) AVOID(<45): %d (%.1f%%) "
+                "Target: 5-15%% BUY, 10-25%% WATCH",
+                horizon, cal_total, cal_buy, buy_pct, cal_watch, watch_pct, cal_avoid,
+                (cal_avoid / cal_total * 100) if cal_total else 0,
+            )
+            if cal_total > 20 and buy_pct < 2:
+                logger.warning("CALIBRATION WARNING [%s]: <2%% BUY signals — scoring may be too strict", horizon)
+            elif cal_total > 20 and buy_pct > 30:
+                logger.warning("CALIBRATION WARNING [%s]: >30%% BUY signals — scoring may be too loose", horizon)
+        except Exception as ce:
+            logger.debug("Calibration logging failed: %s", ce)
+
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         logger.error(f"Scan failed: {error}", exc_info=True)
 
+    scan_end = time.time()
     with _globals_lock:
         _RECO_STATE[horizon] = {
-            "last_run_ts": now,
-            "error": error,
-            "btc_ctx": btc_ctx,
+            "last_run_ts": now, "error": error, "btc_ctx": btc_ctx,
+            "scanned": scanned, "eligible": eligible,
+            "total": total_to_scan, "scanning": False,
+        }
+        if horizon == "short": _last_reco_short_ts = time.time()
+        elif horizon == "medium": _last_reco_medium_ts = time.time()
+        else: _last_reco_long_ts = time.time()
+        _SCAN_PROGRESS["current_symbol"] = ""
+        _SCAN_PROGRESS["current_horizon"] = ""
+        history = _SCAN_PROGRESS.get("scan_history") or []
+        history.append({
+            "horizon": horizon,
+            "ts": int(scan_end),
             "scanned": scanned,
             "eligible": eligible,
-            "total": total_to_scan if 'total_to_scan' in dir() else 0,
-            "scanning": False,
-        }
-        if horizon == "short":
-            _last_reco_short_ts = time.time()
-        else:
-            _last_reco_long_ts = time.time()
+            "buy_signals": buy_signals if 'buy_signals' in dir() else 0,
+            "duration_sec": round(scan_end - (scan_start if 'scan_start' in dir() else scan_end), 1),
+            "error": error,
+        })
+        _SCAN_PROGRESS["scan_history"] = history[-_SCAN_HISTORY_MAX:]
+
+
+def _scan_all_horizons(horizons: List[str]) -> None:
+    """
+    Scan horizons sequentially to avoid Kraken rate limit storms.
+    Running short+medium+long in parallel would cause 24+ concurrent API calls
+    (3 horizons x 8 workers), triggering 429s and failed fetches.
+    Sequential execution keeps concurrency at 8 per horizon.
+    """
+    for h in horizons:
+        _scan_recommendations(h)
 
 
 _BACKOFF_BASE = 1.0
-_BACKOFF_MAX = 60.0
-_CIRCUIT_BREAKER_THRESHOLD = 10
+_BACKOFF_MAX = 30.0
+_CIRCUIT_BREAKER_THRESHOLD = 15
+
+
+def _retry_with_backoff(func, max_retries: int = 3, base_delay: float = 0.5):
+    """
+    Retry a function call with exponential backoff.
+    Useful for rate-limited or transient Alpaca API calls.
+
+    Args:
+        func: Callable that performs the API call
+        max_retries: Max attempts (3 = try up to 4 times)
+        base_delay: Initial delay in seconds
+
+    Returns:
+        Result of func if successful, or raises the last exception if all retries fail
+    """
+    last_exception = None
+    delay = base_delay
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries:
+                logger.debug(f"API call failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay}s: {e}")
+                time.sleep(delay)
+                delay = min(_BACKOFF_MAX, delay * 2)  # Exponential backoff
+            else:
+                logger.warning(f"API call failed after {max_retries + 1} attempts: {e}")
+
+    raise last_exception if last_exception else RuntimeError("Unexpected retry failure")
+
 
 def _recommendations_loop() -> None:
+    logger.info("[RECO_DEBUG] _recommendations_loop STARTED")
     last_short = 0
+    last_medium = 0
     last_long = 0
     fail_count = 0
     backoff = _BACKOFF_BASE
+    medium_bootstrapped = False
+    loop_iter = 0
     while True:
         try:
+            loop_iter += 1
             now = int(time.time())
+            due_short = now - last_short >= RECO_SHORT_EVERY_SEC
+            due_medium = now - last_medium >= RECO_MEDIUM_EVERY_SEC
+            due_long = now - last_long >= RECO_LONG_EVERY_SEC
+            if loop_iter <= 3 or due_short or due_medium or due_long:
+                logger.info("[RECO_DEBUG] recommendations_loop iter=%d due_short=%s due_medium=%s due_long=%s",
+                    loop_iter, due_short, due_medium, due_long)
+
+            if not medium_bootstrapped:
+                try:
+                    counts = count_recommendations_by_horizon()
+                    if counts.get("medium", 0) == 0:
+                        logger.info("Medium Term has 0 records - running bootstrap scan")
+                        _scan_recommendations("medium")
+                        last_medium = now
+                    medium_bootstrapped = True
+                except Exception as e:
+                    logger.debug("Medium bootstrap check: %s", e)
+
+            horizons_due = []
             if now - last_short >= RECO_SHORT_EVERY_SEC:
-                _scan_recommendations("short")
-                last_short = now
+                horizons_due.append("short")
+            if now - last_medium >= RECO_MEDIUM_EVERY_SEC:
+                horizons_due.append("medium")
             if now - last_long >= RECO_LONG_EVERY_SEC:
-                _scan_recommendations("long")
-                last_long = now
+                horizons_due.append("long")
+
+            if horizons_due:
+                with _globals_lock:
+                    already_scanning = [h for h in horizons_due if (_RECO_STATE.get(h) or {}).get("scanning")]
+                if already_scanning:
+                    logger.warning("[SCAN] Skipping trigger: horizons %s already scanning (possible prior timeout)",
+                        already_scanning)
+                    horizons_due = [h for h in horizons_due if h not in already_scanning]
+                if horizons_due:
+                    _scan_all_horizons(horizons_due)
+                    scan_time = int(time.time())
+                    if "short" in horizons_due: last_short = scan_time
+                    if "medium" in horizons_due: last_medium = scan_time
+                    if "long" in horizons_due: last_long = scan_time
+
+            evicted = _evict_ohlcv_cache()
+            if evicted > 0:
+                logger.info("[SCAN] Evicted %d stale OHLCV cache entries (remaining: %d)",
+                    evicted, len(_RECO_OHLCV_CACHE))
+            gc.collect()
+
             fail_count = 0
             backoff = _BACKOFF_BASE
         except Exception:
@@ -1681,8 +2180,8 @@ def _recommendations_loop() -> None:
                     requests.post(DISCORD_WEBHOOK_URL, json={"content": f"⚠️ Recommendations loop: {fail_count} consecutive failures. Degraded."}, timeout=3)
                 except Exception:
                     pass
-            backoff = min(_BACKOFF_MAX, backoff * 2)
-        time.sleep(max(10, int(backoff)))
+            backoff = min(_BACKOFF_MAX, backoff * 1.5)
+        time.sleep(max(5, int(backoff)))
 
 
 def _ml_retrain_loop() -> None:
@@ -1766,13 +2265,26 @@ def _portfolio_snapshot() -> Dict[str, Any]:
         )
 
         def price_for_asset(asset: str) -> Optional[float]:
-            if asset == "USD":
+            if asset in ("USD", "ZUSD"):
                 return 1.0
-            a = "XBT" if asset == "BTC" else asset
+            # Normalize Kraken internal names: XXBT->XBT, XETH->ETH, etc.
+            a = asset
+            if a == "BTC":
+                a = "XBT"
+            elif a.startswith("X") and len(a) == 4 and a != "XBT":
+                a = a[1:]  # XETH -> ETH, XLTC -> LTC
+            elif a.startswith("Z") and len(a) == 4:
+                a = a[1:]  # ZUSD -> USD (already handled above)
             sym = f"{a}/USD"
             if sym in symbols_usd:
                 try:
                     return float(kc.fetch_ticker_last(sym))
+                except Exception:
+                    return None
+            # Fallback: try XBT mapping for BTC variants
+            if a in ("BTC", "XXBT"):
+                try:
+                    return float(kc.fetch_ticker_last("XBT/USD"))
                 except Exception:
                     return None
             return None
@@ -1856,7 +2368,7 @@ def _portfolio_loop():
                 _last_portfolio_ts = time.time()
             # Record to portfolio_snapshots for charts (11.md)
             try:
-                from db import _conn
+                from db import _conn, cleanup_old_portfolio_snapshots
                 con = _conn()
                 try:
                     con.execute(
@@ -1864,6 +2376,14 @@ def _portfolio_loop():
                         (total_usd, 0.0, snap.get("positions_count", 0), 0.0),
                     )
                     con.commit()
+                    # Run cleanup once per day to keep last 90 days
+                    now_float = time.time()
+                    if now_float - _last_portfolio_cleanup_ts >= 86400:
+                        try:
+                            cleanup_old_portfolio_snapshots(keep_days=90)
+                            globals()["_last_portfolio_cleanup_ts"] = now_float
+                        except Exception:
+                            pass
                 finally:
                     con.close()
             except Exception:
@@ -2006,8 +2526,8 @@ def _discord_status_loop() -> None:
         except Exception:
             logger.exception("_discord_status_loop: iteration failed")
             fail_count += 1
-            backoff = min(_BACKOFF_MAX, backoff * 2)
-        time.sleep(max(10, int(backoff)))
+            backoff = min(_BACKOFF_MAX, backoff * 1.5)
+        time.sleep(max(5, int(backoff)))
 
 
 def _pause_state() -> bool:
@@ -2096,7 +2616,11 @@ def _autostart_loop() -> None:
         attempts += 1
 
 
+_WATCHDOG_STICKY_ERRORS: Dict[int, Dict[str, Any]] = {}
+
+
 def _health_watchdog_loop() -> None:
+    global _WATCHDOG_STICKY_ERRORS
     while True:
         try:
             if bm is None:
@@ -2113,23 +2637,39 @@ def _health_watchdog_loop() -> None:
                 bot_id = int(b.get("id"))
                 snap = bm.snapshot(bot_id)
                 if not bool(snap.get("running")):
-                    # Only restart if bot is enabled and should be running
                     bot = get_bot(bot_id)
                     if bot and int(bot.get("enabled", 0)) == 1:
-                        # Add a minimum cooldown to avoid rapid restart loops
                         last_restart = getattr(_health_watchdog_loop, f"_last_restart_{bot_id}", 0)
-                        if (now - last_restart) > 60:  # Don't restart more than once per 60 seconds
+                        fail_count = getattr(_health_watchdog_loop, f"_fail_count_{bot_id}", 0)
+                        if (now - last_restart) > 60:
                             ok, reason = _can_start_bot_live(b)
                             if ok:
-                                bm.start(bot_id)
-                                setattr(_health_watchdog_loop, f"_last_restart_{bot_id}", now)
-                                add_log(bot_id, "WARN", "Watchdog restarted bot.", "SYSTEM")
+                                try:
+                                    bm.start(bot_id)
+                                    setattr(_health_watchdog_loop, f"_last_restart_{bot_id}", now)
+                                    setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", 0)
+                                    _WATCHDOG_STICKY_ERRORS.pop(bot_id, None)
+                                    add_log(bot_id, "WARN", "Watchdog restarted bot.", "SYSTEM")
+                                except Exception as restart_err:
+                                    fail_count += 1
+                                    setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", fail_count)
+                                    _WATCHDOG_STICKY_ERRORS[bot_id] = {
+                                        "error": f"Watchdog restart failed: {restart_err}",
+                                        "fail_count": fail_count, "last_attempt_ts": now,
+                                    }
+                                    add_log(bot_id, "ERROR", f"Watchdog restart failed ({fail_count}x): {restart_err}", "SYSTEM")
                             else:
+                                fail_count += 1
+                                setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", fail_count)
+                                _WATCHDOG_STICKY_ERRORS[bot_id] = {
+                                    "error": f"Cannot start: {reason}",
+                                    "fail_count": fail_count, "last_attempt_ts": now,
+                                }
+                                if fail_count <= 3:
+                                    add_log(bot_id, "WARN", f"Watchdog: cannot restart — {reason}", "SYSTEM")
                                 logger.warning(
-                                    "watchdog: start blocked bot_id=%s market_type=%s reason=%s",
-                                    bot_id,
-                                    b.get("market_type"),
-                                    reason,
+                                    "watchdog: start blocked bot_id=%s market_type=%s reason=%s fails=%d",
+                                    bot_id, b.get("market_type"), reason, fail_count,
                                 )
                     continue
                 last_tick = int(snap.get("last_tick_ts") or 0)
@@ -2281,10 +2821,27 @@ def _start_websocket_with_timeout(ws_manager, timeout_sec: int = 10):
         _STARTUP_STATUS["websocket_status"] = "not_ready"
 
 
-def _init_alpaca_background():
-    """Initialize Alpaca clients in background so app can serve requests immediately."""
+def _init_alpaca_and_bm_sync():
+    """Initialize Alpaca (if ENABLE_ALPACA and keys present) and BotManager synchronously. No background thread."""
     global alpaca_paper, alpaca_live, bm, ALPACA_PAPER_READY, ALPACA_LIVE_READY, ALPACA_ERROR, _STARTUP_STATUS
-    # Log Alpaca key status for debugging "0 candles" issues
+    _has_alpaca_keys = bool(os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"))
+    _enable_alpaca = os.getenv("ENABLE_ALPACA", "1" if _has_alpaca_keys else "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    if not _enable_alpaca or not _has_alpaca_keys:
+        logger.info("worker_api startup: Alpaca skipped (ENABLE_ALPACA=%s, keys=%s); crypto-only mode.", _enable_alpaca, "set" if _has_alpaca_keys else "missing")
+        # Still create BotManager with Kraken only
+        with _globals_lock:
+            bm = None
+            if kc:
+                try:
+                    bm = BotManager(kc, None, None)
+                    if bm and hasattr(bm, "subscribe_all_symbols"):
+                        threading.Thread(target=bm.subscribe_all_symbols, daemon=True).start()
+                    logger.info("worker_api startup: BotManager OK (Crypto only)")
+                except Exception as e:
+                    _STARTUP_STATUS["last_startup_error"] = f"BotManager init failed: {e}"
+                    logger.exception("worker_api startup: BotManager init failed")
+        return
+
     pk = "SET" if os.getenv("ALPACA_API_KEY_PAPER") else "blank"
     sk = "SET" if os.getenv("ALPACA_API_SECRET_PAPER") else "blank"
     lk = "SET" if os.getenv("ALPACA_API_KEY_LIVE") else "blank"
@@ -2347,8 +2904,9 @@ def _init_alpaca_background():
         bp = 0.0
         if alpaca_paper:
             try:
-                bp = float((alpaca_paper.get_account() or {}).get("buying_power", 0))
-            except Exception:
+                bp = float((_retry_with_backoff(lambda: alpaca_paper.get_account() or {}, max_retries=2, base_delay=0.5)).get("buying_power", 0))
+            except Exception as e:
+                logger.debug(f"Failed to fetch Alpaca buying power on startup: {e}")
                 pass
         _STARTUP_STATUS["alpaca_ready"] = ALPACA_PAPER_READY or ALPACA_LIVE_READY
         _STARTUP_STATUS["alpaca_buying_power"] = bp
@@ -2369,12 +2927,56 @@ def _init_alpaca_background():
         # Candle pre-warm test
         if alpaca_paper and bm:
             try:
-                c = alpaca_paper.get_ohlcv("AAPL", "1h", 50)
+                c = _retry_with_backoff(lambda: alpaca_paper.get_ohlcv("AAPL", "1h", 50), max_retries=2, base_delay=0.5)
                 _STARTUP_STATUS["candle_test"] = f"fetched {len(c)} candles for AAPL" if c else "failed"
             except Exception as ex:
                 _STARTUP_STATUS["candle_test"] = f"error: {ex}"
     except Exception as e:
-        logger.exception("_init_alpaca_background failed: %s", e)
+        _STARTUP_STATUS["last_startup_error"] = f"Alpaca/BotManager init failed: {e}"
+        logger.exception("_init_alpaca_and_bm_sync failed: %s", e)
+
+
+def _retry_alpaca_init_if_keys_present() -> bool:
+    """
+    Attempt to re-initialize Alpaca if keys are present but ALPACA_PAPER_READY is False.
+    Returns True if Alpaca is now ready, False otherwise.
+    """
+    global alpaca_paper, alpaca_live, ALPACA_PAPER_READY, ALPACA_LIVE_READY, ALPACA_ERROR
+
+    _has_alpaca_keys = bool(os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"))
+
+    # Only retry if keys exist but neither is ready
+    if not _has_alpaca_keys or (ALPACA_PAPER_READY or ALPACA_LIVE_READY):
+        return ALPACA_PAPER_READY or ALPACA_LIVE_READY
+
+    logger.info("Attempting to re-initialize Alpaca (keys present, but not ready)...")
+
+    try:
+        with _globals_lock:
+            try:
+                if USE_UNIFIED_ALPACA and _UNIFIED_AVAILABLE and UnifiedAlpacaClient:
+                    alpaca_paper = UnifiedAlpacaClient(mode="paper", auto_start_websocket=False)
+                    logger.info("Alpaca PAPER re-initialized (Unified)")
+                else:
+                    alpaca_paper = AlpacaClient(mode="paper")
+                    logger.info("Alpaca PAPER re-initialized (Legacy)")
+                ALPACA_PAPER_READY = True
+                ALPACA_ERROR = ""
+            except Exception as e:
+                try:
+                    alpaca_paper = AlpacaClient(mode="paper")
+                    ALPACA_PAPER_READY = True
+                    ALPACA_ERROR = ""
+                    logger.info("Alpaca PAPER fallback to Legacy succeeded")
+                except Exception as e2:
+                    alpaca_paper = None
+                    ALPACA_PAPER_READY = False
+                    ALPACA_ERROR = f"Paper re-init failed: {e2}"
+                    logger.warning("Alpaca PAPER re-init failed: %s", e2)
+    except Exception as e:
+        logger.warning("Unexpected error during Alpaca re-init: %s", e)
+
+    return ALPACA_PAPER_READY or ALPACA_LIVE_READY
 
 
 def _validate_config() -> None:
@@ -2419,11 +3021,27 @@ def _startup_impl():
 
     _safe_init_db()
     _STARTUP_STATUS["db_ready"] = True
+    # Clean up stale/invalid recommendation scores (100-score artifacts, old data)
+    try:
+        from db import cleanup_invalid_scores
+        cleaned = cleanup_invalid_scores()
+        if cleaned > 0:
+            logger.info("startup: cleaned %d invalid/stale recommendation records", cleaned)
+    except Exception as e:
+        logger.debug("startup: cleanup_invalid_scores: %s", e)
     try:
         _STARTUP_STATUS["db_bots"] = len(list_bots())
     except Exception:
         pass
-    logger.info("Database connected (%s bots)", _STARTUP_STATUS.get("db_bots", 0))
+    from db import DB_NAME
+    _STARTUP_STATUS["db_path"] = DB_NAME
+    _STARTUP_STATUS["timestamp"] = int(time.time())
+    try:
+        env_res = get_last_load_result()
+        _STARTUP_STATUS["env_loaded_paths"] = env_res.get("loaded_paths") or []
+    except Exception:
+        _STARTUP_STATUS["env_loaded_paths"] = []
+    logger.info("Database: %s (%s bots)", DB_NAME, _STARTUP_STATUS.get("db_bots", 0))
 
     # Purge blocklisted symbols from recommendations (Explore tab)
     try:
@@ -2442,6 +3060,130 @@ def _startup_impl():
     except Exception as e:
         logger.warning("startup: token check failed: %s", e)
 
+    # --- KRAKEN DIAGNOSTIC: Check .env and env before init ---
+    _env_paths = [os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), os.path.join(os.getcwd(), ".env")]
+    _env_exists = any(os.path.exists(p) for p in _env_paths)
+    _kkey = os.getenv("KRAKEN_API_KEY", "")
+    _ksec = os.getenv("KRAKEN_API_SECRET", "")
+    _kkey_in_file = False
+    _ksec_in_file = False
+    _kkey_raw = ""
+    _ksec_raw = ""
+    for _p in _env_paths:
+        if os.path.exists(_p):
+            try:
+                with open(_p, "r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        if "KRAKEN_API_KEY" in _line and "=" in _line:
+                            _kkey_in_file = True
+                            _parts = _line.split("=", 1)
+                            if len(_parts) == 2:
+                                _kkey_raw = _parts[1].strip().strip('"').strip("'")
+                        if "KRAKEN_API_SECRET" in _line and "=" in _line:
+                            _ksec_in_file = True
+                            _parts = _line.split("=", 1)
+                            if len(_parts) == 2:
+                                _ksec_raw = _parts[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+            break
+    logger.info(
+        "[KRAKEN_DEBUG] .env exists=%s | KRAKEN_API_KEY in file=%s in env=%s len=%d first4=%s | KRAKEN_API_SECRET in file=%s in env=%s len=%d first4=%s",
+        _env_exists, _kkey_in_file, bool(_kkey), len(_kkey), (_kkey[:4] + "..." if len(_kkey) >= 4 else ("(empty)" if not _kkey else _kkey[:4])),
+        _ksec_in_file, bool(_ksec), len(_ksec), (_ksec[:4] + "..." if len(_ksec) >= 4 else ("(empty)" if not _ksec else _ksec[:4])),
+    )
+    if _kkey_raw and _kkey_raw != _kkey:
+        logger.warning("[KRAKEN_DEBUG] KRAKEN_API_KEY in .env differs from os.environ (env may have been set before load_env, or key was skipped because k in os.environ)")
+    if _ksec_raw and _ksec_raw != _ksec:
+        logger.warning("[KRAKEN_DEBUG] KRAKEN_API_SECRET in .env differs from os.environ")
+    # --- END KRAKEN DIAGNOSTIC ---
+
+    # === KRAKEN DIAGNOSTIC (startup) ===
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _env_paths = [
+        os.path.join(_base, ".env"),
+        os.path.join(os.getcwd(), ".env"),
+    ]
+    if os.getenv("ENV_FILE"):
+        _env_paths.insert(0, os.getenv("ENV_FILE"))
+    _env_exists = any(os.path.exists(p) for p in _env_paths)
+    _env_loaded = _STARTUP_STATUS.get("env_loaded_paths") or []
+    _kk = os.getenv("KRAKEN_API_KEY", "")
+    _ks = os.getenv("KRAKEN_API_SECRET", "")
+    _kk_preview = (_kk[:4] + "…") if _kk and len(_kk) >= 4 else ("EMPTY" if not _kk else "len=" + str(len(_kk)))
+    _ks_preview = (_ks[:4] + "…") if _ks and len(_ks) >= 4 else ("EMPTY" if not _ks else "len=" + str(len(_ks)))
+    # Check .env raw lines for KRAKEN (format issues: spaces, quotes)
+    _kraken_lines_raw = []
+    for _p in _env_paths:
+        if os.path.exists(_p):
+            try:
+                with open(_p, "r", encoding="utf-8") as _f:
+                    for _ln in _f:
+                        if "KRAKEN" in _ln.upper() and "=" in _ln and not _ln.strip().startswith("#"):
+                            _kraken_lines_raw.append(repr(_ln.rstrip()))
+            except Exception:
+                pass
+            break
+    logger.info(
+        "[KRAKEN_DIAG] .env exists=%s | loaded_paths=%s | KRAKEN_API_KEY in env=%s (preview=%s) | KRAKEN_API_SECRET in env=%s (preview=%s) | .env KRAKEN lines: %s",
+        _env_exists, _env_loaded, bool(_kk), _kk_preview, bool(_ks), _ks_preview, _kraken_lines_raw[:4]
+    )
+
+    # === KRAKEN DIAGNOSTIC (startup) ===
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _env_paths = [os.path.join(_base, ".env"), os.path.join(os.getcwd(), ".env")]
+    _env_exists = any(os.path.exists(p) for p in _env_paths)
+    _env_loaded = os.path.abspath(_env_paths[0]) if os.path.exists(_env_paths[0]) else (os.path.abspath(_env_paths[1]) if os.path.exists(_env_paths[1]) else None)
+    _kk = os.getenv("KRAKEN_API_KEY", "")
+    _ks = os.getenv("KRAKEN_API_SECRET", "")
+    _kk_first4 = (_kk[:4] + "...") if _kk and len(_kk) >= 4 else ("EMPTY" if not _kk else ("len=" + str(len(_kk))))
+    _ks_first4 = (_ks[:4] + "...") if _ks and len(_ks) >= 4 else ("EMPTY" if not _ks else ("len=" + str(len(_ks))))
+    print(f"[KRAKEN_DIAG] .env exists: {_env_exists} (checked: {_env_paths})")
+    print(f"[KRAKEN_DIAG] .env loaded from: {_env_loaded or 'NONE'}")
+    print(f"[KRAKEN_DIAG] KRAKEN_API_KEY in os.environ: {bool(_kk)} first4={_kk_first4}")
+    print(f"[KRAKEN_DIAG] KRAKEN_API_SECRET in os.environ: {bool(_ks)} first4={_ks_first4}")
+    if _env_loaded:
+        try:
+            with open(_env_loaded, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    _l = _line.rstrip()
+                    if "KRAKEN" in _l and not _l.strip().startswith("#"):
+                        _has_spaces = " = " in _l or _l.startswith(" ") or "= " in _l.split("=", 1)[0]
+                        _has_quotes = '"' in _l or "'" in _l
+                        print(f"[KRAKEN_DIAG] .env line format: key_part={repr(_l.split('=')[0])} has_spaces_around_eq={_has_spaces} has_quotes={_has_quotes}")
+        except Exception as _e:
+            print(f"[KRAKEN_DIAG] .env read error: {_e}")
+    # === END KRAKEN DIAGNOSTIC ===
+
+    # === KRAKEN DIAGNOSTIC (startup) ===
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _env_paths = [os.path.join(_base, ".env"), os.path.join(os.getcwd(), ".env")]
+    _env_exists = any(os.path.exists(p) for p in _env_paths)
+    _env_loaded = _STARTUP_STATUS.get("env_loaded_paths") or []
+    _kk = os.getenv("KRAKEN_API_KEY", "")
+    _ks = os.getenv("KRAKEN_API_SECRET", "")
+    _kk_preview = (_kk[:4] + "...") if _kk and len(_kk) >= 4 else ("EMPTY" if not _kk else "***")
+    _ks_preview = (_ks[:4] + "...") if _ks and len(_ks) >= 4 else ("EMPTY" if not _ks else "***")
+    print(
+        f"[KRAKEN_DEBUG] .env exists: {_env_exists} | paths tried: {_env_paths} | loaded: {_env_loaded} | "
+        f"KRAKEN_API_KEY in env: {bool(_kk)} (first4={_kk_preview}) | "
+        f"KRAKEN_API_SECRET in env: {bool(_ks)} (first4={_ks_preview})"
+    )
+    # Check .env raw lines for format issues (spaces, quotes)
+    for _p in _env_paths:
+        if os.path.exists(_p):
+            try:
+                with open(_p, "r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        _line = _line.rstrip("\n\r")
+                        if "KRAKEN" in _line and not _line.strip().startswith("#"):
+                            _has_spaces = " = " in _line or _line.startswith(" ") or " =" in _line
+                            _has_quotes = '"' in _line or "'" in _line
+                            print(f"[KRAKEN_DEBUG] .env line: {repr(_line[:80])} (spaces_around_eq={_has_spaces}, has_quotes={_has_quotes})")
+            except Exception as _e:
+                print(f"[KRAKEN_DEBUG] Could not read .env: {_e}")
+            break
+
     with _globals_lock:
         try:
             kc = KrakenClient()
@@ -2454,15 +3196,19 @@ def _startup_impl():
             KRAKEN_ERROR = str(e)
             logger.warning("worker_api startup: Kraken NOT initialized: %s", e)
 
-    # Fail fast: stock provider is Alpaca; keys required for stocks
-    if not os.getenv("ALPACA_API_KEY_PAPER") or not os.getenv("ALPACA_API_SECRET_PAPER"):
-        raise ValueError(
-            "Alpaca paper API keys required for stock trading. "
-            "Set ALPACA_API_KEY_PAPER and ALPACA_API_SECRET_PAPER in .env"
-        )
-    # Alpaca + BotManager init in background so site loads immediately (non-blocking)
+    _STARTUP_STATUS["kraken_ready"] = KRAKEN_READY
+    # ENABLE_ALPACA: 0 = crypto-only (skip Alpaca); 1 = require Alpaca for stocks. Default 0 if keys missing.
+    _has_alpaca_keys = bool(os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"))
+    _enable_alpaca_val = os.getenv("ENABLE_ALPACA", "1" if _has_alpaca_keys else "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    if _enable_alpaca_val and not _has_alpaca_keys:
+        _STARTUP_STATUS["last_startup_error"] = "ENABLE_ALPACA=1 but ALPACA_API_KEY_PAPER or ALPACA_API_SECRET_PAPER missing; set keys in .env or ENABLE_ALPACA=0 for crypto-only"
+        logger.warning("worker_api startup: %s", _STARTUP_STATUS["last_startup_error"])
+
     _STARTUP_STATUS["flask_ready"] = True
-    threading.Thread(target=_init_alpaca_background, daemon=True).start()
+    # Deterministic startup: Alpaca + BotManager init synchronously (no background thread)
+    _init_alpaca_and_bm_sync()
+    _STARTUP_STATUS["alpaca_ready"] = ALPACA_PAPER_READY or ALPACA_LIVE_READY
+    _STARTUP_STATUS["bm_ready"] = bm is not None
 
     # Autopilot status (from DB)
     try:
@@ -2487,6 +3233,7 @@ def _startup_impl():
         ("ml_retrain", _ml_retrain_loop),
         ("ml_outcomes", _ml_outcomes_loop),
         ("autopilot", _autopilot_loop),
+        ("thread_watchdog", _thread_watchdog_loop),
     ]:
         try:
             _start_background_thread(name, target)
@@ -2525,7 +3272,8 @@ def _startup_impl():
 async def api_update_bot(bot_id: int, request: Request):
     """Update bot settings. Merges payload with existing bot for partial updates."""
     if not bm:
-        return _json({"ok": False, "error": "BotManager not initialized"}, 503)
+        reason = _bm_not_ready_reason() or "BotManager not initialized"
+        return _json({"ok": False, "error": "BotManager not initialized", "reason": reason}, 503)
     payload = await request.json()
     if not isinstance(payload, dict):
         return _json({"ok": False, "error": "Invalid payload"}, 400)
@@ -2690,39 +3438,270 @@ def health():
         ts = int(time.time())
     try:
         db_ok = True
+        db_latency = 0
+        db_start = time.time()
         try:
             init_db()
-        except Exception:
+            db_latency = int((time.time() - db_start) * 1000)
+        except Exception as e:
             db_ok = False
+            logger.debug("DB health check failed: %s", e)
+
         status = "healthy" if db_ok else "degraded"
+
+        # Check Kraken
+        kr = False
+        kraken_latency = 0
         try:
+            kraken_start = time.time()
             kr = bool(_kraken_ready())
-        except Exception:
-            kr = False
-        # LIVE-HARDENED: uptime and last autopilot heartbeat for monitoring
+            kraken_latency = int((time.time() - kraken_start) * 1000)
+        except Exception as e:
+            logger.debug("Kraken health check failed: %s", e)
+
+        # Check Alpaca (simplified latency check)
+        alpaca_latency = 0
+
+        # Check disk space
+        disk_free_gb = 0.0
+        try:
+            import shutil
+            disk_stat = shutil.disk_usage("/")
+            disk_free_gb = round(disk_stat.free / (1024**3), 1)
+        except Exception as e:
+            logger.debug("Disk space check failed: %s", e)
+
         uptime_sec = int(time.time() - _APP_START_TIME) if _APP_START_TIME else 0
         last_autopilot_heartbeat = 0
         try:
             last_autopilot_heartbeat = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0)
         except Exception:
             pass
+
         return {
             "ok": True,
             "status": status,
-            "kraken_ready": kr,
-            "kraken_error": KRAKEN_ERROR or "",
-            "alpaca_paper_ready": ALPACA_PAPER_READY,
-            "alpaca_live_ready": ALPACA_LIVE_READY,
-            "alpaca_error": ALPACA_ERROR or "",
-            "bot_manager_ready": bm is not None,
-            "db_ok": db_ok,
+            "checks": {
+                "database": {
+                    "status": "ok" if db_ok else "error",
+                    "latency_ms": db_latency
+                },
+                "kraken": {
+                    "status": "ok" if kr else "error",
+                    "latency_ms": kraken_latency
+                },
+                "alpaca": {
+                    "status": "ok" if ALPACA_PAPER_READY or ALPACA_LIVE_READY else "error",
+                    "latency_ms": alpaca_latency
+                },
+                "disk_space": {
+                    "status": "ok" if disk_free_gb > 1.0 else "warning",
+                    "free_gb": disk_free_gb
+                }
+            },
+            "uptime_seconds": uptime_sec,
+            "version": "2.0.0",
             "time": ts,
-            "uptime_sec": uptime_sec,
             "last_autopilot_heartbeat_ts": last_autopilot_heartbeat if last_autopilot_heartbeat else None,
         }
     except Exception as e:
         logger.exception("health handler error")
         return {"ok": False, "status": "error", "error": str(e)[:200], "time": ts}
+
+
+@app.get("/api/debug/db_info")
+def api_debug_db_info():
+    """Return DB path, bot count, recommendation count, and cwd for persistence verification."""
+    try:
+        from db import DB_NAME
+        init_db()
+        bots = list_bots()
+        bot_count = len(bots)
+        last_bot_id = max((int(b.get("id") or 0) for b in bots), default=0)
+        autopilot_bots = [b for b in bots if str(b.get("bot_type") or "").lower() == "autopilot"]
+        enabled_bots = [b for b in bots if int(b.get("enabled", 0)) == 1]
+        reco_count = 0
+        try:
+            from db import list_recommendations
+            reco_count = len(list_recommendations("long", limit=500))
+        except Exception:
+            pass
+        return _json({
+            "ok": True,
+            "db_path": DB_NAME,
+            "db_path_abs": os.path.abspath(DB_NAME),
+            "bot_count": bot_count,
+            "autopilot_bot_count": len(autopilot_bots),
+            "enabled_bot_count": len(enabled_bots),
+            "recommendation_count": reco_count,
+            "last_bot_id": last_bot_id if bot_count else None,
+            "cwd": os.getcwd(),
+        })
+    except Exception as e:
+        try:
+            from db import DB_NAME as _db_path
+        except Exception:
+            _db_path = None
+        return _json({"ok": False, "error": str(e)[:200], "db_path": _db_path})
+
+
+@app.get("/api/debug/bm_ready")
+def api_debug_bm_ready():
+    """Return whether BotManager is initialized, with reason if not."""
+    reason = _bm_not_ready_reason()
+    return _json({
+        "ok": True,
+        "bm_ready": bm is not None,
+        "reason": reason,
+        "kraken_ready": KRAKEN_READY,
+        "kraken_error": KRAKEN_ERROR or None,
+        "alpaca_paper_ready": ALPACA_PAPER_READY,
+        "alpaca_live_ready": ALPACA_LIVE_READY,
+        "alpaca_error": ALPACA_ERROR or None,
+    })
+
+
+@app.get("/api/debug/watchdog_errors")
+def api_debug_watchdog_errors():
+    """Sticky errors from the health watchdog — bots that are enabled but failed to restart."""
+    return _json({"ok": True, "errors": dict(_WATCHDOG_STICKY_ERRORS)})
+
+
+@app.get("/api/debug/startup_status")
+def api_debug_startup_status():
+    """Full startup diagnostics for debugging autopilot and bot creation issues."""
+    db_path = _STARTUP_STATUS.get("db_path")
+    if db_path is None:
+        try:
+            from db import DB_NAME
+            db_path = DB_NAME
+        except Exception:
+            pass
+    paused = False
+    kill_switch = False
+    try:
+        paused = bool(_pause_state())
+        kill_switch = str(get_setting("kill_switch", "0")).strip().lower() in ("1", "true")
+    except Exception:
+        pass
+    s = {
+        "env_loaded_paths": _STARTUP_STATUS.get("env_loaded_paths") or [],
+        "db_path": db_path,
+        "db_path_abs": os.path.abspath(db_path) if db_path else None,
+        "kraken_ready": _STARTUP_STATUS.get("kraken_ready", KRAKEN_READY),
+        "kraken_error": KRAKEN_ERROR or None,
+        "alpaca_ready": _STARTUP_STATUS.get("alpaca_ready", ALPACA_PAPER_READY or ALPACA_LIVE_READY),
+        "alpaca_error": ALPACA_ERROR or None,
+        "bm_ready": _STARTUP_STATUS.get("bm_ready", bm is not None),
+        "bm_not_ready_reason": _bm_not_ready_reason(),
+        "last_startup_error": _STARTUP_STATUS.get("last_startup_error"),
+        "timestamp": _STARTUP_STATUS.get("timestamp"),
+        "paused": paused,
+        "kill_switch": kill_switch,
+        "cwd": os.getcwd(),
+        "uptime_sec": int(time.time() - _APP_START_TIME),
+    }
+    return _json({"ok": True, "startup_status": s})
+
+
+@app.get("/api/bots/{bot_id}/data_health")
+def api_bot_data_health(bot_id: int):
+    """Per-bot data health: last ticker, last candle per TF, stale flags, spread, provider errors."""
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    symbol = str(b.get("symbol", ""))
+    market = str(b.get("market_type", "crypto")).lower()
+    result: Dict[str, Any] = {
+        "ok": True, "bot_id": bot_id, "symbol": symbol,
+        "ticker": None, "candles": {}, "gate": None, "provider_errors": [],
+    }
+    try:
+        if market != "stocks" and kc:
+            t = kc.fetch_ticker(symbol)
+            bid = float(t.get("bid") or 0)
+            ask = float(t.get("ask") or 0)
+            last = float(t.get("last") or t.get("c") or 0)
+            mid = (bid + ask) / 2 if bid and ask else 0
+            spread_pct = ((ask - bid) / mid) if mid > 0 else None
+            ts = t.get("timestamp") or t.get("ts")
+            ticker_ts = (float(ts) / 1000.0 if float(ts) > 1e12 else float(ts)) if ts else None
+            age = (time.time() - ticker_ts) if ticker_ts else None
+            result["ticker"] = {
+                "bid": bid or None, "ask": ask or None, "last": last or None,
+                "spread_pct": round(spread_pct * 100, 4) if spread_pct is not None else None,
+                "ticker_ts": ticker_ts, "age_sec": round(age, 1) if age is not None else None,
+                "stale": age is not None and age > 120,
+            }
+        elif market == "stocks":
+            client = alpaca_live or alpaca_paper
+            if client:
+                try:
+                    t = client.get_ticker(symbol)
+                    result["ticker"] = {"last": float(t.get("last") or 0), "source": "alpaca"}
+                except Exception as e:
+                    result["provider_errors"].append(f"Alpaca ticker: {e}")
+    except Exception as e:
+        result["provider_errors"].append(f"Ticker fetch: {e}")
+    try:
+        if bm:
+            snap = bm.snapshot(bot_id)
+            if snap.get("gate_details"):
+                result["gate"] = snap["gate_details"]
+            result["last_tick_ts"] = snap.get("last_tick_ts")
+            result["running"] = snap.get("running", False)
+            result["risk_state"] = snap.get("risk_state")
+    except Exception as e:
+        result["provider_errors"].append(f"Snapshot: {e}")
+    try:
+        for tf in ["1h", "4h", "1d"]:
+            if market != "stocks" and bm and hasattr(bm, "ohlcv_cached"):
+                candles = bm.ohlcv_cached(symbol, tf, 5, ttl_sec=600)
+                if candles and len(candles) > 0:
+                    last_ts = float(candles[-1][0]) / 1000.0 if float(candles[-1][0]) > 1e12 else float(candles[-1][0])
+                    age = time.time() - last_ts
+                    tf_sec = {"1h": 3600, "4h": 14400, "1d": 86400}.get(tf, 3600)
+                    result["candles"][tf] = {
+                        "count": len(candles),
+                        "last_candle_ts": last_ts,
+                        "age_sec": round(age, 1),
+                        "stale": age > tf_sec * 3,
+                    }
+                else:
+                    result["candles"][tf] = {"count": 0, "stale": True}
+    except Exception as e:
+        result["provider_errors"].append(f"OHLCV: {e}")
+    return _json(result)
+
+
+@app.get("/api/bots/{bot_id}/execution_gate")
+def api_bot_execution_gate(bot_id: int):
+    """Run the execution gate check for a bot and return the result (diagnostic only)."""
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    symbol = str(b.get("symbol", ""))
+    try:
+        from execution_gate import check_execution_gate, fetch_gate_inputs
+        if kc:
+            inputs = fetch_gate_inputs(kc, symbol, b)
+        else:
+            inputs = {"error": "No trading client available"}
+        if inputs.get("error"):
+            return _json({"ok": False, "error": inputs["error"], "inputs": inputs})
+        gate = check_execution_gate(
+            symbol=symbol,
+            bid=inputs.get("bid"),
+            ask=inputs.get("ask"),
+            last_price=inputs.get("last_price"),
+            ticker_ts=inputs.get("ticker_ts"),
+            volume_24h=inputs.get("volume_24h"),
+            bot_spread_guard_pct=float(b.get("spread_guard_pct", 0.003)),
+            dry_run=bool(b.get("dry_run", 1)),
+        )
+        return _json({"ok": True, "gate": gate.to_dict(), "inputs": inputs})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)[:200]})
 
 
 @app.get("/ready")
@@ -2736,8 +3715,12 @@ def ready():
         return _json({"ok": False, "checks": checks, "error": f"db: {e}"}, 503)
     try:
         if ALPACA_PAPER_READY and alpaca_paper:
-            _ = (alpaca_paper.get_account() or {})
-            checks["alpaca"] = True
+            try:
+                _ = _retry_with_backoff(lambda: alpaca_paper.get_account() or {}, max_retries=2, base_delay=0.5)
+                checks["alpaca"] = True
+            except Exception as e:
+                logger.warning(f"Alpaca health check failed (will retry): {e}")
+                checks["alpaca"] = False
         elif not os.getenv("ALPACA_API_KEY_PAPER"):
             checks["alpaca"] = True  # Not configured, skip
         else:
@@ -2757,13 +3740,16 @@ def ready():
 # =========================================================
 @app.get("/api/startup_status")
 def api_startup_status():
-    """Startup diagnostics - flask, db, alpaca, websocket, autopilot, candle fetch test."""
+    """Startup diagnostics - flask, db, alpaca, websocket, autopilot, env_loaded_paths, db_path, bm_ready, last_startup_error, timestamp."""
     s = dict(_STARTUP_STATUS)
     s["alpaca_ready"] = ALPACA_PAPER_READY or ALPACA_LIVE_READY
+    s["kraken_ready"] = s.get("kraken_ready", KRAKEN_READY)
+    s["bm_ready"] = s.get("bm_ready", bm is not None)
     if alpaca_paper:
         try:
-            s["alpaca_buying_power"] = float((alpaca_paper.get_account() or {}).get("buying_power", 0))
-        except Exception:
+            s["alpaca_buying_power"] = float((_retry_with_backoff(lambda: alpaca_paper.get_account() or {}, max_retries=2, base_delay=0.5)).get("buying_power", 0))
+        except Exception as e:
+            logger.debug(f"Failed to fetch Alpaca buying power in status endpoint: {e}")
             pass
     try:
         import autopilot
@@ -2805,6 +3791,14 @@ def api_health():
             expanded = {"ok": db_ok, "status": "healthy" if db_ok else "degraded"}
         with _thread_start_lock:
             expanded["threads_started"] = list(_thread_started.keys())
+        thread_health = {}
+        for name, info in _background_threads.items():
+            t = info.get("thread")
+            thread_health[name] = {
+                "alive": t.is_alive() if t else False,
+                "uptime_sec": int(time.time() - info.get("started_at", 0)),
+            }
+        expanded["thread_health"] = thread_health
         expanded["last_portfolio_ts"] = _last_portfolio_ts
         expanded["last_reco_short_ts"] = _last_reco_short_ts
         expanded["last_reco_long_ts"] = _last_reco_long_ts
@@ -2870,6 +3864,63 @@ def api_diag_network():
         result["https_head"] = {"ok": False, "error": str(e)}
     result["ok"] = result["dns"].get("ok", False) and result["https_head"].get("ok", False)
     return _json(result)
+
+
+@app.get("/api/diag/scan_full")
+def api_diag_scan_full():
+    """
+    Diagnostic: scan pipeline state for Market Screener troubleshooting.
+    Returns: RECO_STATE, SCAN_PROGRESS, cache sizes, thread count, intervals, DB counts.
+    """
+    now_ts = int(time.time())
+    with _globals_lock:
+        short_s = (_RECO_STATE.get("short") or {}).copy()
+        medium_s = (_RECO_STATE.get("medium") or {}).copy()
+        long_s = (_RECO_STATE.get("long") or {}).copy()
+        prog = dict(_SCAN_PROGRESS)
+    try:
+        counts = count_recommendations_by_horizon()
+    except Exception as e:
+        counts = {"error": str(e)}
+    thread_count = threading.active_count()
+    ohlcv_cache_size = len(_RECO_OHLCV_CACHE)
+    ohlcv_fetch_locks = len(_OHLCV_FETCH_LOCKS)
+    ram_mb = None
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        ram_mb = round(rss / 1024.0, 2)
+    except ImportError:
+        try:
+            import psutil
+            proc = psutil.Process()
+            ram_mb = round(proc.memory_info().rss / (1024 * 1024), 2)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    short_last = short_s.get("last_run_ts", 0)
+    medium_last = medium_s.get("last_run_ts", 0)
+    long_last = long_s.get("last_run_ts", 0)
+    return _json({
+        "ok": True,
+        "timestamp": now_ts,
+        "reco_state": {"short": short_s, "medium": medium_s, "long": long_s},
+        "scan_progress": prog,
+        "intervals_sec": {
+            "short": RECO_SHORT_EVERY_SEC, "medium": RECO_MEDIUM_EVERY_SEC, "long": RECO_LONG_EVERY_SEC,
+        },
+        "ages_sec": {
+            "short": now_ts - short_last if short_last else None,
+            "medium": now_ts - medium_last if medium_last else None,
+            "long": now_ts - long_last if long_last else None,
+        },
+        "db_counts": counts,
+        "thread_count": thread_count,
+        "ohlcv_cache_entries": ohlcv_cache_size,
+        "ohlcv_fetch_locks": ohlcv_fetch_locks,
+        "ram_mb": ram_mb,
+    })
 
 
 @app.get("/api/stats")
@@ -2961,6 +4012,38 @@ def api_symbols(quote: str = "USD"):
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}", "symbols": []}, 500)
 
 
+@app.get("/api/notifications")
+def api_notifications(limit: int = 50, unread_only: bool = False):
+    """Get recent notifications for in-app display."""
+    try:
+        from notification_manager import get_notifications, get_unread_count
+
+        notifications = get_notifications(limit=limit, unread_only=unread_only)
+        unread_count = get_unread_count()
+
+        return _json({
+            "ok": True,
+            "notifications": notifications,
+            "unread_count": unread_count,
+        })
+    except Exception as e:
+        logger.error(f"Notifications API error: {type(e).__name__}: {e}")
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}", "notifications": [], "unread_count": 0}, 500)
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def api_mark_notification_read(notification_id: int):
+    """Mark a notification as read."""
+    try:
+        from notification_manager import mark_notification_read
+
+        success = mark_notification_read(notification_id)
+        return _json({"ok": success, "notification_id": notification_id})
+    except Exception as e:
+        logger.error(f"Mark notification read error: {type(e).__name__}: {e}")
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
 @app.get("/api/alpaca/symbols")
 def api_alpaca_symbols():
     """Get list of tradeable stock symbols from Alpaca"""
@@ -2970,7 +4053,7 @@ def api_alpaca_symbols():
             return _json({"ok": False, "error": "Alpaca not initialized", "symbols": []}, 503)
         
         # Get top tradeable stocks
-        assets = alpaca_paper.search_assets(query="", asset_class="us_equity")
+        assets = _retry_with_backoff(lambda: alpaca_paper.search_assets(query="", asset_class="us_equity"), max_retries=2, base_delay=0.5)
         
         # Filter to tradeable and sort by common popularity
         popular_symbols = [
@@ -3718,6 +4801,19 @@ def api_bot_status(bot_id: int):
     except Exception as e:
         logger.debug("data_health fetch failed: %s", e)
 
+    last_decisions = []
+    try:
+        from db import list_logs as _list_bot_logs
+        logs = _list_bot_logs(int(bot_id), limit=10)
+        for lg in (logs or []):
+            msg = lg.get("message") or ""
+            if any(k in msg for k in ("STRATEGY:", "Decision:", "INTELLIGENCE:", "Risk blocked:", "Order placed")):
+                last_decisions.append({"ts": lg.get("ts"), "level": lg.get("level"), "message": msg})
+                if len(last_decisions) >= 5:
+                    break
+    except Exception:
+        pass
+
     return _json({
         "ok": True,
         "bot": b,
@@ -3727,6 +4823,7 @@ def api_bot_status(bot_id: int):
         "kraken_error": KRAKEN_ERROR,
         "paused": bool(_pause_state()),
         "data_health": data_health,
+        "last_decisions": last_decisions,
     })
 
 
@@ -3873,15 +4970,222 @@ def api_strategies_leaderboard(window_days: int = 90):
 
 @app.get("/api/recommendations/scan_status")
 def api_recommendations_scan_status():
-    """Return current scan progress for short/long horizons. Used during Rescan."""
+    """Return current scan progress for short/medium/long horizons. Used during Rescan."""
     with _globals_lock:
         short_state = (_RECO_STATE.get("short") or {}).copy()
+        medium_state = (_RECO_STATE.get("medium") or {}).copy()
         long_state = (_RECO_STATE.get("long") or {}).copy()
     return _json({
         "ok": True,
         "short": {"scanned": short_state.get("scanned", 0), "total": short_state.get("total", 0), "scanning": short_state.get("scanning", False)},
+        "medium": {"scanned": medium_state.get("scanned", 0), "total": medium_state.get("total", 0), "scanning": medium_state.get("scanning", False)},
         "long": {"scanned": long_state.get("scanned", 0), "total": long_state.get("total", 0), "scanning": long_state.get("scanning", False)},
     })
+
+
+@app.get("/api/recommendations/scan_progress")
+def api_recommendations_scan_progress():
+    """Rich progress data for the live status panel: per-horizon state, current symbol, errors, history, ETA."""
+    now_t = time.time()
+    with _globals_lock:
+        prog = {k: v for k, v in _SCAN_PROGRESS.items()}
+        horizons = {}
+        any_scanning = False
+        for h in ("short", "medium", "long"):
+            st = (_RECO_STATE.get(h) or {}).copy()
+            scanning = bool(st.get("scanning"))
+            if scanning:
+                any_scanning = True
+            last_ts = st.get("last_run_ts", 0)
+            horizons[h] = {
+                "scanning": scanning,
+                "scanned": st.get("scanned", 0),
+                "total": st.get("total", 0),
+                "eligible": st.get("eligible", 0),
+                "error": st.get("error", ""),
+                "last_run_ts": last_ts,
+                "last_run_ago_sec": int(now_t - last_ts) if last_ts else None,
+            }
+    eta_sec = None
+    if any_scanning:
+        cur_h = prog.get("current_horizon", "")
+        st = horizons.get(cur_h, {})
+        done = st.get("scanned", 0)
+        total = st.get("total", 0)
+        elapsed = now_t - prog.get("scan_start_ts", now_t)
+        if done > 0 and total > done and elapsed > 0:
+            rate = done / elapsed
+            eta_sec = int((total - done) / rate)
+    return _json({
+        "ok": True,
+        "any_scanning": any_scanning,
+        "current_symbol": prog.get("current_symbol", ""),
+        "current_horizon": prog.get("current_horizon", ""),
+        "buy_signals_found": prog.get("buy_signals_found", 0),
+        "eta_sec": eta_sec,
+        "horizons": horizons,
+        "recent_errors": (prog.get("recent_errors") or [])[-5:],
+        "scan_history": (prog.get("scan_history") or [])[-5:],
+        "server_ts": int(now_t),
+    })
+
+
+@app.get("/api/recommendations/diagnose")
+def api_recommendations_diagnose(symbols: str = "XBT/USD,ETH/USD,SOL/USD,XRP/USD,ADA/USD", horizon: str = "short"):
+    """Diagnostic: scan specific symbols and show raw scores, filter decisions, and why they pass/fail."""
+    sym_list = [s.strip() for s in symbols.split(",") if s.strip()][:10]
+    btc_ctx = _btc_context()
+    buy_thresh_crypto = _reco_buy_threshold_crypto()
+    buy_thresh_stocks = _reco_buy_threshold_stocks()
+    watch_thresh = _reco_watch_threshold()
+    results = []
+    for sym in sym_list:
+        entry = {"symbol": sym, "raw_score": 0, "final_score": 0, "eligible": False,
+                 "signal": "wait", "filters_passed": [], "filters_failed": [], "reasons": [],
+                 "risk_flags": [], "regime": "", "error": None}
+        try:
+            snap = _scan_symbol(sym, horizon, btc_ctx)
+            if not snap:
+                entry["error"] = "No data returned"
+                results.append(entry)
+                continue
+            score = float(snap.get("score") or 0)
+            entry["raw_score"] = score
+            entry["final_score"] = score
+            entry["eligible"] = bool(snap.get("eligible", False))
+            entry["reasons"] = snap.get("reasons") or []
+            entry["risk_flags"] = snap.get("risk_flags") or []
+            regime = snap.get("regime") or {}
+            entry["regime"] = str(regime.get("regime") or regime.get("label") or regime)
+            metrics = snap.get("metrics") or {}
+            entry["allowed_action"] = metrics.get("allowed_action", "")
+            is_stock = len(sym) < 6 and "/" not in sym
+            buy_t = buy_thresh_stocks if is_stock else buy_thresh_crypto
+            entry["buy_threshold"] = buy_t
+            entry["watch_threshold"] = watch_thresh
+            entry["signal"] = "buy" if score >= buy_t else ("watch" if score >= watch_thresh else "wait")
+            if snap.get("data_ok") is False:
+                entry["filters_failed"].append("DATA: data_ok=False")
+            else:
+                entry["filters_passed"].append("DATA: OK")
+            rflags = snap.get("risk_flags") or []
+            if "btc_risk_off" in rflags:
+                entry["filters_failed"].append("MACRO: btc_risk_off (score -20)")
+            else:
+                entry["filters_passed"].append("MACRO: no risk-off penalty")
+            if any("EXPLORE_V2_GATE" in str(f) for f in rflags):
+                gate_msg = [f for f in rflags if "EXPLORE_V2_GATE" in str(f)]
+                entry["filters_failed"].append(f"EXPLORE_V2: {gate_msg}")
+            else:
+                entry["filters_passed"].append("EXPLORE_V2: passed gates")
+            vol = metrics.get("volume_24h_quote")
+            if vol is not None and vol < RECO_MIN_VOLUME_24H:
+                entry["filters_failed"].append(f"VOLUME: {vol:.0f} < {RECO_MIN_VOLUME_24H:.0f}")
+            else:
+                entry["filters_passed"].append(f"VOLUME: {vol}")
+            if score < buy_t:
+                entry["filters_failed"].append(f"SCORE: {score:.1f} < buy_threshold {buy_t}")
+            else:
+                entry["filters_passed"].append(f"SCORE: {score:.1f} >= buy_threshold {buy_t}")
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        results.append(entry)
+    return _json({
+        "ok": True,
+        "horizon": horizon,
+        "btc_context": btc_ctx,
+        "thresholds": {
+            "buy_crypto": buy_thresh_crypto,
+            "buy_stocks": buy_thresh_stocks,
+            "watch": watch_thresh,
+            "reco_min_volume_24h": RECO_MIN_VOLUME_24H,
+            "reco_min_market_cap": RECO_MIN_MARKET_CAP,
+            "explore_v2_enabled": os.getenv("EXPLORE_V2", "1"),
+        },
+        "results": results,
+    })
+
+
+def _active_symbol_set() -> Tuple[set, Dict[str, List[str]]]:
+    """Build set of normalized symbols that are already active (enabled bot, running bot, open deal). Returns (symbols_set, symbol -> [reasons])."""
+    active = set()
+    reasons: Dict[str, List[str]] = {}
+    try:
+        for b in list_bots():
+            if int(b.get("enabled", 0)) != 1:
+                continue
+            sym = str(b.get("symbol") or "").strip()
+            if not sym:
+                continue
+            norm = _normalize_symbol(sym)
+            active.add(norm)
+            reasons.setdefault(norm, []).append("enabled_bot")
+            if int(b.get("last_running", 0)) == 1 and "running_bot" not in (reasons.get(norm) or []):
+                reasons.setdefault(norm, []).append("running_bot")
+        for d in list_all_deals(state="OPEN", limit=500):
+            sym = str(d.get("symbol") or "").strip()
+            if not sym:
+                continue
+            norm = _normalize_symbol(sym)
+            active.add(norm)
+            if "open_deal" not in (reasons.get(norm) or []):
+                reasons.setdefault(norm, []).append("open_deal")
+    except Exception as e:
+        logger.debug("_active_symbol_set: %s", e)
+    return active, reasons
+
+
+# ─── Scanner readiness enrichment for Explore items ──────────────────────────
+_SCANNER_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SCANNER_CACHE_TTL = 300  # 5 minutes
+
+def _get_scanner_fields_for_item(symbol: str, market_type: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return scanner-derived fields for a recommendation item.
+    Uses a lightweight cache to avoid re-computing on every API call.
+    Non-blocking: returns empty defaults if scanner unavailable.
+    """
+    defaults = {
+        "ready_now": None,
+        "entry_type_scanner": None,
+        "edge_score": None,
+        "expected_move_pct": None,
+        "invalidation_level": None,
+        "target_levels": None,
+        "time_horizon_scanner": None,
+        "evidence": None,
+        "trigger_conditions": None,
+    }
+
+    now = time.time()
+    cached = _SCANNER_CACHE.get(symbol)
+    if cached:
+        ts, fields = cached
+        if (now - ts) < _SCANNER_CACHE_TTL:
+            return fields
+
+    try:
+        from db import get_watchlist_entry
+        wl = get_watchlist_entry(symbol, status="watching")
+        if wl:
+            setup = json.loads(wl.get("setup_json") or "{}")
+            fields = {
+                "ready_now": setup.get("ready_now", False),
+                "entry_type_scanner": setup.get("entry_type"),
+                "edge_score": setup.get("edge_score"),
+                "expected_move_pct": setup.get("expected_move_pct"),
+                "invalidation_level": setup.get("invalidation_level"),
+                "target_levels": setup.get("target_levels"),
+                "time_horizon_scanner": setup.get("time_horizon"),
+                "evidence": setup.get("evidence"),
+                "trigger_conditions": setup.get("trigger_conditions"),
+            }
+            _SCANNER_CACHE[symbol] = (now, fields)
+            return fields
+    except Exception:
+        pass
+
+    return defaults
 
 
 @app.get("/api/recommendations")
@@ -3900,6 +5204,7 @@ def api_recommendations(
     volatility: str = "all",  # "all" | "low" | "medium" | "high" - filter by volatility level
     regime: str = "all",  # "all" | "bull" | "breakout" | "range" | "bear" - filter by regime
     sector: str = "all",  # "all" | "Technology" | "Financial" | etc. - stocks only
+    show_already_active: int = 0,  # 1 = include symbols that already have a bot/open deal (with badge)
 ):
     """
     Get market recommendations. Returns structured status for better UX.
@@ -3913,7 +5218,8 @@ def api_recommendations(
     
     Regime filter: BULL, BREAKOUT, RANGE, BEAR (from metrics.regime).
     """
-    h = "long" if str(horizon).lower().startswith("l") else "short"
+    _h = str(horizon).lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
     if market_type == "crypto" and not quote:
         quote = "USD"
     
@@ -3921,6 +5227,13 @@ def api_recommendations(
     limit = min(int(limit), 100)  # Cap at 100 for pagination support
     offset = max(0, int(offset))  # Ensure non-negative
     signal_filter = str(signal).lower()  # "buy", "watch", or "all"
+    # Min Score: Any (0) = show everything. Else use horizon default when not explicitly set.
+    _horizon_defaults = {"short": RECO_MIN_SCORE_SHORT, "medium": RECO_MIN_SCORE_MEDIUM, "long": RECO_MIN_SCORE_LONG}
+    if min_score <= 0:
+        min_score = -1  # Sentinel: ignore score filter (show everything)
+    elif signal_filter == "buy" and min_score == 80:
+        # UI default 80 - use horizon-specific for better results
+        min_score = _horizon_defaults.get(h, 70)
     sort_by = str(sort).lower()  # "score", "profit_factor", "drawdown", "winrate"
     volatility_filter = str(volatility).lower()  # "all", "low", "medium", "high"
     regime_filter = str(regime).lower().strip()  # "all", "bull", "breakout", "range", "bear"
@@ -3929,7 +5242,7 @@ def api_recommendations(
     # Check client readiness
     kraken_ready = _kraken_ready()
     alpaca_ready = _alpaca_any_ready()
-    
+
     # Early returns for specific market types
     if market_type == "crypto" and not kraken_ready:
         return _json({
@@ -3939,15 +5252,18 @@ def api_recommendations(
             "message": KRAKEN_ERROR or "Kraken not ready",
             "items": []
         }, 503)
-    
+
     if market_type == "stocks" and not alpaca_ready:
-        return _json({
-            "ok": False,
-            "status": "error",
-            "reason": "alpaca_not_ready",
-            "message": "Alpaca API not configured",
-            "items": []
-        }, 503)
+        # Retry Alpaca initialization if keys are present
+        alpaca_ready = _retry_alpaca_init_if_keys_present()
+        if not alpaca_ready:
+            return _json({
+                "ok": False,
+                "status": "error",
+                "reason": "alpaca_not_ready",
+                "message": "Alpaca API not configured",
+                "items": []
+            }, 503)
     
     # For "all" market type, if neither is ready, return empty but don't block
     if market_type == "all" and not kraken_ready and not alpaca_ready:
@@ -3975,10 +5291,28 @@ def api_recommendations(
         logger.error(f"list_recommendations failed: {e}")
         rows = []
         # Don't return error - just return empty list with status
+
+    # Log DB counts when medium is empty (diagnostics)
+    if h == "medium" and len(rows) == 0:
+        try:
+            counts = count_recommendations_by_horizon()
+            logger.warning("Medium Term has 0 rows. DB counts: short=%d medium=%d long=%d",
+                counts.get("short", 0), counts.get("medium", 0), counts.get("long", 0))
+        except Exception:
+            pass
     
     with _globals_lock:
         state = (_RECO_STATE.get(h) or {}).copy()
+        short_state = (_RECO_STATE.get("short") or {}).copy()
+        medium_state = (_RECO_STATE.get("medium") or {}).copy()
+        long_state = (_RECO_STATE.get("long") or {}).copy()
     last_scan = state.get("last_run_ts", 0)
+    now_i = int(time.time())
+    last_scan_by_horizon = {
+        "short": {"ts": short_state.get("last_run_ts"), "age_sec": now_i - short_state.get("last_run_ts", 0) if short_state.get("last_run_ts") else None},
+        "medium": {"ts": medium_state.get("last_run_ts"), "age_sec": now_i - medium_state.get("last_run_ts", 0) if medium_state.get("last_run_ts") else None},
+        "long": {"ts": long_state.get("last_run_ts"), "age_sec": now_i - long_state.get("last_run_ts", 0) if long_state.get("last_run_ts") else None},
+    }
     scan_error = state.get("error", "")
     now = int(time.time())
     scan_age = now - last_scan if last_scan > 0 else 999999
@@ -4028,10 +5362,14 @@ def api_recommendations(
     
     include_set = {s.strip().upper() for s in include.split(",") if s.strip()}
     exclude_set = {s.strip().upper() for s in exclude.split(",") if s.strip()}
-    
+    active_symbols, active_reason = _active_symbol_set()
+    seen_normalized: set = set()  # Dedupe by normalized symbol
+    btc_ctx = _btc_context()
+    macro_risk_off = bool(btc_ctx.get("risk_off", False))
+
     items = []
     eligible_count = 0
-    
+
     # Process rows with error handling to avoid blocking on malformed data.
     # When filtering by market_type, process many more rows (crypto/stocks mixed in DB).
     max_process = min(len(rows), 800) if market_type != "all" else min(len(rows), limit)
@@ -4075,6 +5413,10 @@ def api_recommendations(
                 if want == "crypto" and item_market != "crypto":
                     continue
 
+            # Skip stock recommendations when Alpaca is not connected - prevents false signals
+            if item_market == "stocks" and not alpaca_ready:
+                continue
+
             # For crypto, only allow USD-quoted pairs and exclude non-USD duplicates
             if item_market == "crypto":
                 if "/" not in sym:
@@ -4084,9 +5426,23 @@ def api_recommendations(
                     continue
                 if (base or "").upper() in CRYPTO_BLOCKLIST:
                     continue
+                # TOP 30 whitelist: block small-caps - enforced at API level (handles BTC/USD, XBT/USD, BTCUSD, etc.)
+                base_norm = _crypto_base_from_symbol(sym)
+                if RECO_CRYPTO_TOP_30_ONLY and base_norm not in TOP_30_CRYPTO_BASES:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("Whitelist BLOCKED: %s (base=%s not in top30)", sym, base_norm)
+                    continue
                 # Ensure symbol exists on Kraken (never recommend CC or invalid pairs)
                 resolved, err = _validate_crypto_symbol(sym)
                 if not resolved:
+                    continue
+                # Min volume filter: exclude low-liquidity crypto ($10M+ 24h volume)
+                vol = float(metrics.get("volume_24h_quote") or 0)
+                if vol > 0 and vol < RECO_MIN_VOLUME_24H:
+                    continue
+            if item_market == "stocks":
+                mc = metrics.get("market_cap") or (float(metrics.get("market_cap_b") or 0) * 1e9)
+                if mc and mc < RECO_MIN_MARKET_CAP:
                     continue
 
             # 2. Filters
@@ -4110,9 +5466,9 @@ def api_recommendations(
             if eligible:
                 eligible_count += 1
             
-            # 4. Score Filter
+            # 4. Score Filter (min_score < 0 means "Any" - show everything)
             score = float(r.get("score") or 0.0)
-            if not include_all:
+            if min_score >= 0 and not include_all:
                 if (not eligible or research_only) and score < min_score:
                     continue
                 if score < min_score:
@@ -4157,6 +5513,11 @@ def api_recommendations(
                 if want == "bear" and ir not in ("BEAR", "HIGH_VOL_DEFENSIVE", "RISK_OFF"):
                     continue
 
+            # 5d. Macro Risk-Off: informational warning (score already penalized in intelligence layer)
+            macro_warning = None
+            if macro_risk_off and item_signal == "buy":
+                macro_warning = "Market conditions are cautious. Defensive strategies and smaller sizing recommended."
+            
             # 6. Populate Ticker Data (FAST - use metrics only, no network calls)
             # Prices will be filled via /api/prices endpoint async
             price_from_metrics = metrics.get("price")
@@ -4188,20 +5549,15 @@ def api_recommendations(
             except Exception:
                 pass
 
-            # Rating buckets aligned with per-market buy threshold
-            buy_thresh = _reco_buy_threshold_stocks() if item_market == "stocks" else _reco_buy_threshold_crypto()
-            strong_buy_thresh = buy_thresh + 20
-            watch_thresh = _reco_watch_threshold()
-            if score >= strong_buy_thresh:
+            # Rating buckets: strict thresholds to prevent misleading labels
+            if score >= 75:
                 rating = "Strong Buy"
-            elif score >= buy_thresh:
+            elif score >= 55:
                 rating = "Buy"
-            elif score >= watch_thresh:
+            elif score >= 40:
                 rating = "Watch"
-            elif score > 20:
-                rating = "Sell"
             else:
-                rating = "Strong Sell"
+                rating = "Avoid"
 
             # Fast JSON parse with fallbacks (lazy - only parse if needed)
             regime = {}
@@ -4226,20 +5582,48 @@ def api_recommendations(
             except (json.JSONDecodeError, TypeError):
                 pass
 
+            norm_sym = _normalize_symbol(sym)
+            if norm_sym in seen_normalized:
+                continue
+            seen_normalized.add(norm_sym)
+            already_active = norm_sym in active_symbols
+            active_reason_list = list(active_reason.get(norm_sym) or [])
+            if not show_already_active and already_active:
+                continue
+
+            score_breakdown = {}
+            try:
+                sbd_raw = r.get("score_breakdown_json")
+                if sbd_raw:
+                    score_breakdown = json.loads(sbd_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            if not score_breakdown:
+                try:
+                    from explore_v2 import compute_score_breakdown, is_enabled as _ev2
+                    if _ev2():
+                        regime_label = (regime.get("1d") or {}).get("label") or ""
+                        score_breakdown = compute_score_breakdown(score, metrics, regime_label)
+                except ImportError:
+                    pass
+
+            # Scanner readiness enrichment (from cached setup if available)
+            scanner_fields = _get_scanner_fields_for_item(sym, item_market, metrics)
+
             items.append(
                 {
                     "symbol": sym,
                     "score": score,
-                    "sort_key": sort_key,  # For sorting
-                    "signal": item_signal,  # "buy", "watch", or "wait"
+                    "sort_key": sort_key,
+                    "signal": item_signal,
                     "horizon": h,
                     "market_type": item_market,
-                    "price": price,  # From metrics only, filled async via /api/prices
-                    "change_pct": None,  # Filled async via /api/prices
-                    "volume": None,  # Filled async via /api/prices
-                    "market_cap": None, 
+                    "price": price,
+                    "change_pct": None,
+                    "volume": None,
+                    "market_cap": None,
                     "rating": rating,
-                    "confidence": float(metrics.get("confidence_score") or 0.0),
+                    "confidence": scanner_fields.get("confidence") or float(metrics.get("confidence_score") or 0.0),
                     "sparkline": sparkline,
                     "regime_1d": (regime.get("1d") or {}).get("label"),
                     "regime_4h": (regime.get("4h") or {}).get("label"),
@@ -4258,14 +5642,27 @@ def api_recommendations(
                     "peer_rank": metrics.get("peer_rank") or None,
                     "beta": metrics.get("beta"),
                     "diversify_key": (metrics.get("sector") or "unknown") if item_market == "stocks" else "crypto",
+                    "already_active": already_active,
+                    "active_reason": active_reason_list,
+                    "top_reasons": (reasons or [])[:3],
+                    "top_risk_flags": (risk_flags or [])[:3],
+                    "score_breakdown": score_breakdown,
+                    "macro_risk_off": macro_risk_off,
+                    "macro_warning": macro_warning,
+                    "ml_confidence": (metrics.get("ml_confidence_pct") or metrics.get("ml_confidence")),
+                    "crypto_cycle": metrics.get("crypto_cycle") or metrics.get("cycle_phase"),
+                    "funding_rate_warning": (float(metrics.get("funding_rate") or 0) > 0.001) if item_market == "crypto" else None,
+                    "earnings_warning": (isinstance(metrics.get("earnings_days"), (int, float)) and 0 <= metrics.get("earnings_days", 99) <= 5) if item_market == "stocks" else None,
+                    "earnings_days": metrics.get("earnings_days"),
+                    **scanner_fields,
                 }
             )
             processed += 1
         except Exception:
             continue
             
-    # Sort items by sort_key (defaults to score)
-    items.sort(key=lambda x: float(x.get("sort_key", x.get("score", 0))), reverse=True)
+    # Sort: eligible first, then by sort_key (score) descending for stability
+    items.sort(key=lambda x: (0 if x.get("eligible") else 1, -float(x.get("sort_key", x.get("score", 0)))), reverse=False)
 
     # Diversify top N by sector (stocks) / crypto so list isn't all one sector
     try:
@@ -4308,14 +5705,19 @@ def api_recommendations(
                 if score < -50:
                     continue
                 price_from_metrics = metrics.get("price")
+                norm_sym = _normalize_symbol(sym)
+                already_active = norm_sym in active_symbols
+                active_reason_list = list(active_reason.get(norm_sym) or [])
+                if not show_already_active and already_active:
+                    continue
                 items.append({
                     "symbol": sym,
                     "score": score,
                     "horizon": h,
                     "market_type": item_market,
                     "price": float(price_from_metrics) if price_from_metrics and price_from_metrics > 0 else None,
-                    "change_pct": None,  # Filled async
-                    "volume": None,  # Filled async
+                    "change_pct": None,
+                    "volume": None,
                     "market_cap": None,
                     "rating": "Neutral",
                     "confidence": float(metrics.get("confidence_score") or 0.0),
@@ -4332,6 +5734,8 @@ def api_recommendations(
                     "eligible": bool(metrics.get("eligible")),
                     "research_only": bool(metrics.get("research_only")) or (item_market == "stocks" and not _alpaca_any_ready()),
                     "reasons": [],
+                    "already_active": already_active,
+                    "active_reason": active_reason_list,
                 })
             except Exception:
                 continue
@@ -4352,7 +5756,10 @@ def api_recommendations(
         "limit": limit,
         "has_more": (offset + len(paginated_items)) < total_count,
         "scan_age_sec": scan_age if last_scan > 0 else None,
-        "last_scan_ts": last_scan if last_scan > 0 else None
+        "last_scan_ts": last_scan if last_scan > 0 else None,
+        "last_scan_by_horizon": last_scan_by_horizon,
+        "macro_risk_off": macro_risk_off,
+        "top30_whitelist_active": RECO_CRYPTO_TOP_30_ONLY and market_type in ("crypto", "all"),
     })
 
 
@@ -4620,11 +6027,10 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
             ticker = _ticker_cached(sym, ttl_sec=120) or {}
     
     score = float(row.get("score") or 0.0)
-    if score >= 80: rating = "Strong Buy"
-    elif score >= 60: rating = "Buy"
+    if score >= 75: rating = "Strong Buy"
+    elif score >= 55: rating = "Buy"
     elif score >= 40: rating = "Watch"
-    elif score > 20: rating = "Sell"
-    else: rating = "Strong Sell"
+    else: rating = "Avoid"
     
     return _json({
         "ok": True,
@@ -4678,40 +6084,42 @@ def api_diagnostics():
     
     with _globals_lock:
         short_state = (_RECO_STATE.get("short") or {}).copy()
+        medium_state = (_RECO_STATE.get("medium") or {}).copy()
         long_state = (_RECO_STATE.get("long") or {}).copy()
 
     # Count recommendations in DB
-    short_count = len(list_recommendations("short", limit=1000))
-    long_count = len(list_recommendations("long", limit=1000))
-    
+    counts = count_recommendations_by_horizon()
+    short_count = counts.get("short", 0)
+    medium_count = counts.get("medium", 0)
+    long_count = counts.get("long", 0)
+
+    def _scan_info(state: dict) -> dict:
+        ts = state.get("last_run_ts")
+        return {
+            "count": 0,  # filled below
+            "last_scan_ts": ts,
+            "last_scan_age_sec": now - ts if ts else None,
+            "last_error": state.get("error"),
+            "scanned": state.get("scanned", 0),
+            "eligible": state.get("eligible", 0),
+        }
+
+    short_info = _scan_info(short_state)
+    short_info["count"] = short_count
+    medium_info = _scan_info(medium_state)
+    medium_info["count"] = medium_count
+    long_info = _scan_info(long_state)
+    long_info["count"] = long_count
+
     return _json({
         "ok": True,
         "uptime_sec": uptime_sec,
-        "kraken": {
-            "ready": kraken_ready,
-            "error": kraken_error
-        },
-        "alpaca": {
-            "ready": alpaca_ready,
-            "error": alpaca_error
-        },
+        "kraken": {"ready": kraken_ready, "error": kraken_error},
+        "alpaca": {"ready": alpaca_ready, "error": alpaca_error},
         "recommendations": {
-            "short": {
-                "count": short_count,
-                "last_scan_ts": short_state.get("last_run_ts"),
-                "last_scan_age_sec": now - short_state.get("last_run_ts") if short_state.get("last_run_ts") else None,
-                "last_error": short_state.get("error"),
-                "scanned": short_state.get("scanned", 0),
-                "eligible": short_state.get("eligible", 0)
-            },
-            "long": {
-                "count": long_count,
-                "last_scan_ts": long_state.get("last_run_ts"),
-                "last_scan_age_sec": now - long_state.get("last_run_ts") if long_state.get("last_run_ts") else None,
-                "last_error": long_state.get("error"),
-                "scanned": long_state.get("scanned", 0),
-                "eligible": long_state.get("eligible", 0)
-            }
+            "short": short_info,
+            "medium": medium_info,
+            "long": long_info,
         },
         "timestamp": now
     })
@@ -4749,7 +6157,8 @@ async def api_recommendation_create_bot(symbol: str, request: Request):
     horizon = str(payload.get("horizon") or "short")
     if "/" in symbol and (symbol.split("/")[0] or "").upper() in CRYPTO_BLOCKLIST:
         return _json({"ok": False, "error": "Symbol is blocklisted"}, 400)
-    row = get_recommendation(_resolve_symbol(symbol), "long" if horizon.startswith("l") else "short")
+    h = "long" if str(horizon).lower().startswith("l") else ("medium" if str(horizon).lower().startswith("m") else "short")
+    row = get_recommendation(_resolve_symbol(symbol), h)
     if not row:
         return _json({"ok": False, "error": "No recommendation found"}, 404)
     metrics = json.loads(row.get("metrics_json") or "{}")
@@ -4839,7 +6248,8 @@ async def api_recommendation_create_bot(symbol: str, request: Request):
 def api_recommendations_scan(horizon: str = "short"):
     """Trigger a manual scan of recommendations. Returns immediately, scan runs in background."""
     import threading
-    h = "long" if str(horizon).lower().startswith("l") else "short"
+    _h = str(horizon).lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
 
     def _scan_async():
         try:
@@ -5209,6 +6619,80 @@ def api_bot_order_cancel_all(bot_id: int):
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
 
 
+@app.post("/api/bots/{bot_id}/add_funds")
+async def api_bot_add_funds(bot_id: int, request: Request):
+    """Add funds to an active bot. Increases investment_amount and scales safety order sizes."""
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    
+    try:
+        payload = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "Invalid JSON payload"}, 400)
+    
+    add_amount = float(payload.get("amount") or 0)
+    add_safety_orders = int(payload.get("add_safety_orders") or 0)
+    
+    if add_amount < 5:
+        return _json({"ok": False, "error": "Amount must be at least $5"}, 400)
+    if add_amount > 100000:
+        return _json({"ok": False, "error": "Amount exceeds maximum allowed"}, 400)
+    
+    # Current values
+    current_max_spend = float(b.get("max_spend_quote") or b.get("base_quote") or 0)
+    current_base_quote = float(b.get("base_quote") or 20)
+    current_safety_quote = float(b.get("safety_quote") or 10)
+    current_max_safety = int(b.get("max_safety") or 3)
+    
+    # Calculate new values
+    new_max_spend = current_max_spend + add_amount
+    
+    # Scale safety order size proportionally (optional: keep same or scale)
+    scale_factor = new_max_spend / current_max_spend if current_max_spend > 0 else 1
+    new_safety_quote = current_safety_quote * scale_factor
+    new_base_quote = current_base_quote * scale_factor
+    
+    # Add safety orders if requested
+    new_max_safety = current_max_safety + add_safety_orders
+    
+    # Update bot config
+    try:
+        update_payload = {
+            "max_spend_quote": new_max_spend,
+            "base_quote": new_base_quote,
+            "safety_quote": new_safety_quote,
+            "max_safety": new_max_safety,
+        }
+        
+        # Merge with existing bot config
+        updated_bot = {**b, **update_payload}
+        
+        # Use update_bot from db module
+        from db import update_bot
+        update_bot(int(bot_id), updated_bot)
+        
+        add_log(
+            int(bot_id),
+            "INFO",
+            f"Funds added: +${add_amount:.2f} (new total: ${new_max_spend:.2f}). Safety orders: {current_max_safety} -> {new_max_safety}.",
+            "SYSTEM"
+        )
+        
+        return _json({
+            "ok": True,
+            "message": f"Added ${add_amount:.2f} to bot",
+            "new_max_spend": new_max_spend,
+            "new_base_quote": new_base_quote,
+            "new_safety_quote": new_safety_quote,
+            "new_max_safety": new_max_safety,
+        })
+        
+    except Exception as e:
+        logger.exception("Failed to add funds to bot %d", bot_id)
+        return _json({"ok": False, "error": f"Failed to update bot: {e}"}, 500)
+
+
 def _bot_live_degraded(b: Dict[str, Any], bot_id: int, logs_limit: int, deals_limit: int, last_event: str, price_error: Optional[str] = None) -> Dict[str, Any]:
     """Return a successful live payload with degraded snap so the UI loads instead of showing 'Live refresh failed'."""
     sym = b.get("symbol", "")
@@ -5529,6 +7013,46 @@ def api_analytics_performance(days: int = 90):
             dt = datetime.utcfromtimestamp(ts)
             key = dt.strftime("%Y-%m-%d")
             daily_pnl[key] = daily_pnl.get(key, 0.0) + float(d.get("realized_pnl_quote") or 0)
+    # Calculate additional analytics for new enhanced page
+    equity_curve = []
+    cum = 0.0
+    peak = 0.0
+    for p in pnls:
+        cum += p
+        peak = max(peak, cum)
+        equity_curve.append({"timestamp": int(now_ts()), "value": cum, "pnl": p})
+
+    # Trade history for streaks
+    pnl_history = [p for p in pnls]
+
+    # Trades data for best/worst trades
+    trades_list = []
+    for d in closed:
+        trades_list.append({
+            "symbol": d.get("symbol") or "?",
+            "entry_price": float(d.get("entry_avg") or 0),
+            "exit_price": float(d.get("exit_avg") or 0),
+            "quantity": float(d.get("amount") or 0),
+            "pnl": float(d.get("realized_pnl_quote") or 0),
+            "pnl_pct": float(d.get("profit_percent") or 0),
+            "closed_at": int(d.get("closed_at") or 0),
+            "notes": d.get("notes") or ""
+        })
+
+    # Trade journal
+    trade_journal = []
+    for d in closed:
+        trade_journal.append({
+            "symbol": d.get("symbol") or "?",
+            "entry_price": float(d.get("entry_avg") or 0),
+            "exit_price": float(d.get("exit_avg") or 0),
+            "quantity": float(d.get("amount") or 0),
+            "pnl": float(d.get("realized_pnl_quote") or 0),
+            "pnl_pct": float(d.get("profit_percent") or 0),
+            "closed_at": int(d.get("closed_at") or 0),
+            "notes": d.get("notes") or ""
+        })
+
     return _json({
         "ok": True,
         "days": days,
@@ -5543,6 +7067,136 @@ def api_analytics_performance(days: int = 90):
         "by_strategy": by_strategy,
         "by_symbol": by_symbol,
         "daily_pnl": daily_pnl,
+        "equity_curve": equity_curve,
+        "pnl_history": pnl_history,
+        "trades": trades_list,
+        "trade_journal": trade_journal,
+    })
+
+
+@app.get("/api/analytics/summary")
+def api_analytics_summary(days: int = 90):
+    """Return summary of analytics: win rate, avg win/loss, Sharpe, best/worst trades, streaks."""
+    import math
+    since = now_ts() - (int(days) * 86400)
+    closed = list_closed_deals_for_journal(since_ts=since, limit=2000)
+    closed = [d for d in closed if d.get("closed_at") and int(d.get("closed_at") or 0) >= since]
+    pnls = [float(d.get("realized_pnl_quote") or 0) for d in closed]
+
+    if not pnls:
+        return _json({
+            "ok": True,
+            "win_rate": 0,
+            "avg_win": 0,
+            "avg_loss": 0,
+            "sharpe": 0,
+            "best_trade": {"symbol": "N/A", "pnl": 0},
+            "worst_trade": {"symbol": "N/A", "pnl": 0},
+            "current_win_streak": 0,
+            "current_loss_streak": 0,
+        })
+
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    avg_win = sum(wins) / len(wins) if wins else 0
+    avg_loss = sum(losses) / len(losses) if losses else 0
+
+    # Sharpe
+    mean_ret = sum(pnls) / len(pnls)
+    variance = sum((p - mean_ret) ** 2 for p in pnls) / len(pnls)
+    std = math.sqrt(variance) if variance > 0 else 0.0
+    sharpe = (mean_ret / std * math.sqrt(252)) if std > 0 else 0.0
+
+    # Best and worst trades
+    best_pnl = max(pnls) if pnls else 0
+    worst_pnl = min(pnls) if pnls else 0
+    best_trade = [d for d in closed if float(d.get("realized_pnl_quote") or 0) == best_pnl]
+    worst_trade = [d for d in closed if float(d.get("realized_pnl_quote") or 0) == worst_pnl]
+
+    # Streaks
+    win_streak = 0
+    loss_streak = 0
+    for p in reversed(pnls):
+        if p > 0:
+            win_streak += 1
+        elif p < 0:
+            loss_streak = 0
+        else:
+            break
+
+    return _json({
+        "ok": True,
+        "win_rate": round(len(wins) / len(pnls), 2) if pnls else 0,
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "sharpe": round(sharpe, 2),
+        "best_trade": {"symbol": (best_trade[0].get("symbol") if best_trade else "N/A"), "pnl": round(best_pnl, 2)},
+        "worst_trade": {"symbol": (worst_trade[0].get("symbol") if worst_trade else "N/A"), "pnl": round(worst_pnl, 2)},
+        "current_win_streak": win_streak,
+        "current_loss_streak": loss_streak,
+    })
+
+
+@app.get("/api/analytics/daily_pnl")
+def api_analytics_daily_pnl(days: int = 90):
+    """Return daily P&L history for charting."""
+    import math
+    from datetime import datetime
+    since = now_ts() - (int(days) * 86400)
+    closed = list_closed_deals_for_journal(since_ts=since, limit=2000)
+
+    daily_pnl = {}
+    for d in closed:
+        ts = int(d.get("closed_at") or 0)
+        if ts and ts >= since:
+            dt = datetime.utcfromtimestamp(ts)
+            key = dt.strftime("%Y-%m-%d")
+            daily_pnl[key] = daily_pnl.get(key, 0.0) + float(d.get("realized_pnl_quote") or 0)
+
+    return _json({
+        "ok": True,
+        "daily_pnl": daily_pnl,
+    })
+
+
+@app.get("/api/analytics/equity_curve")
+def api_analytics_equity_curve(days: int = 90):
+    """Return portfolio equity curve history."""
+    import math
+    from datetime import datetime
+    since = now_ts() - (int(days) * 86400)
+    closed = list_closed_deals_for_journal(since_ts=since, limit=2000)
+
+    # Sort by closed_at
+    closed = sorted(closed, key=lambda d: int(d.get("closed_at") or 0))
+
+    equity_curve = []
+    cum = 0.0
+    for d in closed:
+        ts = int(d.get("closed_at") or 0)
+        if ts and ts >= since:
+            cum += float(d.get("realized_pnl_quote") or 0)
+            equity_curve.append({
+                "timestamp": ts,
+                "value": cum,
+                "pnl": float(d.get("realized_pnl_quote") or 0),
+            })
+
+    return _json({
+        "ok": True,
+        "equity_curve": equity_curve,
+    })
+
+
+@app.get("/api/portfolio/history")
+def api_portfolio_history():
+    """Return portfolio value history for analytics."""
+    with _globals_lock:
+        history = list(PORT_HISTORY[-500:])
+
+    return _json({
+        "ok": True,
+        "history": history,
     })
 
 
@@ -5949,6 +7603,7 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
                         metrics_json=json.dumps(metrics),
                         reasons_json=json.dumps(res.get("reasons") or []),
                         risk_flags_json=json.dumps(res.get("risk_flags") or []),
+                        score_breakdown_json=res.get("score_breakdown_json") or json.dumps(res.get("score_breakdown") or {}),
                     )
                      processed += 1
                      results.append(res)
@@ -5984,16 +7639,19 @@ def _autopilot_loop() -> None:
             interval = int(hours) * 3600
     except Exception:
         pass
+    logger.info("autopilot_loop started, interval=%ds", interval)
     while True:
         try:
             time.sleep(min(60, interval // 10))
-            if not ap_mod.is_autopilot_enabled():
+            enabled = ap_mod.is_autopilot_enabled()
+            if not enabled:
                 continue
             now = time.time()
             if now < _autopilot_next_run:
                 continue
             _autopilot_next_run = now + interval
             _autopilot_last_run = now
+            logger.info("autopilot cycle starting (next in %ds)", interval)
 
             def _create_bot_fn(payload):
                 return create_bot(payload)
@@ -6044,8 +7702,8 @@ def _autopilot_loop() -> None:
                 get_portfolio_total_fn=_get_portfolio_fn,
                 notify_fn=notify_fn,
             )
-            if res.get("created") or res.get("closed"):
-                logger.info("autopilot cycle: created=%s closed=%s", res.get("created", 0), res.get("closed", 0))
+            logger.info("autopilot cycle complete: created=%s closed=%s skipped=%s",
+                        res.get("created", 0), res.get("closed", 0), len(res.get("skipped", [])))
         except Exception as e:
             logger.exception("autopilot loop error: %s", e)
 
@@ -6108,17 +7766,36 @@ async def api_autopilot_config_update(request: Request):
 
 @app.get("/api/autopilot/status")
 def api_autopilot_status():
-    import autopilot
-    enabled = autopilot.is_autopilot_enabled()
-    cfg = autopilot.get_autopilot_config()
+    """Always return 200 so UI shows a message instead of 500. On error, ok=False + error."""
+    try:
+        import autopilot
+        enabled = autopilot.is_autopilot_enabled()
+        cfg = autopilot.get_autopilot_config()
+    except Exception as e:
+        logger.exception("api_autopilot_status: autopilot config failed")
+        return _json({
+            "ok": False,
+            "error": str(e)[:300],
+            "enabled": False,
+            "config": {},
+            "last_run_ts": 0,
+            "next_scan_in_sec": 0,
+            "last_autopilot_heartbeat_ts": None,
+            "portfolio_value": 0.0,
+            "active_positions": 0,
+            "max_positions": 6,
+            "total_pnl": 0.0,
+        })
     now = time.time()
     next_sec = max(0, int(_autopilot_next_run - now)) if _autopilot_next_run > now else 0
     portfolio_value = 0.0
     active_positions = 0
     total_pnl = 0.0
     try:
-        snap = _portfolio_snapshot()
-        portfolio_value = float(snap.get("total_usd") or 0)
+        # Use cached portfolio data (no network call) to keep this endpoint fast
+        with _globals_lock:
+            if PORT_HISTORY:
+                portfolio_value = float(PORT_HISTORY[-1].get("total_usd") or 0)
         bots = list_bots()
         active_positions = sum(1 for b in bots if int(b.get("enabled", 0)) == 1)
         from db import all_deal_stats
@@ -6126,7 +7803,10 @@ def api_autopilot_status():
         total_pnl = float(stats.get("realized_total", 0) or 0)
     except Exception:
         pass
-    last_heartbeat = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0)
+    try:
+        last_heartbeat = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0)
+    except Exception:
+        last_heartbeat = 0
     last_run_ts = int(_autopilot_last_run)
     if last_run_ts <= 0 and last_heartbeat > 0:
         last_run_ts = last_heartbeat
@@ -6249,9 +7929,36 @@ def api_autopilot_stop():
 
 @app.post("/api/autopilot/run")
 def api_autopilot_run():
+    """Run one autopilot cycle. Returns detailed diagnostic info so the UI never silently fails."""
     global _autopilot_last_run, _autopilot_next_run
     import autopilot
     import autopilot as ap_mod
+
+    paused = bool(_pause_state())
+    kill_switch = bool(get_setting("kill_switch", "0") in ("1", "true"))
+    bm_ready = bm is not None
+    kraken_ready = _kraken_ready()
+
+    if paused:
+        return _json({
+            "ok": False, "error": "Trading is paused (global pause active). Resume from Safety page before running autopilot.",
+            "created": 0, "closed": 0, "created_bots": [], "skipped": [],
+            "bm_ready": bm_ready, "kraken_ready": kraken_ready, "paused": True, "kill_switch": kill_switch,
+        })
+    if kill_switch:
+        return _json({
+            "ok": False, "error": "Kill switch is ON. Disable it before running autopilot.",
+            "created": 0, "closed": 0, "created_bots": [], "skipped": [],
+            "bm_ready": bm_ready, "kraken_ready": kraken_ready, "paused": paused, "kill_switch": True,
+        })
+    if not bm_ready:
+        reason = _bm_not_ready_reason() or "BotManager not initialized"
+        return _json({
+            "ok": False, "error": f"BotManager not ready: {reason}. Server may still be starting up.",
+            "created": 0, "closed": 0, "created_bots": [], "skipped": [],
+            "bm_ready": False, "kraken_ready": kraken_ready, "paused": paused, "kill_switch": kill_switch,
+            "reason": reason,
+        }, 503)
 
     def _create_bot_fn(payload):
         return create_bot(payload)
@@ -6312,7 +8019,174 @@ def api_autopilot_run():
     except Exception:
         pass
     _autopilot_next_run = time.time() + interval
-    return _json({"ok": True, "created": res.get("created", 0), "closed": res.get("closed", 0), "errors": res.get("errors", [])})
+
+    created_count = res.get("created", 0)
+    created_bots = res.get("created_bots", [])
+    skipped = res.get("skipped", [])
+    candidates = res.get("candidates_considered", 0)
+    no_reason = res.get("no_candidates_reason")
+    errors = res.get("errors", [])
+    closed = res.get("closed", 0)
+
+    success = created_count > 0 or closed > 0 or (candidates == 0 and not errors)
+    error_msg = None
+    if created_count == 0 and not errors:
+        if candidates == 0:
+            error_msg = no_reason or "No recommendation candidates found. Run 'Scan recommendations' first, then retry."
+        elif len(skipped) > 0:
+            reasons = set(s.get("reason", "") for s in skipped[:5])
+            error_msg = f"Found {candidates} candidate(s) but all were skipped: {', '.join(reasons)}"
+        else:
+            error_msg = f"Cycle ran but created 0 bots from {candidates} candidate(s). Check min_score, max_positions, or slot availability."
+
+    return _json({
+        "ok": success and not errors,
+        "created": created_count,
+        "closed": closed,
+        "created_bots": created_bots[:20],
+        "skipped": skipped[:30],
+        "candidates_considered": candidates,
+        "errors": errors,
+        "error": error_msg,
+        "bm_ready": bm_ready,
+        "kraken_ready": kraken_ready,
+        "paused": paused,
+        "kill_switch": kill_switch,
+        "slots_used": res.get("slots_used", 0),
+        "max_positions": res.get("max_positions", 0),
+    })
+
+
+@app.post("/api/autopilot/create_bots")
+async def api_autopilot_create_bots(request: Request):
+    """
+    Create N bots from top recommendations (portfolio-aware: skips symbols already active).
+    Does: create -> enabled=1 -> start. Returns per-bot result for clear error reporting.
+    """
+    import autopilot
+    body = await request.json() or {}
+    count = max(1, min(int(body.get("count", 1)), 20))
+    dry_run = int(body.get("dry_run", 1))
+    horizon = str(body.get("horizon", "long")).lower() or "long"
+    if horizon not in ("short", "long"):
+        horizon = "long"
+    cfg = autopilot.get_autopilot_config()
+    min_score = float(body.get("min_score") or cfg.get("min_score") or cfg.get("min_score_threshold") or 75)
+    min_score = max(50, min(95, min_score))
+    asset_filter = str(body.get("asset_filter") or cfg.get("asset_types") or "both")
+    sectors_avoid = cfg.get("sectors_avoid") or []
+    if isinstance(sectors_avoid, str):
+        sectors_avoid = [s.strip() for s in sectors_avoid.split(",") if s.strip()]
+
+    # Build active symbol set (duplicate-symbol prevention)
+    active_symbols, active_reason = _active_symbol_set()
+    top = autopilot.get_top_recommendations(
+        horizon=horizon,
+        min_score=min_score,
+        max_count=count * 3,
+        asset_filter=asset_filter,
+        sectors_avoid=sectors_avoid,
+    )
+    candidates = []
+    skipped = []  # detailed reason per skipped symbol
+    for r in top:
+        sym = str(r.get("symbol") or "")
+        if not sym:
+            continue
+        norm = _normalize_symbol(sym)
+        if norm in active_symbols:
+            reasons = active_reason.get(norm) or ["already_active"]
+            skipped.append({"symbol": sym, "reason": "already_active", "detail": reasons})
+            continue
+        candidates.append(r)
+        if len(candidates) >= count:
+            break
+
+    if not candidates:
+        return _json({
+            "ok": False,
+            "error": "No candidates available. Either no recommendations above min_score or all top symbols already have a bot/open position.",
+            "created": [],
+            "errors": [],
+            "skipped": skipped[:20],
+        })
+
+    # Kraken must be ready for crypto bots
+    if not _kraken_ready():
+        return _json({
+            "ok": False,
+            "error": f"Kraken not ready: {KRAKEN_ERROR or 'API not configured or unreachable'}",
+            "created": [],
+            "errors": [],
+        })
+
+    if not bm:
+        reason = _bm_not_ready_reason() or "BotManager not initialized"
+        return _json({
+            "ok": False, "error": "BotManager not initialized", "reason": reason,
+            "created": [], "errors": [],
+        }, 503)
+
+    strategy = str(body.get("strategy_mode") or cfg.get("strategy_mode") or "smart_dca")
+    base_quote = float(body.get("base_quote") or cfg.get("capital_per_bot") or 500)
+    safety_quote = float(body.get("safety_quote") or base_quote * 0.2)
+    max_safety = int(body.get("max_safety") or 3)
+    tp = float(body.get("tp") or 0.03)
+    market_default = "crypto"
+    profile = str(cfg.get("risk_profile") or "balanced").lower()
+    _pp = {"conservative": {"tp": 0.02, "stop_loss_pct": 0.05}, "balanced": {"tp": 0.03, "stop_loss_pct": 0.08}, "aggressive": {"tp": 0.05, "stop_loss_pct": 0.12}}
+    pp = _pp.get(profile, _pp["balanced"])
+    created_list = []
+    errors_list = []
+    for rec in candidates[:count]:
+        sym = str(rec.get("symbol") or "")
+        metrics = rec.get("metrics") or {}
+        market = (metrics.get("market_type") or "crypto").strip().lower()
+        if market == "stock":
+            market = "stocks"
+        try:
+            payload = {
+                "name": f"Autopilot {sym}",
+                "symbol": sym,
+                "bot_type": "autopilot",
+                "enabled": 1,
+                "dry_run": dry_run,
+                "strategy_mode": str(metrics.get("strategy") or metrics.get("recommended_strategy") or strategy),
+                "forced_strategy": "",
+                "base_quote": base_quote,
+                "safety_quote": safety_quote,
+                "max_safety": max_safety,
+                "first_dev": 0.015,
+                "step_mult": 1.2,
+                "tp": float(body.get("tp") or pp["tp"] or tp),
+                "max_spend_quote": base_quote + safety_quote * max_safety,
+                "poll_seconds": 10,
+                "max_open_orders": 6,
+                "market_type": market,
+                "alpaca_mode": str(cfg.get("alpaca_mode") or "paper"),
+                "auto_restart": 1,
+                "stop_loss_pct": pp.get("stop_loss_pct", 0.08),
+            }
+            bot_id = create_bot(payload)
+            bot = get_bot(int(bot_id))
+            if bot and bm and _can_start_bot_live(bot)[0]:
+                try:
+                    bm.start(int(bot_id))
+                except Exception as e:
+                    errors_list.append(f"Start {sym}: {e}")
+            active_symbols.add(_normalize_symbol(sym))
+            created_list.append({"ok": True, "bot_id": bot_id, "symbol": sym})
+        except Exception as e:
+            err_msg = str(e)[:200]
+            created_list.append({"ok": False, "bot_id": None, "symbol": sym, "error": err_msg})
+            errors_list.append(f"Create {sym}: {err_msg}")
+    return _json({
+        "ok": True,
+        "created": created_list,
+        "errors": errors_list,
+        "skipped": skipped[:30],
+        "summary": f"chose {len(candidates)} candidate(s); created {len([c for c in created_list if c.get('ok')])} bot(s).",
+    })
 
 
 @app.get("/api/autopilot/top")
@@ -6398,6 +8272,107 @@ def api_autopilot_watchlist():
             "reason": (str(reason)[:200] if reason else None),
         })
     return _json({"ok": True, "items": out})
+
+
+@app.get("/api/scanner/status")
+def api_scanner_status():
+    """Return scanner status with last scan time, next scan time, and interval.
+    Used by frontend countdown timer."""
+    now_t = time.time()
+    
+    # Get last scan time from any horizon
+    last_scan_ts = 0
+    with _globals_lock:
+        for h in ("short", "medium", "long"):
+            st = _RECO_STATE.get(h) or {}
+            ts = st.get("last_run_ts", 0)
+            if ts > last_scan_ts:
+                last_scan_ts = ts
+    
+    # Default scan interval (15 minutes for short horizon)
+    scan_intervals = {
+        "short": 15 * 60,    # 15 minutes
+        "medium": 30 * 60,   # 30 minutes
+        "long": 60 * 60,     # 60 minutes
+    }
+    
+    # Use shortest interval as default
+    interval_sec = scan_intervals.get("short", 900)
+    
+    # Calculate next scan time
+    next_scan_ts = last_scan_ts + interval_sec if last_scan_ts > 0 else now_t + interval_sec
+    
+    # If next scan is in the past, calculate next one
+    if next_scan_ts < now_t:
+        cycles_elapsed = int((now_t - last_scan_ts) / interval_sec)
+        next_scan_ts = last_scan_ts + (cycles_elapsed + 1) * interval_sec
+    
+    return _json({
+        "ok": True,
+        "last_scan": int(last_scan_ts) if last_scan_ts > 0 else None,
+        "next_scan": int(next_scan_ts),
+        "interval_seconds": interval_sec,
+        "last_scan_ago_sec": int(now_t - last_scan_ts) if last_scan_ts > 0 else None,
+        "next_scan_in_sec": max(0, int(next_scan_ts - now_t)),
+    })
+
+
+@app.get("/api/scanner/watchlist")
+def api_scanner_watchlist(limit: int = 50):
+    """Get the scanner watchlist: symbols identified as good setups but not yet READY."""
+    try:
+        import autopilot
+        items = autopilot.get_scanner_watchlist(limit=min(int(limit), 100))
+        out = []
+        for entry in items:
+            setup = {}
+            try:
+                setup = json.loads(entry.get("setup_json") or "{}")
+            except Exception:
+                pass
+            out.append({
+                "symbol": entry.get("symbol"),
+                "market_type": entry.get("market_type"),
+                "regime": entry.get("regime"),
+                "entry_type": entry.get("entry_type"),
+                "confidence": entry.get("confidence"),
+                "edge_score": entry.get("edge_score"),
+                "trigger_conditions": entry.get("trigger_conditions"),
+                "evidence": setup.get("evidence", []),
+                "created_at": entry.get("created_at"),
+                "updated_at": entry.get("updated_at"),
+                "status": entry.get("status"),
+            })
+        return _json({"ok": True, "items": out, "count": len(out)})
+    except Exception as e:
+        logger.error("Scanner watchlist API failed: %s", e)
+        return _json({"ok": False, "error": str(e), "items": []}, 500)
+
+
+@app.post("/api/scanner/watchlist")
+async def api_add_to_watchlist(request: Request):
+    """Add a symbol to the scanner watchlist (manual save from explore)."""
+    try:
+        body = await request.json()
+        symbol = str(body.get("symbol") or "").strip()
+        if not symbol:
+            return _json({"ok": False, "error": "symbol required"}, 400)
+        market_type = "crypto" if "/" in symbol or len(symbol) > 6 else "stocks"
+        from db import upsert_watchlist_entry
+        rid = upsert_watchlist_entry(
+            symbol=symbol,
+            market_type=market_type,
+            setup_json="{}",
+            trigger_conditions="Manual add from Explore",
+            regime="",
+            entry_type="manual",
+            confidence=0.0,
+            edge_score=0.5,
+        )
+        return _json({"ok": True, "id": rid, "symbol": symbol})
+    except Exception as e:
+        logger.error("Add to watchlist failed: %s", e)
+        return _json({"ok": False, "error": str(e)}, 500)
 
 
 @app.post("/api/autopilot/setup")
@@ -6537,12 +8512,14 @@ async def api_autopilot_capital_add(request: Request):
             continue
         base = float(cur.get("base_quote") or 0)
         spend = float(cur.get("max_spend_quote") or 0)
-        if mode == "all":
+        if mode in ("all", "all_enabled"):
             add = amount_usd / len(bots)
         elif mode == "single":
             add = amount_usd
+        elif pct_per_bot:
+            add = (float(pct_per_bot) / 100.0) * base
         else:
-            add = (float(pct_per_bot or 0) / 100.0) * base
+            add = amount_usd / max(1, len(bots))
         if add <= 0:
             continue
         data = dict(cur)

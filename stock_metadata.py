@@ -21,6 +21,7 @@ STOCK_SECTOR_MAP: Dict[str, str] = {
     "JNJ": "Healthcare", "PG": "Consumer Defensive", "KO": "Consumer Defensive",
     "PEP": "Consumer Defensive", "WMT": "Consumer Defensive", "COST": "Consumer Defensive",
     "UNH": "Healthcare", "PFE": "Healthcare", "MRK": "Healthcare",
+    "BA": "Industrials", "FINT": "Financial", "ASYS": "Technology", "FGNXP": "Financial",
 }
 
 

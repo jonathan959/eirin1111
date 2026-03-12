@@ -48,14 +48,14 @@
     <div class="card">
       <div class="card-label">Realized PnL</div>
       <div class="card-value {% if deal.realized_pnl_quote is not none and deal.realized_pnl_quote >= 0 %}pos{% elif deal.realized_pnl_quote is not none %}neg{% else %}muted{% endif %}">
-        {{ "%.2f"|format(deal.realized_pnl_quote) if deal.realized_pnl_quote is not none else "—" }}
+        {% if deal.realized_pnl_quote is not none %}{% if deal.realized_pnl_quote >= 0 %}+{% endif %}{{ "%.2f"|format(deal.realized_pnl_quote) }}{% else %}—{% endif %}
       </div>
       <div class="card-sub muted">Closed only</div>
     </div>
     <div class="card">
       <div class="card-label">Unrealized PnL</div>
       <div class="card-value {% if unrealized_pnl is not none and unrealized_pnl >= 0 %}pos{% else %}neg{% endif %}">
-        {{ "%.2f"|format(unrealized_pnl) if unrealized_pnl is not none else "—" }}
+        {% if unrealized_pnl is not none %}{% if unrealized_pnl >= 0 %}+{% endif %}{{ "%.2f"|format(unrealized_pnl) }}{% else %}—{% endif %}
       </div>
       <div class="card-sub muted">Live snapshot</div>
     </div>

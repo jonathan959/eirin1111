@@ -509,7 +509,7 @@ class Phase1Intelligence:
         ) if bot_config.get('trailing_stop_enabled', 1) else None
         
         self.cooldown_mgr = CooldownManager(
-            cooldown_sec=bot_config.get('stop_loss_cooldown_sec', 3600)
+            cooldown_sec=bot_config.get('stop_loss_cooldown_sec', 172800)  # 48h default
         )
         
         self.tp_scaler = VolatilityTPScaler(

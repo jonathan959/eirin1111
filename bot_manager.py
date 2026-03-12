@@ -18,6 +18,7 @@ from db import (
     set_bot_running,
     get_setting,
     set_setting,
+    get_global_consecutive_losses,
     add_regime_snapshot,
     add_strategy_decision,
     get_expected_edge,
@@ -343,6 +344,7 @@ class RuntimeState:
     regime_confidence: Optional[float] = None
     regime_scores: Optional[Dict[str, float]] = None
     risk_state: Optional[str] = None
+    gate_details: Optional[Dict[str, Any]] = None
     forced_strategy: Optional[str] = None
     consecutive_losses: int = 0
     # Trailing stop (Part 1 profit optimization)
@@ -404,6 +406,9 @@ class BotRunner:
         self._regime_candidate: Optional[str] = None
         self._regime_candidate_ticks: int = 0
         self._regime_history: List[str] = []
+        self._last_buy_ts: float = 0.0
+        self._last_pnl_notify_ts: float = 0.0
+        self._pnl_notify_interval: float = float(os.getenv("PNL_NOTIFY_INTERVAL_SEC", "300"))
         
         # Initialize Intelligence Layer and Executor
         self.intelligence_layer = IntelligenceLayer()
@@ -414,11 +419,21 @@ class BotRunner:
     # -----------------
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            lp = self.state.last_price
+            ae = self.state.avg_entry
+            bp = self.state.base_pos
+            upnl_q: Optional[float] = None
+            upnl_p: Optional[float] = None
+            pnl_st: str = "FLAT"
+            if ae and ae > 0 and bp and bp > 0 and lp is not None:
+                upnl_q = (lp - ae) * bp
+                upnl_p = ((lp / ae) - 1.0) * 100.0
+                pnl_st = "UP" if upnl_q > 0 else ("DOWN" if upnl_q < 0 else "FLAT")
             return {
                 "running": self.state.running,
-                "last_price": self.state.last_price,
-                "avg_entry": self.state.avg_entry,
-                "base_pos": self.state.base_pos,
+                "last_price": lp,
+                "avg_entry": ae,
+                "base_pos": bp,
                 "safety_used": self.state.safety_used,
                 "spent_quote": self.state.spent_quote,
                 "tp_price": self.state.tp_price,
@@ -436,6 +451,10 @@ class BotRunner:
                 "regime_scores": self.state.regime_scores,
                 "risk_state": self.state.risk_state,
                 "forced_strategy": self.state.forced_strategy,
+                "gate_details": self.state.gate_details,
+                "unrealized_pnl_quote": upnl_q,
+                "unrealized_pnl_pct": upnl_p,
+                "pnl_status": pnl_st,
             }
 
     def _log(self, msg: str, level: str = "INFO", category: str = "SYSTEM") -> None:
@@ -513,6 +532,29 @@ class BotRunner:
             requests.post(webhook, json={"content": message}, timeout=3)
         except Exception:
             pass
+
+    def _maybe_send_pnl_update(self) -> None:
+        """Send a PnL update to Discord after a buy, rate-limited."""
+        if self._last_buy_ts <= 0:
+            return
+        now = time.time()
+        if (now - self._last_pnl_notify_ts) < self._pnl_notify_interval:
+            return
+        with self._lock:
+            lp = self.state.last_price
+            ae = self.state.avg_entry
+            bp = self.state.base_pos
+        if not ae or ae <= 0 or not bp or bp <= 0 or lp is None:
+            return
+        upnl_q = (lp - ae) * bp
+        upnl_p = ((lp / ae) - 1.0) * 100.0
+        sign = "+" if upnl_q >= 0 else ""
+        arrow = "📈" if upnl_q >= 0 else "📉"
+        self._notify_discord(
+            f"{arrow} {self._bot_label()} position: {sign}{upnl_p:.2f}% ({sign}{upnl_q:.2f}) since entry @ {ae:.4f}",
+            trade_event=True,
+        )
+        self._last_pnl_notify_ts = now
 
     def _bot_label(self) -> str:
         try:
@@ -786,6 +828,19 @@ class BotRunner:
         if th and th.is_alive():
             th.join(timeout=STOP_JOIN_TIMEOUT_SEC)
 
+        # Cancel any pending TP order to avoid orphaned orders on the exchange
+        try:
+            tp_oid = self.state.tp_order_id
+            bot = get_bot(self.bot_id) if self.bot_id else None
+            sym = (bot or {}).get("symbol", "") if bot else ""
+            if tp_oid and sym:
+                self._cancel_order_safe(sym, tp_oid)
+                with self._lock:
+                    self.state.tp_order_id = None
+                self._log(f"Cancelled pending TP order {tp_oid} on stop.", "INFO", "SYSTEM")
+        except Exception as e:
+            logger.warning("stop: failed to cancel TP order for bot %s: %s", self.bot_id, e)
+
         still_alive = bool(th and th.is_alive())
         with self._lock:
             self.state.running = False
@@ -1050,6 +1105,8 @@ class BotRunner:
         volume_24h: Optional[float] = None,
         volatility_pct: Optional[float] = None,
         volatility_avg_pct: Optional[float] = None,
+        proposed_order_usd: Optional[float] = None,
+        is_safety_order: bool = False,
     ) -> Optional[Any]:
         """Build RiskContext for risk engine when RISK_ENGINE_ENABLED=1."""
         try:
@@ -1087,6 +1144,8 @@ class BotRunner:
             max_total_exposure_pct=float(bot.get("max_total_exposure_pct") or os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50")),
             per_symbol_exposure_pct=float(bot.get("per_symbol_exposure_pct") or 0.15),
             daily_loss_limit_pct=float(bot.get("daily_loss_limit_pct") or 0.06),
+            proposed_order_usd=proposed_order_usd,
+            is_safety_order=is_safety_order,
         )
 
     def _grid_maintain(
@@ -1362,6 +1421,8 @@ class BotRunner:
                         self.state.spent_quote = float(buy_cost)
                     self.state.safety_used = int(safety_used_est)
 
+                self._maybe_send_pnl_update()
+
                 deal_state = DealState(
                     avg_entry=self.state.avg_entry,
                     position_size=float(self.state.base_pos),
@@ -1405,7 +1466,14 @@ class BotRunner:
                     now_ts=int(time.time())
                 )
                 
-                intel_decision = self.intelligence_layer.evaluate(ctx)
+                try:
+                    intel_decision = self.intelligence_layer.evaluate(ctx)
+                except Exception as intel_err:
+                    self._log(f"Intelligence evaluation failed, skipping cycle: {intel_err}", "WARN", "INTELLIGENCE")
+                    logger.warning("intelligence_layer.evaluate failed bot_id=%s: %s", self.bot_id, intel_err, exc_info=True)
+                    self._heartbeat()
+                    time.sleep(poll)
+                    continue
                 
                 # Persist full trace
                 try:
@@ -1569,6 +1637,8 @@ class BotRunner:
                     if eff_size < eff_base and ob_reason:
                         self._set(f"Order book: {ob_reason}", "INFO", "ORDER")
                     self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    self._last_buy_ts = time.time()
+                    self._last_pnl_notify_ts = 0.0
 
                 if decision.action == "SAFETY_ORDER":
                     self._log_decision(decision.action, decision.reason)
@@ -1591,6 +1661,8 @@ class BotRunner:
                         time.sleep(poll)
                         continue
                     self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    self._last_buy_ts = time.time()
+                    self._last_pnl_notify_ts = 0.0
                     if tp_order_id:
                         self._cancel_order_safe(symbol, tp_order_id)
                         tp_order_id = None
@@ -1872,6 +1944,12 @@ class BotRunner:
                                         self.state.consecutive_losses += 1
                                     else:
                                         self.state.consecutive_losses = 0
+                                # 3-loss circuit breaker: pause autopilot 24h
+                                if float(realized) < 0 and get_global_consecutive_losses(10) <= -3:
+                                    pause_until = int(time.time()) + 86400  # 24h
+                                    set_setting("loss_circuit_pause_until", str(pause_until))
+                                    if trip_and_alert:
+                                        trip_and_alert("3 consecutive losses — autopilot paused for 24h", pause_hours=24, bot_label="System")
                             if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
                                 new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
                                 with self._lock:
@@ -1981,6 +2059,12 @@ class BotRunner:
                                         self.state.consecutive_losses += 1
                                     else:
                                         self.state.consecutive_losses = 0
+                                # 3-loss circuit breaker: pause autopilot 24h
+                                if float(realized) < 0 and get_global_consecutive_losses(10) <= -3:
+                                    pause_until = int(time.time()) + 86400  # 24h
+                                    set_setting("loss_circuit_pause_until", str(pause_until))
+                                    if trip_and_alert:
+                                        trip_and_alert("3 consecutive losses — autopilot paused for 24h", pause_hours=24, bot_label="System")
                             if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
                                 new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
                                 with self._lock:
@@ -2317,6 +2401,8 @@ class BotRunner:
                         self.state.spent_quote = float(buy_cost)
                     self.state.safety_used = int(safety_used_est)
 
+                self._maybe_send_pnl_update()
+
                 try:
                     account = self._account_snapshot_simple(quote, price, float(self.state.base_pos))
                 except Exception as e:
@@ -2341,6 +2427,9 @@ class BotRunner:
                         _floor = float(os.getenv("FLOOR_MAX_EXPOSURE_PCT", "0.50"))
                         _max_exp = max(_max_exp, _floor)
                         logger.debug("Exposure check: %s = %.2f%% (limit: %.2f%%)", self._bot_label(), exp_pct * 100, _max_exp * 100)
+                        glob_streak = get_global_consecutive_losses(10)
+                        loss_pause_until = get_setting("loss_circuit_pause_until")
+                        loss_until_ts = int(loss_pause_until) if loss_pause_until and str(loss_pause_until).isdigit() else None
                         ok, cb_reason = check_circuit_breakers(
                             equity=equity,
                             daily_realized_pnl=daily_realized,
@@ -2352,7 +2441,9 @@ class BotRunner:
                             max_exposure_pct=_max_exp,
                             max_concurrent_deals=int(bot.get("max_concurrent_deals", 6)),
                             max_daily_loss_pct=float(bot.get("daily_loss_limit_pct", 0.06)),
-                            max_drawdown_pct=float(bot.get("max_drawdown_pct", 0) or 0) or 1.0,  # 0 = disabled (use 1.0 so check never trips)
+                            max_drawdown_pct=float(bot.get("max_drawdown_pct", 0) or 0) or 0.15,
+                            consecutive_losses=abs(glob_streak) if glob_streak < 0 else 0,
+                            loss_circuit_pause_until_ts=loss_until_ts,
                         )
                         if not ok and cb_reason:
                             risk_reason = cb_reason
@@ -2448,17 +2539,32 @@ class BotRunner:
                     except Exception:
                         pass
 
-                # Spread guard
+                # Unified Execution Gate (spread + stale data + price feed)
                 try:
-                    max_spread = float(bot.get("spread_guard_pct", 0.003))
-                    t = self.kc.fetch_ticker(symbol)
-                    bid = float(t.get("bid") or 0.0)
-                    ask = float(t.get("ask") or 0.0)
-                    mid = (bid + ask) / 2 if bid and ask else 0.0
-                    if mid > 0 and ((ask - bid) / mid) >= max_spread:
-                        risk_reason = "Spread too wide."
-                except Exception:
-                    pass
+                    from execution_gate import check_execution_gate, fetch_gate_inputs
+                    _gate_inputs = fetch_gate_inputs(self.kc, symbol, bot)
+                    if _gate_inputs.get("error"):
+                        risk_reason = f"Price feed error: {_gate_inputs['error']}"
+                    else:
+                        _gate = check_execution_gate(
+                            symbol=symbol,
+                            side="buy",
+                            order_type="limit",
+                            bid=_gate_inputs.get("bid"),
+                            ask=_gate_inputs.get("ask"),
+                            last_price=_gate_inputs.get("last_price"),
+                            ticker_ts=_gate_inputs.get("ticker_ts"),
+                            volume_24h=_gate_inputs.get("volume_24h"),
+                            bot_spread_guard_pct=float(bot.get("spread_guard_pct", 0.003)),
+                            volatility_pct=float(getattr(self.state, 'atr_pct', None) or 0) or None,
+                            dry_run=dry_run,
+                        )
+                        if not _gate.allowed:
+                            risk_reason = _gate.reason or "Execution gate blocked."
+                            with self._lock:
+                                self.state.gate_details = _gate.to_dict()
+                except Exception as _ge:
+                    logger.debug("execution_gate check: %s", _ge)
 
                 # Open orders guard
                 try:
@@ -2647,15 +2753,15 @@ class BotRunner:
                                     deal_id = self.state.deal_id
                                     if deal_id:
                                         _entry = float(avg_entry) if avg_entry else None
-                                    _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
-                                    close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
-                                                   base_amount=float(pos_total),
-                                                   realized_pnl_quote=_pnl,
-                                                   exit_strategy="stop_loss")
+                                        _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
+                                        close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
+                                                       base_amount=float(pos_total),
+                                                       realized_pnl_quote=_pnl,
+                                                       exit_strategy="stop_loss")
                                 except Exception as e:
                                     self._set(f"Stop loss sell failed: {e}", "ERROR", "ORDER")
                             now_ts_sl = int(time.time())
-                            self._cooldown_until = now_ts_sl + int(float(bot.get("stop_loss_cooldown_sec") or 3600))
+                            self._cooldown_until = now_ts_sl + int(float(bot.get("stop_loss_cooldown_sec") or 172800))  # 48h default
                             with self._lock:
                                 self.state.cooldown_until = int(self._cooldown_until)
                             set_setting(f"bot:{self.bot_id}:last_stop_ts", str(now_ts_sl))
@@ -2683,11 +2789,11 @@ class BotRunner:
                                     deal_id = self.state.deal_id
                                     if deal_id:
                                         _entry = float(avg_entry) if avg_entry else None
-                                    _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
-                                    close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
-                                                   base_amount=float(pos_total),
-                                                   realized_pnl_quote=_pnl,
-                                                   exit_strategy="time_exit")
+                                        _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
+                                        close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
+                                                       base_amount=float(pos_total),
+                                                       realized_pnl_quote=_pnl,
+                                                       exit_strategy="time_exit")
                                 except Exception as e:
                                     self._set(f"Time exit sell failed: {e}", "ERROR", "ORDER")
                             self._heartbeat()
@@ -2969,9 +3075,21 @@ class BotRunner:
                 # Execute Intelligence decision through executor
                 if _safe_enum_val(intel_decision.allowed_actions) in ("TRADE_ALLOWED", "MANAGE_ONLY"):
                     vol_pct = None
+                    order_size_usd = None
                     if decision.order:
                         vol_pct = decision.order.get("volatility_pct")
                         vol_pct = float(vol_pct) if vol_pct is not None else None
+                        # Extract order size in USD for risk floor check
+                        size_quote = decision.order.get("size_quote")
+                        if size_quote is not None:
+                            order_size_usd = float(size_quote)
+                        else:
+                            # Fallback: calculate from base size * price
+                            size_base = decision.order.get("size_base")
+                            if size_base is not None and price > 0:
+                                order_size_usd = float(size_base) * price
+                    # SAFETY_ORDER actions are exempt from per-symbol exposure cap (DCA must be allowed to add)
+                    is_safety = decision.action == "SAFETY_ORDER"
                     risk_ctx = self._build_risk_context(
                         symbol=symbol,
                         account=account,
@@ -2979,6 +3097,8 @@ class BotRunner:
                         bot=bot,
                         spread_bps=float(intel_context.spread_pct or 0) * 10000.0 if intel_context.spread_pct else None,
                         volatility_pct=vol_pct,
+                        proposed_order_usd=order_size_usd,
+                        is_safety_order=is_safety,
                     )
                     exec_result = self.executor.execute_decision(
                         intel_decision, self.bot_id, symbol, dry_run,
@@ -3439,6 +3559,8 @@ class BotRunner:
                             if eff_size < effective_base and ob_reason:
                                 self._set(f"Order book: {ob_reason}", "INFO", "ORDER")
                             self.kc.create_market_buy_quote(symbol, float(eff_size))
+                            self._last_buy_ts = time.time()
+                            self._last_pnl_notify_ts = 0.0
 
             # Ladder anchor:
             # - Use the first observed price after start (stable for DCA ladder),
@@ -3627,9 +3749,10 @@ class BotRunner:
                 with self._lock:
                     self.state.avg_entry = float(avg_entry) if (avg_entry is not None) else None
                     self.state.base_pos = float(pos_total) if not dry_run else float(max(buy_amt - sell_amt, 0.0))
-                    # spent_quote: prefer buy_cost if we have it
                     if buy_cost > 0:
                         self.state.spent_quote = float(buy_cost)
+
+                self._maybe_send_pnl_update()
 
                 # When no position yet, refresh levels from current price (avoids wrong 1.0 fallback when initial fetch failed)
                 if avg_entry is None and price > 0:
@@ -3796,6 +3919,27 @@ class BotRunner:
                                             time.sleep(poll)
                                             continue
 
+                                    # Risk engine check for safety orders (with exemption flag)
+                                    try:
+                                        from risk_engine import can_open_trade, is_enabled as risk_enabled
+                                        if risk_enabled():
+                                            risk_ctx = self._build_risk_context(
+                                                symbol=symbol,
+                                                account=account,
+                                                price=price,
+                                                bot=bot,
+                                                proposed_order_usd=float(effective_safety_quote),
+                                                is_safety_order=True,  # Exempt from per-symbol cap
+                                            )
+                                            if risk_ctx:
+                                                allowed, reason = can_open_trade(risk_ctx)
+                                                if not allowed:
+                                                    self._set(f"Safety buy blocked by risk engine: {reason}", "WARN", "RISK")
+                                                    time.sleep(poll)
+                                                    continue
+                                    except Exception as e:
+                                        logger.debug("Risk check skipped for safety order: %s", e)
+
                                     self._set(
                                         f"Placing averaging order ({safety_index} out of {safety_of}). "
                                         f"Price: {price:.2f} {quote} Size: {effective_safety_quote:.8f} {quote} "
@@ -3814,6 +3958,8 @@ class BotRunner:
                                         self._set(f"Order book block: {ob_reason}", "WARN", "RISK")
                                     else:
                                         self.kc.create_market_buy_quote(symbol, float(eff_size))
+                                        self._last_buy_ts = time.time()
+                                        self._last_pnl_notify_ts = 0.0
                                     self._last_safety_buy_ts = time.time()
 
                                     # Cancel/replace TP on next loop (only our TP)
@@ -4012,7 +4158,11 @@ class BotManager:
                 return self.alpaca_live
             else:
                 if not self.alpaca_paper:
-                    raise ValueError("Alpaca paper trading client not initialized")
+                    raise ValueError(
+                        "Alpaca paper trading client not initialized. "
+                        "Set ALPACA_API_KEY_PAPER and ALPACA_API_SECRET_PAPER in .env, then restart the app. "
+                        "Get free keys at https://alpaca.markets"
+                    )
                 return self.alpaca_paper
         else:
             # Default to Kraken for crypto

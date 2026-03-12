@@ -30,8 +30,8 @@ echo ""
 
 # 3. Upload core Python files
 echo "[3/6] Uploading app files..."
-scp -q app.py worker_api.py bot_manager.py db.py strategies.py intelligence_layer.py constants.py "$HOST:$REMOTE_PATH/"
-echo "Uploaded: app.py, worker_api.py, bot_manager.py, db.py, strategies.py, intelligence_layer.py, constants.py"
+scp -q app.py worker_api.py bot_manager.py db.py strategies.py intelligence_layer.py constants.py autopilot.py explore_v2.py stock_metadata.py market_scanner.py stock_universe.py "$HOST:$REMOTE_PATH/"
+echo "Uploaded: app.py, worker_api.py, bot_manager.py, db.py, strategies.py, intelligence_layer.py, constants.py, autopilot.py, explore_v2.py, stock_metadata.py, market_scanner.py, stock_universe.py"
 echo ""
 
 # 4. Restart service

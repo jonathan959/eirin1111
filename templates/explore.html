@@ -4,24 +4,25 @@
 
 {% block content %}
 <style>
-  /* TradingView-like Dark Theme overrides */
+  /* Explore page uses layout theme variables for consistency */
   :root {
-    --bg-dark: #131722;
-    --bg-card: #1e222d;
-    --text-primary: #d1d4dc;
-    --text-secondary: #787b86;
-    --border-color: #2a2e39;
-    --color-up: #089981;
-    --color-down: #f23645;
-    --color-rating-buy: #089981;
-    --color-rating-sell: #f23645;
-    --color-rating-neutral: #787b86;
+    --bg-dark: var(--bg, #f5f7fb);
+    --bg-card: var(--panel, #ffffff);
+    --text-primary: var(--text, #0f172a);
+    --text-secondary: var(--muted, #64748b);
+    --border-color: var(--border, rgba(148,163,184,.35));
+    --color-up: var(--success, #10b981);
+    --color-down: var(--danger, #ef4444);
+    --color-rating-buy: var(--success, #10b981);
+    --color-rating-sell: var(--danger, #ef4444);
+    --color-rating-neutral: var(--muted, #64748b);
   }
-
-  body {
-    background-color: var(--bg-dark) !important;
-    color: var(--text-primary) !important;
-    font-family: -apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif;
+  [data-theme="dark"] {
+    --bg-dark: var(--bg, #0b1020);
+    --bg-card: var(--panel, #101827);
+    --text-primary: var(--text, #e2e8f0);
+    --text-secondary: var(--muted, #94a3b8);
+    --border-color: var(--border, rgba(148,163,184,.15));
   }
 
   .screener-header {
@@ -70,17 +71,18 @@
   .pill {
     padding: 6px 12px;
     border-radius: 12px;
-    background: #2a2e39;
+    background: var(--panel-2, #f0f2f5);
     color: var(--text-secondary);
     font-size: 13px;
     cursor: pointer;
     white-space: nowrap;
     transition: all 0.2s;
+    border: 1px solid var(--border-color);
   }
 
   .pill:hover,
   .pill.active {
-    background: #363a45;
+    background: color-mix(in srgb, var(--accent, #4f46e5) 15%, var(--panel-2, #f0f2f5));
     color: var(--text-primary);
   }
 
@@ -117,7 +119,7 @@
   }
 
   .tv-table tr:hover td {
-    background-color: #2a2e39;
+    background-color: color-mix(in srgb, var(--accent, #4f46e5) 5%, transparent);
   }
 
   .symbol-cell {
@@ -130,13 +132,14 @@
     width: 24px;
     height: 24px;
     border-radius: 50%;
-    background: #363a45;
+    background: var(--panel-2, #f0f2f5);
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 10px;
     font-weight: bold;
     color: var(--text-primary);
+    border: 1px solid var(--border-color);
   }
 
   .symbol-info {
@@ -199,6 +202,14 @@
     color: var(--color-rating-sell);
   }
 
+  .rating-avoid {
+    color: var(--color-rating-sell);
+    background: color-mix(in srgb, var(--color-rating-sell) 12%, transparent);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+  }
+
   /* Sparkline canvas */
   .sparkline {
     width: 100px;
@@ -209,33 +220,285 @@
   .tv-table th[onclick] { cursor:pointer; }
   .tv-table th[onclick]:hover { color:var(--text-primary); }
   .score-badge { font-size:11px; padding:2px 6px; border-radius:6px; font-weight:600; }
-  .score-high { background:rgba(8,153,129,0.2); color:#089981; }
-  .score-mid { background:rgba(201,162,39,0.2); color:#c9a227; }
-  .score-low { background:rgba(148,163,184,0.2); color:#94a3b8; }
-  .breakdown-row { background:#131722 !important; }
-  .breakdown-cell { padding:12px 20px !important; font-size:12px; border-bottom:1px solid #2a2e39; vertical-align:top; }
+  .score-high { background:rgba(8,153,129,0.2); color:#089981; font-weight:700; }
+  .score-mid { background:rgba(234,179,8,0.2); color:#eab308; font-weight:600; }
+  .score-low { background:rgba(148,163,184,0.2); color:#94a3b8; font-weight:500; }
+  .breakdown-row { background:var(--bg-dark) !important; }
+  .breakdown-cell { padding:12px 20px !important; font-size:12px; border-bottom:1px solid var(--border-color); vertical-align:top; }
   .breakdown-cell .breakdown-section { margin-bottom:8px; }
-  .breakdown-cell .breakdown-label { color:#787b86; font-size:11px; margin-bottom:4px; }
-  .breakdown-cell .breakdown-items { color:#d1d4dc; }
+  .breakdown-cell .breakdown-label { color:var(--text-secondary); font-size:11px; margin-bottom:4px; }
+  .breakdown-cell .breakdown-items { color:var(--text-primary); }
   .breakdown-cell .breakdown-items ul { margin:0; padding-left:18px; }
   .expand-icon { cursor:pointer; opacity:0.7; font-size:14px; padding:2px 6px; border-radius:4px; }
-  .expand-icon:hover { opacity:1; background:#2a2e39; }
-  .skeleton { background:linear-gradient(90deg,#2a2e39 25%,#363a45 50%,#2a2e39 75%); background-size:200% 100%; animation:skeleton 1.2s ease-in-out infinite; border-radius:4px; height:20px; }
+  .expand-icon:hover { opacity:1; background:var(--panel-2, #f0f2f5); }
+  .skeleton { background:linear-gradient(90deg, var(--panel-2) 25%, var(--border-color) 50%, var(--panel-2) 75%); background-size:200% 100%; animation:skeleton 1.2s ease-in-out infinite; border-radius:4px; height:20px; }
   @keyframes skeleton { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+  /* ── Scan Status Panel ── */
+  .scan-panel { padding:14px 20px; background:var(--panel-2, #f8fafc); border-bottom:1px solid var(--border-color); }
+  .scan-panel-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }
+  @media(max-width:900px){ .scan-panel-grid { grid-template-columns:1fr; } }
+
+  .scan-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:10px; padding:12px 14px; }
+  .scan-card-title { font-size:11px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px; }
+
+  .scan-progress-wrap { margin-top:10px; }
+  .scan-progress-bar-bg { height:6px; background:var(--panel-2, #f0f2f5); border-radius:3px; overflow:hidden; position:relative; }
+  .scan-progress-bar-fill { height:100%; border-radius:3px; transition:width .4s ease; background:linear-gradient(90deg,var(--color-up),var(--color-success, #22c55e)); }
+  .scan-progress-bar-fill.indeterminate { width:30%!important; animation:indeterminate 1.5s ease-in-out infinite; }
+  @keyframes indeterminate { 0%{transform:translateX(-100%)} 100%{transform:translateX(400%)} }
+  .scan-progress-text { display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary); margin-top:4px; }
+
+  .scan-current { font-size:13px; color:var(--text-primary); margin-top:6px; display:flex; align-items:center; gap:6px; }
+  .scan-current .pulse-dot { width:8px; height:8px; border-radius:50%; background:#eab308; animation:pulse-dot 1s ease-in-out infinite; flex-shrink:0; }
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  .horizon-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:12px; color:var(--text-primary); }
+  .horizon-row + .horizon-row { border-top:1px solid rgba(42,46,57,.5); }
+  .status-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .status-dot.green { background:#089981; box-shadow:0 0 4px rgba(8,153,129,.4); }
+  .status-dot.yellow { background:#eab308; box-shadow:0 0 4px rgba(234,179,8,.4); }
+  .status-dot.red { background:#f23645; box-shadow:0 0 4px rgba(242,54,69,.4); }
+  .horizon-label { min-width:80px; color:var(--text-secondary); }
+  .horizon-detail { color:var(--text-secondary); font-size:11px; }
+
+  .scan-counter { font-size:22px; font-weight:700; color:#089981; }
+  .scan-counter-label { font-size:11px; color:var(--text-secondary); margin-top:2px; }
+  .scan-eta { font-size:12px; color:#eab308; margin-top:8px; display:flex; align-items:center; gap:4px; }
+
+  .scan-errors-toggle { font-size:11px; color:var(--text-secondary); cursor:pointer; margin-top:8px; user-select:none; }
+  .scan-errors-toggle:hover { color:var(--text-primary); }
+  .scan-errors-list { margin-top:6px; max-height:100px; overflow-y:auto; font-size:11px; font-family:monospace; }
+  .scan-error-item { padding:3px 0; color:#fca5a5; border-bottom:1px solid rgba(42,46,57,.4); word-break:break-all; }
+
+  .scan-history-list { margin-top:6px; font-size:11px; }
+  .scan-history-item { padding:4px 0; border-bottom:1px solid rgba(42,46,57,.4); color:var(--text-secondary); display:flex; justify-content:space-between; gap:6px; }
+  .scan-history-item .h-horizon { color:var(--text-primary); min-width:55px; }
+
+  .scan-toast { position:fixed; top:20px; right:20px; background:#089981; color:#fff; padding:12px 20px; border-radius:10px; font-size:14px; font-weight:600; z-index:9999; box-shadow:0 4px 20px rgba(0,0,0,.4); transform:translateX(120%); transition:transform .4s ease; }
+  .scan-toast.show { transform:translateX(0); }
+
+  /* ── Hover-reveal Create Bot button ── */
+  .tv-table tr .create-bot-hover { opacity: 0; pointer-events: none; transition: opacity 0.15s ease; }
+  .tv-table tr:hover .create-bot-hover { opacity: 1; pointer-events: auto; }
+
+  /* ── AVOID row subtle red tint ── */
+  .tv-table tr.row-avoid > td { background: color-mix(in srgb, var(--color-down, #ef4444) 4%, transparent); }
+  .tv-table tr.row-avoid:hover > td { background: color-mix(in srgb, var(--color-down, #ef4444) 7%, transparent); }
+
+  /* ── Scan cards equal height ── */
+  .scan-panel-grid .scan-card { display: flex; flex-direction: column; min-height: 140px; }
+
+  /* ── Sparkline uniform size ── */
+  .sparkline { width: 100px; height: 30px; display: block; }
+
+  /* ── Horizon color badges in scan history ── */
+  .h-horizon-short { color: #22c55e; font-weight: 600; }
+  .h-horizon-medium { color: #3b82f6; font-weight: 600; }
+  .h-horizon-long { color: #a855f7; font-weight: 600; }
+
+  /* ── New Improvements ── */
+  /* Score breakdown tooltip */
+  .score-tooltip {
+    position: relative;
+  }
+  .score-tooltip-content {
+    display: none;
+    position: absolute;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    pointer-events: none;
+  }
+  .score-tooltip:hover .score-tooltip-content {
+    display: block;
+  }
+  .score-tooltip-content::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 0;
+    height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 6px solid rgba(15, 23, 42, 0.95);
+  }
+
+  /* Watchlist star icon */
+  .watchlist-star {
+    cursor: pointer;
+    font-size: 16px;
+    opacity: 0.5;
+    transition: opacity 0.2s, color 0.2s;
+    margin-right: 6px;
+  }
+  .watchlist-star:hover {
+    opacity: 1;
+  }
+  .watchlist-star.active {
+    color: #eab308;
+    opacity: 1;
+  }
+
+  /* Unusual volume badge */
+  .volume-alert {
+    background: rgba(234, 179, 8, 0.15);
+    border: 1px solid #eab308;
+    color: #eab308;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    margin-left: 4px;
+  }
+
+  /* Create bot button styling */
+  .create-bot-btn {
+    padding: 4px 8px;
+    font-size: 11px;
+    background: var(--accent, #4f46e5);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .create-bot-btn:hover {
+    background: color-mix(in srgb, var(--accent, #4f46e5) 120%, white);
+  }
+
+  /* Scan countdown timer */
+  .countdown-timer {
+    color: #089981;
+    font-weight: 600;
+    font-size: 12px;
+  }
+
+  /* CSV export button styling */
+  .export-csv-btn {
+    padding: 4px 10px;
+    border-radius: 8px;
+    background: var(--panel, #2a2e39);
+    border: 1px solid var(--border, #363a45);
+    color: var(--text, #d1d4dc);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .export-csv-btn:hover {
+    background: color-mix(in srgb, var(--border, #363a45) 100%, var(--panel, #2a2e39));
+  }
+
+  /* ── Macro banner dismissable ── */
+  .macro-banner-inner { display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 12px; }
+  .macro-banner-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 18px; opacity: 0.5; padding: 2px 6px; border-radius: 4px; line-height: 1; flex-shrink: 0; }
+  .macro-banner-close:hover { opacity: 1; background: rgba(255,255,255,0.1); }
+
+  /* ── Status cell compact layout ── */
+  .status-cell-wrap { display: flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; }
+
+  /* ── Filter bar unified ── */
+  .filters-bar { align-items: center; }
+  .filter-separator { width: 1px; height: 24px; background: var(--border-color); margin: 0 4px; flex-shrink: 0; }
 </style>
 
 <div class="screener-header">
   <div class="screener-title">
-    Explore <span style="font-weight:400; color:var(--text-secondary)">Market Screener</span>
+    Explore <span style="font-weight:400; font-size:13px; color:var(--text-secondary); opacity:0.7;">— Market Screener</span>
   </div>
-  <div class="market-status">
-    <div class="market-dot"></div> Market Open
+  <div class="market-status" id="marketStatusContainer">
+    <span style="display:flex; align-items:center; gap:6px;">
+      <span class="market-dot" style="background:#089981;"></span>
+      <span>Crypto: <span style="color:#089981;">24/7</span></span>
+    </span>
+    <span style="margin-left:12px; display:flex; align-items:center; gap:6px;">
+      <span class="market-dot" id="stocksMarketDot" style="background:var(--text-secondary);"></span>
+      <span id="stocksMarketStatus">Stocks: <span style="color:var(--text-secondary);">Checking...</span></span>
+    </span>
     <span style="margin-left:12px; font-size:11px; color:var(--text-secondary);">
       Crypto: <span style="color:{% if kraken_ready %}#089981{% else %}#f23645{% endif %}">{% if kraken_ready %}Kraken ✓{% else %}Kraken ✗{% endif %}</span>
-      &nbsp;|&nbsp; Stocks: <span style="color:{% if alpaca_ready %}#089981{% else %}#f23645{% endif %}">{% if alpaca_ready %}Alpaca ✓{% else %}Alpaca ✗{% endif %}</span>
+      &nbsp;|&nbsp; Stocks: <span style="color:{% if alpaca_ready %}#089981{% else %}var(--text-secondary){% endif %}">{% if alpaca_ready %}Alpaca ✓{% else %}<span class="stock-not-configured" style="cursor:pointer; text-decoration:underline dotted;" title="Stocks require an Alpaca API key. Add ALPACA_API_KEY_PAPER and ALPACA_API_SECRET_PAPER to your .env file to enable stock scanning.">Not configured <span style="font-size:10px; opacity:0.7;">[ALPACA_NOT_CONFIGURED]</span></span>{% endif %}</span>
     </span>
   </div>
 </div>
+
+<!-- ═══ Live Scan Status Panel ═══ -->
+<div class="scan-panel" id="scanPanel">
+  <div class="scan-panel-grid">
+    <!-- Left: Progress bar + current symbol -->
+    <div class="scan-card">
+      <div class="scan-card-title">Scanning Progress</div>
+      <div class="scan-progress-wrap">
+        <div class="scan-progress-bar-bg">
+          <div class="scan-progress-bar-fill" id="scanBarFill" style="width:0%"></div>
+        </div>
+        <div class="scan-progress-text">
+          <span id="scanProgressLabel">Idle — waiting for scan</span>
+          <span id="scanProgressPct">0%</span>
+        </div>
+      </div>
+      <div class="scan-current" id="scanCurrentWrap" style="display:none">
+        <span class="pulse-dot"></span>
+        <span>Currently scanning: <strong id="scanCurrentSymbol">—</strong></span>
+      </div>
+      <div class="scan-eta" id="scanEta" style="display:none">⏱ <span id="scanEtaText">Calculating…</span></div>
+      <div id="scanLastTime" style="font-size:11px; color:var(--text-secondary); margin-top:6px;"></div>
+    </div>
+
+    <!-- Center: Horizon status rows -->
+    <div class="scan-card">
+      <div class="scan-card-title">Horizon Status</div>
+      <div class="horizon-row">
+        <span class="status-dot red" id="dotShort"></span>
+        <span class="horizon-label">Short Term</span>
+        <span class="horizon-detail" id="statusShort">Never scanned</span>
+      </div>
+      <div class="horizon-row">
+        <span class="status-dot red" id="dotMedium"></span>
+        <span class="horizon-label">Medium Term</span>
+        <span class="horizon-detail" id="statusMedium">Never scanned</span>
+      </div>
+      <div class="horizon-row">
+        <span class="status-dot red" id="dotLong"></span>
+        <span class="horizon-label">Long Term</span>
+        <span class="horizon-detail" id="statusLong">Never scanned</span>
+      </div>
+    </div>
+
+    <!-- Right: Live counter + errors + history -->
+    <div class="scan-card">
+      <div class="scan-card-title">Live Results</div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="none" style="flex-shrink:0; opacity:0.8;"><path d="M2 14V8h3v6H2zm4.5 0V4h3v10h-3zM11 14V1h3v13h-3z" fill="#089981"/></svg>
+        <div class="scan-counter" id="scanBuyCount">0</div>
+      </div>
+      <div class="scan-counter-label">buy signals found so far</div>
+      <div class="scan-errors-toggle" id="errorsToggle" onclick="toggleScanErrors()" style="display:none">
+        ▸ Last errors (<span id="errorsCount">0</span>)
+      </div>
+      <div id="scanErrorsList" class="scan-errors-list" style="display:none"></div>
+      <div style="margin-top:10px">
+        <div class="scan-card-title" style="margin-bottom:4px">Scan History</div>
+        <div class="scan-history-list" id="scanHistoryList">
+          <div style="color:var(--text-secondary); font-size:11px;">No scans yet</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="scan-toast" id="scanToast"></div>
+<!-- ═══ End Scan Status Panel ═══ -->
 
 <div class="filters-bar">
   <input type="text" id="filter-search" placeholder="Search symbol…" oninput="applyFilters()"
@@ -243,88 +506,101 @@
   <div class="pill active" id="filter-all" onclick="setFilter('all')">All Assets</div>
   <div class="pill" id="filter-crypto" onclick="setFilter('crypto')">Crypto</div>
   <div class="pill" id="filter-stocks" onclick="setFilter('stocks')">Stocks</div>
+  <div class="pill" id="filter-watchlist" onclick="setFilter('watchlist')">⭐ Watchlist</div>
   
-  <select id="filter-horizon" onchange="applyFilters()" title="Short Term: 90+ days data, faster signals. Long Term: 180+ days data, slower but more stable." style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+  <select id="filter-horizon" onchange="applyFilters()" title="Short: 90+ days. Medium: 135+ days, more reliable. Long: 180+ days." style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
     <option value="short">Short Term (3mo+)</option>
+    <option value="medium" selected>Medium Term (4.5mo+)</option>
     <option value="long">Long Term (6mo+)</option>
   </select>
   
-  <select id="filter-signal" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="buy" selected>Buy Only</option>
+  <select id="filter-signal" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">
+    <option value="all" selected>All Signals</option>
+    <option value="buy">Buy Only</option>
     <option value="watch">Buy + Watch</option>
-    <option value="all">All Signals</option>
   </select>
   
-  <select id="filter-sort" onchange="applyFilters()" title="Sort recommendations by different metrics" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="score" selected>Sort: Best Score</option>
+  <select id="filter-sort" onchange="applyFilters()" title="Sort by" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">
+    <option value="score" selected>Sort: Score</option>
     <option value="winrate">Sort: Win Rate</option>
     <option value="profit_factor">Sort: Profit Factor</option>
-    <option value="drawdown">Sort: Low Drawdown</option>
   </select>
   
-  <select id="filter-volatility" onchange="applyFilters()" title="Filter by volatility/risk level" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="all" selected>All Risk Levels</option>
-    <option value="low">Low Volatility</option>
-    <option value="medium">Medium Volatility</option>
-    <option value="high">High Volatility</option>
-  </select>
-  
-  <select id="filter-regime" onchange="applyFilters()" title="Filter by market regime" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="all" selected>All Regimes</option>
-    <option value="bull">Bull</option>
-    <option value="breakout">Breakout</option>
-    <option value="range">Range</option>
-    <option value="bear">Bear / Defensive</option>
-  </select>
-  
-  <select id="filter-sector" onchange="applyFilters()" title="Filter by sector (stocks only)" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="all" selected>All Sectors</option>
-    <option value="Technology">Technology</option>
-    <option value="Financial">Financial</option>
-    <option value="Healthcare">Healthcare</option>
-    <option value="Consumer Cyclical">Consumer Cyclical</option>
-    <option value="Consumer Defensive">Consumer Defensive</option>
-    <option value="Communication">Communication</option>
-    <option value="ETF">ETF</option>
-  </select>
-  
-  <select id="filter-min-score" onchange="applyFilters()" title="Minimum recommendation score" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
+  <select id="filter-min-score" onchange="applyFilters()" title="Filter by minimum score" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">
     <option value="0" selected>Min Score: Any</option>
-    <option value="60">Min Score: 60+</option>
-    <option value="70">Min Score: 70+</option>
-    <option value="80">Min Score: 80+</option>
-    <option value="90">Min Score: 90+</option>
+    <option value="45">Score: 45+</option>
+    <option value="55">Score: 55+</option>
+    <option value="65">Score: 65+</option>
+    <option value="75">Score: 75+</option>
   </select>
   
-  <select id="filter-limit" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">
-    <option value="10">Top 10</option>
+  <select id="filter-limit" onchange="applyFilters()" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">
     <option value="25">Top 25</option>
     <option value="50" selected>Top 50</option>
     <option value="100">Top 100</option>
-    <option value="200">Top 200</option>
   </select>
   
-  <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-secondary); cursor:pointer;">
-    <input type="checkbox" id="chk-auto-refresh" onchange="toggleAutoRefresh()" style="accent-color:#089981;">
-    Auto-refresh (60s)
-  </label>
-  <button id="btn-show-more" onclick="loadMore()" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer; display:none;">Show More</button>
-  <button id="btn-refresh" onclick="loadScreener(false)" title="Reload current view with current filters (no full scan)" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer;">Refresh</button>
-  <button id="btn-reset-filters" onclick="resetFilters()" title="Reset all filters to defaults" style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">Reset</button>
-  <button id="btn-rescan" onclick="triggerRescan()" title="Full scan: crypto + stocks for short & long term. Reload or switch filters after a few minutes." style="padding:6px 12px; border-radius:12px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:13px; cursor:pointer;">Rescan</button>
-  <div class="pill" id="filter-performance" onclick="togglePerformancePanel()" title="Show recommendation accuracy metrics">Accuracy</div>
+  <button id="btn-refresh" onclick="loadScreener(false)" title="Reload results" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer;">Refresh</button>
+  <span class="filter-separator"></span>
+  <button id="btn-rescan" onclick="triggerRescan()" title="Full scan: crypto + stocks for all horizons" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">Rescan All</button>
+  <button id="btn-reset-filters" onclick="resetFilters()" title="Reset all filters" style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer;">Reset</button>
+  <button id="btn-show-more" onclick="loadMore()" style="padding:6px 12px; border-radius:12px; background:#089981; border:none; color:#fff; font-size:13px; cursor:pointer; display:none;">More</button>
+  <details style="display:inline;">
+    <summary style="padding:6px 12px; border-radius:12px; background:var(--panel, #2a2e39); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:13px; cursor:pointer; display:inline-block; list-style:none;">More Filters ▾</summary>
+    <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; padding:8px; background:var(--panel, #2a2e39); border-radius:8px; border:1px solid var(--border, #363a45);">
+      <select id="filter-volatility" onchange="applyFilters()" style="padding:6px 12px; border-radius:8px; background:var(--bg, #1a1e29); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:12px;">
+        <option value="all" selected>All Risk Levels</option>
+        <option value="low">Low Volatility</option>
+        <option value="medium">Medium Volatility</option>
+        <option value="high">High Volatility</option>
+      </select>
+      <select id="filter-regime" onchange="applyFilters()" style="padding:6px 12px; border-radius:8px; background:var(--bg, #1a1e29); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:12px;">
+        <option value="all" selected>All Regimes</option>
+        <option value="bull">Bull</option>
+        <option value="breakout">Breakout</option>
+        <option value="range">Range</option>
+        <option value="bear">Bear</option>
+      </select>
+      <select id="filter-sector" onchange="applyFilters()" style="padding:6px 12px; border-radius:8px; background:var(--bg, #1a1e29); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:12px;">
+        <option value="all" selected>All Sectors</option>
+        <option value="Technology">Technology</option>
+        <option value="Financial">Financial</option>
+        <option value="Healthcare">Healthcare</option>
+        <option value="Consumer Cyclical">Consumer</option>
+        <option value="ETF">ETF</option>
+      </select>
+      <select id="filter-min-ml-confidence" onchange="applyFilters()" style="padding:6px 12px; border-radius:8px; background:var(--bg, #1a1e29); border:1px solid var(--border, #363a45); color:var(--text, #d1d4dc); font-size:12px;">
+        <option value="0" selected>ML: Any</option>
+        <option value="65">ML: 65%+</option>
+        <option value="80">ML: 80%+</option>
+      </select>
+      <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:var(--text-secondary); cursor:pointer;">
+        <input type="checkbox" id="chk-auto-refresh" onchange="toggleAutoRefresh()" style="accent-color:#089981;">
+        Auto-refresh
+      </label>
+      <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:var(--text-secondary); cursor:pointer;">
+        <input type="checkbox" id="chk-show-already-active" onchange="applyFilters()" style="accent-color:#089981;">
+        Show active
+      </label>
+    </div>
+  </details>
 </div>
 
 <!-- Horizon description + last scan timestamp + export -->
 <div id="horizonBanner" style="padding: 8px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 12px; color: #787b86; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-  <span id="horizonDesc">Short Term: Quick trades with 90+ days of data. Scans every 15 minutes.</span>
+  <span style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+    <span id="horizonDesc">Medium Term: More reliable signals with 135+ days of data. Scans every 30 minutes.</span>
+    <span id="whitelistBadge" style="display:none; padding:3px 10px; border-radius:6px; background:#0d3d2d; color:#22c55e; font-size:11px; font-weight:600; border:1px solid rgba(34,197,94,0.3);" title="Only top 30 cryptos (BTC, ETH, SOL, etc.) are shown">&#9432; Top 30 cryptos only (BTC, ETH, SOL, etc.)</span>
+  </span>
   <div style="display:flex; align-items:center; gap:12px;">
+    <span id="portfolioExposure" class="muted" style="font-size:11px;" title="Portfolio exposure % (deployed capital)"></span>
     <span id="dataFreshness" class="muted" style="font-size:11px;" title="When recommendations were last refreshed"></span>
     <button id="btn-export-csv" onclick="exportToCsv(event)" title="Export current filtered results to CSV" style="padding:4px 10px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:11px; cursor:pointer;">Export CSV</button>
   </div>
 </div>
 <div id="explorePricesBanner" style="display:none; padding: 6px 20px; background: #2a2616; border-bottom: 1px solid #3a3520; font-size: 12px; color: #c9a227;"></div>
 <div id="exploreSignalBanner" style="display:none; padding: 6px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 12px; color: #94a3b8;"></div>
+<div id="exploreMacroBanner" style="display:none; padding: 8px 20px; background: #3a2616; border-bottom: 1px solid #4a3520; font-size: 12px; color: #eab308;"></div>
 
 <!-- Recommendation Accuracy Panel (collapsible) -->
 <div id="performancePanel" style="display:none; padding: 16px 20px; background: #1a1e29; border-bottom: 1px solid #2a2e39; font-size: 13px;">
@@ -336,10 +612,10 @@
         <option value="60">Last 60 days</option>
         <option value="90">Last 90 days</option>
       </select>
-      <button id="btn-calibrate" onclick="runCalibration()" title="Adjust scoring weights from historical performance" style="padding:4px 10px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:11px; cursor:pointer;">Calibrate</button>
+      <button id="btn-calibrate" onclick="runCalibration()" title="Adjust scoring weights from historical performance" style="padding:4px 10px; border-radius:8px; background:#2a2e39; border:1px solid #363a45; color:#d1d4dc; font-size:11px; cursor:pointer;">Adjust scoring weights</button>
     </div>
   </div>
-  <div id="performanceContent" style="color:var(--text-secondary);">Loading...</div>
+  <div id="performanceContent" style="color:var(--text-secondary);">No accuracy data yet. Create bots from recommendations and close deals to see metrics.</div>
 </div>
 
 <div class="screener-table-container">
@@ -348,17 +624,15 @@
       <tr>
         <th width="250" onclick="sortBy('symbol')" title="Click to sort">Symbol <span id="sort-symbol" class="sort-ind"></span></th>
         <th width="100" class="right" onclick="sortBy('price')" title="Click to sort">Last <span id="sort-price" class="sort-ind"></span></th>
-        <th width="80" class="right" onclick="sortBy('chg')" title="Click to sort">Chg % <span id="sort-chg" class="sort-ind"></span></th>
-        <th width="80" class="right">Chg</th>
-        <th width="130" class="center" onclick="sortBy('score')" title="Click to sort">Score / Rating <span id="sort-score" class="sort-ind">▼</span></th>
-        <th width="100" class="right" onclick="sortBy('volume')" title="Click to sort">Vol <span id="sort-volume" class="sort-ind"></span></th>
-        <th width="120" class="right">Mkt Cap</th>
-        <th width="150">7d Trend</th>
-        <th>Sector / Strategy</th>
+        <th width="80" class="right" onclick="sortBy('chg')" title="Click to sort">24h <span id="sort-chg" class="sort-ind"></span></th>
+        <th width="160" class="center" onclick="sortBy('score')" title="Composite signal score combining RSI, momentum, volume, and regime factors">Status / Score <span id="sort-score" class="sort-ind">▼</span></th>
+        <th width="100" class="right" onclick="sortBy('volume')" title="Trading volume - higher volume = more liquidity and easier execution">Vol <span id="sort-volume" class="sort-ind"></span></th>
+        <th width="150" title="Trend direction over the last 7 days">7d Trend</th>
+        <th title="Sector or asset class and recommended strategy">Sector / Strategy</th>
       </tr>
     </thead>
     <tbody id="screenerBody">
-      <tr><td colspan="9" style="padding:24px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>
+      <tr><td colspan="8" style="padding:24px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>
     </tbody>
   </table>
 </div>
@@ -423,10 +697,150 @@
 
 <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
 <script>
+  const CRYPTO_ICONS = {
+    'BTC/USD': 'https://assets.coingecko.com/coins/images/1/small/bitcoin.png',
+    'XBT/USD': 'https://assets.coingecko.com/coins/images/1/small/bitcoin.png',
+    'ETH/USD': 'https://assets.coingecko.com/coins/images/279/small/ethereum.png',
+    'SOL/USD': 'https://assets.coingecko.com/coins/images/4128/small/solana.png',
+    'XRP/USD': 'https://assets.coingecko.com/coins/images/44/small/xrp-symbol-white-128.png',
+    'ADA/USD': 'https://assets.coingecko.com/coins/images/975/small/cardano.png',
+    'DOGE/USD': 'https://assets.coingecko.com/coins/images/5/small/dogecoin.png',
+    'DOT/USD': 'https://assets.coingecko.com/coins/images/12171/small/polkadot.png',
+    'LINK/USD': 'https://assets.coingecko.com/coins/images/877/small/chainlink-new-logo.png',
+    'AVAX/USD': 'https://assets.coingecko.com/coins/images/12559/small/Avalanche_Circle_RedWhite_Trans.png',
+    'MATIC/USD': 'https://assets.coingecko.com/coins/images/4713/small/matic-token-icon.png',
+    'ATOM/USD': 'https://assets.coingecko.com/coins/images/1481/small/cosmos_hub.png',
+    'UNI/USD': 'https://assets.coingecko.com/coins/images/12504/small/uni.jpg',
+    'LTC/USD': 'https://assets.coingecko.com/coins/images/2/small/litecoin.png',
+    'SHIB/USD': 'https://assets.coingecko.com/coins/images/11939/small/shiba.png',
+    'FIL/USD': 'https://assets.coingecko.com/coins/images/12817/small/filecoin.png',
+    'TRX/USD': 'https://assets.coingecko.com/coins/images/1094/small/tron-logo.png',
+    'NEAR/USD': 'https://assets.coingecko.com/coins/images/10365/small/near.jpg',
+    'APT/USD': 'https://assets.coingecko.com/coins/images/26455/small/aptos_round.png',
+    'ARB/USD': 'https://assets.coingecko.com/coins/images/16547/small/photo_2023-03-29_21.47.00.jpeg',
+    'OP/USD': 'https://assets.coingecko.com/coins/images/25244/small/Optimism.png',
+    'PEPE/USD': 'https://assets.coingecko.com/coins/images/29850/small/pepe-token.jpeg',
+    'SUI/USD': 'https://assets.coingecko.com/coins/images/26375/small/sui_asset.jpeg',
+    'SEI/USD': 'https://assets.coingecko.com/coins/images/28205/small/Sei_Logo_-_Transparent.png',
+    'INJ/USD': 'https://assets.coingecko.com/coins/images/12882/small/Secondary_Symbol.png',
+    'FET/USD': 'https://assets.coingecko.com/coins/images/5681/small/Fetch.jpg',
+    'RENDER/USD': 'https://assets.coingecko.com/coins/images/11636/small/rndr.png',
+    'IMX/USD': 'https://assets.coingecko.com/coins/images/17233/small/immutableX-symbol-BLK-RGB.png',
+    'GRT/USD': 'https://assets.coingecko.com/coins/images/13397/small/Graph_Token.png',
+    'AAVE/USD': 'https://assets.coingecko.com/coins/images/12645/small/AAVE.png',
+    'MKR/USD': 'https://assets.coingecko.com/coins/images/1364/small/Mark_Maker.png',
+    'CRV/USD': 'https://assets.coingecko.com/coins/images/12124/small/Curve.png',
+    'SAND/USD': 'https://assets.coingecko.com/coins/images/12129/small/sandbox_logo.jpg',
+    'MANA/USD': 'https://assets.coingecko.com/coins/images/878/small/decentraland-mana.png',
+    'APE/USD': 'https://assets.coingecko.com/coins/images/24383/small/apecoin.jpg',
+    'ALGO/USD': 'https://assets.coingecko.com/coins/images/4380/small/download.png',
+    'XLM/USD': 'https://assets.coingecko.com/coins/images/100/small/Stellar_symbol_black_RGB.png',
+    'VET/USD': 'https://assets.coingecko.com/coins/images/1167/small/VeChain-Logo-768x725.png',
+    'FTM/USD': 'https://assets.coingecko.com/coins/images/4001/small/Fantom_round.png',
+    'HBAR/USD': 'https://assets.coingecko.com/coins/images/3688/small/hbar.png',
+    'ICP/USD': 'https://assets.coingecko.com/coins/images/14495/small/Internet_Computer_logo.png',
+    'EOS/USD': 'https://assets.coingecko.com/coins/images/738/small/eos-eos-logo.png',
+    'FLOW/USD': 'https://assets.coingecko.com/coins/images/13446/small/5f6294c0c7a8cda55cb1c936_Flow_Wordmark.png',
+    'CHZ/USD': 'https://assets.coingecko.com/coins/images/8834/small/CHZ_Token_updated.png',
+    'ENJ/USD': 'https://assets.coingecko.com/coins/images/1102/small/enjin-coin-logo.png',
+    'LDO/USD': 'https://assets.coingecko.com/coins/images/13573/small/Lido_DAO.png',
+    'COMP/USD': 'https://assets.coingecko.com/coins/images/10775/small/COMP.png',
+    'SNX/USD': 'https://assets.coingecko.com/coins/images/3406/small/SNX.png',
+    'THETA/USD': 'https://assets.coingecko.com/coins/images/2538/small/theta-token-logo.png',
+    'EGLD/USD': 'https://assets.coingecko.com/coins/images/12335/small/egld-token-logo.png',
+    'KSM/USD': 'https://assets.coingecko.com/coins/images/9568/small/m4zRhP5e_400x400.jpg',
+    'ZEC/USD': 'https://assets.coingecko.com/coins/images/486/small/circle-zcash-color.png',
+    'XMR/USD': 'https://assets.coingecko.com/coins/images/69/small/monero_logo.png',
+    'DASH/USD': 'https://assets.coingecko.com/coins/images/19/small/dash-logo.png',
+    'XTZ/USD': 'https://assets.coingecko.com/coins/images/976/small/Tezos-logo.png',
+    'KAVA/USD': 'https://assets.coingecko.com/coins/images/9761/small/kava.png',
+    'ROSE/USD': 'https://assets.coingecko.com/coins/images/13162/small/rose.png',
+    'ZIL/USD': 'https://assets.coingecko.com/coins/images/2687/small/Zilliqa-logo.png',
+    'WAVES/USD': 'https://assets.coingecko.com/coins/images/425/small/waves.png',
+    '1INCH/USD': 'https://assets.coingecko.com/coins/images/13469/small/1inch-token.png',
+    'BAT/USD': 'https://assets.coingecko.com/coins/images/677/small/basic-attention-token.png',
+  };
+
+  // CoinGecko fallback cache and symbol mapping
+  let _coinGeckoList = null;
+  const _iconCache = {};
+  
+  async function fetchCoinGeckoList() {
+    if (_coinGeckoList) return _coinGeckoList;
+    try {
+      const cached = localStorage.getItem('coingecko_list');
+      if (cached) {
+        const { data, ts } = JSON.parse(cached);
+        if (Date.now() - ts < 86400000) { // 24 hours cache
+          _coinGeckoList = data;
+          return _coinGeckoList;
+        }
+      }
+      const res = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+      if (res.ok) {
+        _coinGeckoList = await res.json();
+        localStorage.setItem('coingecko_list', JSON.stringify({ data: _coinGeckoList, ts: Date.now() }));
+      }
+    } catch (e) {
+      console.debug('CoinGecko list fetch failed:', e);
+    }
+    return _coinGeckoList || [];
+  }
+
+  async function fetchCoinGeckoIcon(symbol) {
+    const baseSymbol = symbol.split('/')[0].toLowerCase();
+    if (_iconCache[baseSymbol]) return _iconCache[baseSymbol];
+    
+    try {
+      const list = await fetchCoinGeckoList();
+      const coin = list.find(c => c.symbol.toLowerCase() === baseSymbol);
+      if (coin) {
+        const detailRes = await fetch(`https://api.coingecko.com/api/v3/coins/${coin.id}?localization=false&tickers=false&market_data=false&community_data=false&developer_data=false&sparkline=false`);
+        if (detailRes.ok) {
+          const detail = await detailRes.json();
+          const iconUrl = detail.image?.small || detail.image?.thumb;
+          if (iconUrl) {
+            _iconCache[baseSymbol] = iconUrl;
+            CRYPTO_ICONS[symbol] = iconUrl;
+            return iconUrl;
+          }
+        }
+      }
+    } catch (e) {
+      console.debug('CoinGecko icon fetch failed for', symbol, e);
+    }
+    _iconCache[baseSymbol] = null;
+    return null;
+  }
+
+  function getSymbolIcon(symbol) {
+    const url = CRYPTO_ICONS[symbol];
+    const isCrypto = symbol.includes('/');
+    const symbolId = 'icon_' + symbol.replace(/[^a-zA-Z0-9]/g, '_');
+    
+    if (url) {
+      return `<img id="${symbolId}" src="${url}" width="24" height="24" style="border-radius:50%; background:var(--panel-2, #f0f2f5); border:1px solid var(--border-color);" onerror="this.outerHTML='<div class=\\'symbol-icon\\'>${symbol.substring(0, 1)}</div>'" alt="">`;
+    }
+    
+    if (isCrypto) {
+      // Trigger async CoinGecko fetch and update later
+      fetchCoinGeckoIcon(symbol).then(iconUrl => {
+        if (iconUrl) {
+          const el = document.getElementById(symbolId);
+          if (el && el.tagName === 'DIV') {
+            el.outerHTML = `<img id="${symbolId}" src="${iconUrl}" width="24" height="24" style="border-radius:50%; background:var(--panel-2, #f0f2f5); border:1px solid var(--border-color);" onerror="this.outerHTML='<div class=\\'symbol-icon\\'>${symbol.substring(0, 1)}</div>'" alt="">`;
+          }
+        }
+      });
+    }
+    
+    return `<div id="${symbolId}" class="symbol-icon">${symbol.substring(0, 1)}</div>`;
+  }
+
   let allData = [];
   let currentFilter = 'all';
   let currentHorizon = 'short';
-  let currentSignal = 'buy';
+  let currentSignal = 'all';
   let currentLimit = 50;
   let currentOffset = 0;
   let hasMoreData = false;
@@ -443,10 +857,12 @@
       const volEl = document.getElementById('filter-volatility');
       const regEl = document.getElementById('filter-regime');
       const minEl = document.getElementById('filter-min-score');
+      const showActiveEl = document.getElementById('chk-show-already-active');
       localStorage.setItem('explore_prefs', JSON.stringify({
         filter: currentFilter, horizon: currentHorizon, signal: currentSignal, limit: currentLimit,
         sort: sortEl ? sortEl.value : 'score', volatility: volEl ? volEl.value : 'all', regime: regEl ? regEl.value : 'all', minScore: minEl ? parseInt(minEl.value) || 0 : 0,
-        autoRefresh: !!document.getElementById('chk-auto-refresh')?.checked
+        autoRefresh: !!document.getElementById('chk-auto-refresh')?.checked,
+        showActive: showActiveEl ? showActiveEl.checked : false
       }));
     } catch (e) {}
   }
@@ -464,6 +880,7 @@
       if (p.regime) { const el = document.getElementById('filter-regime'); if (el) el.value = p.regime; }
       if (p.minScore != null) { const el = document.getElementById('filter-min-score'); if (el) el.value = p.minScore; }
       if (p.autoRefresh) { const chk = document.getElementById('chk-auto-refresh'); if (chk) { chk.checked = true; toggleAutoRefresh(); } }
+      if (p.showActive) { const chk = document.getElementById('chk-show-already-active'); if (chk) chk.checked = true; }
     } catch (e) {}
   }
   function toggleAutoRefresh() {
@@ -494,7 +911,10 @@
     content.textContent = 'Loading...';
     try {
       const days = document.getElementById('perfDays')?.value || 30;
-      const res = await fetch(`/api/recommendations/performance?days=${days}`);
+      const perfCtrl = new AbortController();
+      const perfTimeout = setTimeout(() => perfCtrl.abort(), 8000);
+      const res = await fetch(`/api/recommendations/performance?days=${days}`, { signal: perfCtrl.signal });
+      clearTimeout(perfTimeout);
       const data = await res.json();
       if (!data.ok) {
         content.innerHTML = '<span style="color:var(--text-secondary);">No performance data available.</span>';
@@ -508,11 +928,12 @@
       const wr = data.win_rate_pct || 0;
       const avg = data.avg_profit_per_recommendation || 0;
       const avgClr = avg >= 0 ? 'var(--color-up)' : 'var(--color-down)';
+      const avgSign = avg >= 0 ? '+' : '';
       let html = `<span style="color:var(--text-primary);">${t} closed</span> &nbsp;|&nbsp; ` +
         `<span style="color:var(--color-up);">${data.wins || 0} wins</span> &nbsp;|&nbsp; ` +
         `<span style="color:var(--color-down);">${data.losses || 0} losses</span> &nbsp;|&nbsp; ` +
         `Win rate: <strong>${wr.toFixed(1)}%</strong> &nbsp;|&nbsp; ` +
-        `Avg PnL: <strong style="color:${avgClr}">$${avg.toFixed(2)}</strong>`;
+        `Avg PnL: <strong style="color:${avgClr}">$${avgSign}${avg.toFixed(2)}</strong>`;
       if (data.by_score_range && data.by_score_range.length) {
         html += '<br><span style="font-size:11px; color:var(--text-secondary);">By score: ';
         html += data.by_score_range.map(r => `${r.range}: ${r.win_rate.toFixed(0)}% (n=${r.total})`).join(' &nbsp;|&nbsp; ');
@@ -736,6 +1157,16 @@
   let currentRegime = 'all';
   let currentSector = 'all';
   let currentMinScore = 0;
+  let currentMinMlConfidence = 0;
+  
+  async function addToWatchlist(symbol) {
+    try {
+      const res = await fetch('/api/scanner/watchlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol }) });
+      const d = await res.json();
+      if (d.ok) alert('Added ' + symbol + ' to watchlist');
+      else alert(d.error || 'Failed to add');
+    } catch (e) { alert('Failed: ' + (e.message || e)); }
+  }
   
   function applyFilters() {
     // Get current filter values
@@ -747,15 +1178,17 @@
     const regimeSelect = document.getElementById('filter-regime');
     const sectorSelect = document.getElementById('filter-sector');
     const minScoreSelect = document.getElementById('filter-min-score');
+    const minMlSelect = document.getElementById('filter-min-ml-confidence');
     
-    currentHorizon = horizonSelect ? horizonSelect.value : 'short';
-    currentSignal = signalSelect ? signalSelect.value : 'buy';
+    currentHorizon = horizonSelect ? horizonSelect.value : 'medium';
+    currentSignal = signalSelect ? signalSelect.value : 'all';
     currentLimit = limitSelect ? parseInt(limitSelect.value) : 10;
     currentSort = sortSelect ? sortSelect.value : 'score';
     currentVolatility = volatilitySelect ? volatilitySelect.value : 'all';
     currentRegime = regimeSelect ? regimeSelect.value : 'all';
     currentSector = sectorSelect ? sectorSelect.value : 'all';
     currentMinScore = minScoreSelect ? parseInt(minScoreSelect.value) || 0 : 0;
+    currentMinMlConfidence = minMlSelect ? parseInt(minMlSelect.value) || 0 : 0;
     currentOffset = 0; // Reset offset when filters change
     relaxedSignal = false;
     const sigBanner = document.getElementById('exploreSignalBanner');
@@ -766,6 +1199,8 @@
     if (horizonBanner) {
       if (currentHorizon === 'long') {
         horizonBanner.textContent = 'Long Term: Stable trends with 180+ days of data (52 weeks). Scans every 60 minutes. Lower exposure per trade (5%).';
+      } else if (currentHorizon === 'medium') {
+        horizonBanner.textContent = 'Medium Term: More reliable signals with 135+ days of data. Scans every 30 minutes. Balanced exposure per trade (7%).';
       } else {
         horizonBanner.textContent = 'Short Term: Quick trades with 90+ days of data. Scans every 15 minutes. Higher exposure per trade (10%).';
       }
@@ -788,9 +1223,9 @@
     const searchEl = document.getElementById('filter-search');
     if (searchEl) searchEl.value = '';
     const horizon = document.getElementById('filter-horizon');
-    if (horizon) horizon.value = 'short';
+    if (horizon) horizon.value = 'medium';
     const signal = document.getElementById('filter-signal');
-    if (signal) signal.value = 'buy';
+    if (signal) signal.value = 'all';
     const sort = document.getElementById('filter-sort');
     if (sort) sort.value = 'score';
     const limit = document.getElementById('filter-limit');
@@ -803,6 +1238,8 @@
     if (sector) sector.value = 'all';
     const minScore = document.getElementById('filter-min-score');
     if (minScore) minScore.value = '0';
+    const minMl = document.getElementById('filter-min-ml-confidence');
+    if (minMl) minMl.value = '0';
     currentSortCol = 'score';
     currentSortDesc = true;
     document.querySelectorAll('.sort-ind').forEach(s => s.textContent = '');
@@ -831,7 +1268,7 @@
             const long = l.total ? `${l.scanned || 0}/${l.total}` : '-';
             msg = `Scanning… Short: ${short} | Long: ${long}`;
           }
-          tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary); line-height:1.6;">
+          tbody.innerHTML = `<tr><td colspan="8" style="padding:40px; text-align:center; color:var(--text-secondary); line-height:1.6;">
             ${msg}<br>
             <small>This may take a few minutes. Reload or switch filters to see new data.</small>
           </td></tr>`;
@@ -842,8 +1279,10 @@
     try {
       await Promise.all([
         fetch('/api/recommendations/scan?horizon=short', { method: 'POST' }),
+        fetch('/api/recommendations/scan?horizon=medium', { method: 'POST' }),
         fetch('/api/recommendations/scan?horizon=long', { method: 'POST' }),
         fetch('/api/recommendations/scan_stocks?horizon=short', { method: 'POST' }),
+        fetch('/api/recommendations/scan_stocks?horizon=medium', { method: 'POST' }),
         fetch('/api/recommendations/scan_stocks?horizon=long', { method: 'POST' })
       ]);
     } catch (e) { console.warn('Rescan request failed:', e); }
@@ -856,7 +1295,7 @@
   async function loadScreener(append = false) {
     const tbody = document.getElementById("screenerBody");
     if (!append && tbody) {
-      tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" style="padding:40px; text-align:center; color:var(--text-secondary)">Loading market data...</td></tr>`;
     }
     
     // Build market_type filter
@@ -865,7 +1304,8 @@
     else if (currentFilter === 'stocks') marketTypeParam = 'stocks';
     
     try {
-      const url = `/api/recommendations?horizon=${currentHorizon}&market_type=${marketTypeParam}&signal=${currentSignal}&limit=${currentLimit}&offset=${currentOffset}&sort=${currentSort}&volatility=${currentVolatility}&regime=${currentRegime}&sector=${encodeURIComponent(currentSector)}&min_score=${currentMinScore}`;
+      const showActive = document.getElementById('chk-show-already-active')?.checked ? 1 : 0;
+      const url = `/api/recommendations?horizon=${currentHorizon}&market_type=${marketTypeParam}&signal=${currentSignal}&limit=${currentLimit}&offset=${currentOffset}&sort=${currentSort}&volatility=${currentVolatility}&regime=${currentRegime}&sector=${encodeURIComponent(currentSector)}&min_score=${currentMinScore}&show_already_active=${showActive}`;
       const res = await fetchWithRetry(url, { headers: { 'Accept': 'application/json' }, timeoutMs: 12000 }, 3, 1000);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -877,7 +1317,7 @@
       if (status === "warming_up") {
         const message = data.message || "Generating recommendations...";
         if (tbody && !append) {
-          tbody.innerHTML = `<tr><td colspan="9" style="padding:40px; text-align:center; color:var(--text-secondary)">
+          tbody.innerHTML = `<tr><td colspan="8" style="padding:40px; text-align:center; color:var(--text-secondary)">
             ${message}<br><small>Auto-refreshing in 10 seconds...</small>
           </td></tr>`;
         }
@@ -899,34 +1339,71 @@
           } else if (reason === "scan_failed") {
             displayMsg = `Scan failed: ${errorMsg}. Check server logs.`;
           }
-          tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${displayMsg}</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="8" class="center muted" style="padding:40px">${displayMsg}</td></tr>`;
         }
         return;
       }
 
-      // Update last scan timestamp (relative + absolute)
+      // Macro Risk-Off banner — informational, not blocking
+      const macroBanner = document.getElementById('exploreMacroBanner');
+      if (macroBanner) {
+        if (data.macro_risk_off) {
+          macroBanner.innerHTML = '<div class="macro-banner-inner"><span>⚠️ <strong>Market conditions are cautious (Risk-Off).</strong> Recommendations favor defensive strategies with reduced position sizes.</span><button class="macro-banner-close" onclick="this.closest(\'#exploreMacroBanner\').style.display=\'none\'" title="Dismiss">&times;</button></div>';
+          macroBanner.style.display = 'block';
+        } else {
+          macroBanner.style.display = 'none';
+        }
+      }
+
+      // Top 30 whitelist indicator
+      const whitelistBadge = document.getElementById('whitelistBadge');
+      if (whitelistBadge) {
+        if (data.top30_whitelist_active) {
+          whitelistBadge.style.display = 'inline-block';
+          console.log('[Explore] Top 30 crypto whitelist ACTIVE: only BTC, ETH, SOL, XRP, ADA, AVAX, DOGE, DOT, LINK, MATIC, etc.');
+        } else {
+          whitelistBadge.style.display = 'none';
+        }
+      }
+
+      // Update last scan timestamp (per horizon: Short/Medium/Long)
       const freshnessEl = document.getElementById('dataFreshness');
       if (freshnessEl) {
-        const age = data.scan_age_sec;
-        const lastTs = data.last_scan_ts;
+        const byHorizon = data.last_scan_by_horizon || {};
+        const h = currentHorizon || data.horizon || 'short';
+        const info = byHorizon[h] || { ts: data.last_scan_ts, age_sec: data.scan_age_sec };
+        const age = info.age_sec;
+        const lastTs = info.ts;
         if (age != null && age >= 0 && lastTs) {
           const mins = Math.floor(age / 60);
           const secs = Math.floor(age % 60);
           let rel = mins > 0 ? (mins >= 60 ? `${Math.floor(mins/60)}h ago` : `${mins}m ago`) : `${secs}s ago`;
           const d = new Date(lastTs * 1000);
           const abs = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-          freshnessEl.textContent = `Last scan: ${rel}`;
-          freshnessEl.title = `Last scan: ${rel} (${abs})`;
+          freshnessEl.textContent = `${h.charAt(0).toUpperCase() + h.slice(1)}: scanned ${rel}`;
+          freshnessEl.title = `Last scan (${h}): ${rel} (${abs})`;
         } else if (age != null && age >= 0) {
           const mins = Math.floor(age / 60);
-          const secs = Math.floor(age % 60);
-          freshnessEl.textContent = mins > 0 ? `Data: ${mins}m ago` : `Data: ${secs}s ago`;
+          freshnessEl.textContent = `${h}: ${mins > 0 ? mins + 'm ago' : 'just now'}`;
           freshnessEl.title = '';
         } else {
-          freshnessEl.textContent = '';
-          freshnessEl.title = '';
+          freshnessEl.textContent = `${h}: never scanned`;
+          freshnessEl.title = 'Run Rescan to populate';
         }
       }
+
+      // Portfolio exposure %
+      fetch('/api/portfolio').then(r => r.json()).then(p => {
+        const expEl = document.getElementById('portfolioExposure');
+        const snap = p && p.portfolio ? p.portfolio : p;
+        if (expEl && snap && (snap.total_usd || 0) > 0) {
+          const pos = snap.positions_usd || 0;
+          const tot = snap.total_usd || 1;
+          const pct = (pos / tot * 100).toFixed(1);
+          expEl.textContent = 'Deployed: $' + Number(pos).toLocaleString('en-US', {maximumFractionDigits:0}) + ' / $' + Number(tot).toLocaleString('en-US', {maximumFractionDigits:0}) + ' (' + pct + '%)';
+          expEl.title = 'Deployed capital: $' + Number(pos).toLocaleString('en-US', {maximumFractionDigits:0}) + ' / $' + Number(tot).toLocaleString('en-US', {maximumFractionDigits:0});
+        }
+      }).catch(() => {});
 
       // Get items from response
       const newItems = data.items || [];
@@ -969,7 +1446,7 @@
           return;
         }
         if (tbody && !append) {
-          tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${message}</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="8" class="center muted" style="padding:40px">${message}</td></tr>`;
         }
         return;
       }
@@ -1028,7 +1505,7 @@
         if (e.name === "AbortError") errorMsg += "Request timed out. ";
         else errorMsg += (e.message || String(e)) + ". ";
         errorMsg += "Retrying in 5s…";
-        tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px">${errorMsg}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="center muted" style="padding:40px">${errorMsg}</td></tr>`;
         setTimeout(() => loadScreener(false), 5000);
       }
     }
@@ -1045,6 +1522,18 @@
       if (currentFilter === 'crypto') if (!isCrypto) return false;
       if (currentFilter === 'stocks') if (isCrypto) return false;
       if (searchQ && (!item.symbol || !item.symbol.toUpperCase().includes(searchQ))) return false;
+      if (currentMinMlConfidence > 0) {
+        const ml = item.ml_confidence;
+        const mlPct = ml != null ? (typeof ml === 'number' && ml <= 1 ? ml * 100 : ml) : 0;
+        if (mlPct < currentMinMlConfidence) return false;
+      }
+      // Client-side signal filter (Buy Only / Buy + Watch)
+      const itemScore = item.score ?? 0;
+      const rating = (item.rating || '').toLowerCase();
+      const isBuy = itemScore >= 70 && rating !== 'avoid';
+      const isWatch = itemScore >= 45 && itemScore < 70 && rating !== 'avoid';
+      if (currentSignal === 'buy' && !isBuy) return false;
+      if (currentSignal === 'watch' && !isBuy && !isWatch) return false;
       return true;
     });
 
@@ -1070,7 +1559,7 @@
         msg = "No market data available. Ensure the worker is running and recommendations are being generated.";
       }
       if (!append) {
-        tbody.innerHTML = `<tr><td colspan="9" class="center muted" style="padding:40px; line-height:1.6">${msg}<br><small style="opacity:0.8">Try adjusting filters, lowering Min Score, or switching to "Buy + Watch"</small></td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="center muted" style="padding:40px; line-height:1.6">${msg}<br><small style="opacity:0.8">Try adjusting filters, lowering Min Score, or switching to "Buy + Watch"</small></td></tr>`;
       }
       return;
     }
@@ -1103,10 +1592,10 @@
           if (canvas) {
             const ctx = canvas.getContext('2d');
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = 'rgba(148, 163, 184, 0.3)';
-            ctx.font = '10px sans-serif';
+            ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+            ctx.font = '11px sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText('No data', canvas.width / 2, canvas.height / 2);
+            ctx.fillText('—', canvas.width / 2, canvas.height / 2 + 3);
           }
         }
       });
@@ -1122,6 +1611,13 @@
     const hasPrice = item.price !== null && item.price !== undefined && item.price > 0;
     const price = hasPrice ? ((item.price || 0) < 10 ? (item.price || 0).toFixed(4) : (item.price || 0).toFixed(2)) : '—';
     const chg = (hasPrice && hasChange) ? ((item.price || 0) * ((item.change_pct || 0) / 100)).toFixed(2) : '—';
+    // Unified status: BUY (75+), WATCH (55-74), AVOID (<55 or explicit avoid)
+    const itemScore = item.score ?? 0;
+    const isBuy = itemScore >= 70 && (item.rating || '').toLowerCase() !== 'avoid';
+    const isWatch = itemScore >= 45 && itemScore < 70 && (item.rating || '').toLowerCase() !== 'avoid';
+    const isAvoid = itemScore < 45 || (item.rating || '').toLowerCase() === 'avoid';
+    const statusLabel = isBuy ? 'BUY' : (isWatch ? 'WATCH' : 'AVOID');
+    const statusColor = isBuy ? '#089981' : (isWatch ? '#eab308' : '#e74c3c');
     const isCrypto = item.market_type === 'crypto' || item.symbol.includes('/');
     const typeLabel = isCrypto ? 'CRYPTO' : 'STOCK';
     const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
@@ -1129,48 +1625,83 @@
     const reasons = (item.reasons || []).concat(item.risk_flags || []);
     const tooltip = reasons.length ? `${(item.rating || 'Neutral')} (${item.score ?? '—'}) | ${reasons.join(' • ')}` : `${item.rating || 'Neutral'} | Score: ${item.score ?? '—'}`;
     const score = item.score ?? 0;
-    const scoreClass = score >= 70 ? 'score-high' : (score >= 50 ? 'score-mid' : 'score-low');
+    const scoreDisplay = score.toFixed(1);
+    const scoreClass = score >= 70 ? 'score-high' : (score >= 45 ? 'score-mid' : 'score-low');
     
     return `
-      <tr onclick="openBotModal('${item.symbol}')" style="cursor:pointer">
+      <tr class="${isAvoid ? 'row-avoid' : ''}" onclick="openBotModal('${item.symbol}')" style="cursor:pointer" data-symbol="${item.symbol}">
         <td class="symbol-cell">
-          <div class="symbol-icon">${item.symbol.substring(0, 1)}</div>
+          <span class="watchlist-star ${isInWatchlist(item.symbol) ? 'active' : ''}" onclick="toggleWatchlist('${(item.symbol || '').replace(/'/g, "\\'")}'); event.stopPropagation();" title="Add to watchlist">⭐</span>
+          ${getSymbolIcon(item.symbol)}
           <div class="symbol-info">
             <span class="symbol-ticker">${item.symbol}</span>
+            ${item.already_active ? '<span class="tag tag-neg" style="margin-left:6px; font-size:10px;" title="' + (item.active_reason || []).join(', ') + '">Already active</span>' : ''}
             <span class="symbol-name">${typeLabel} • ${item.recommended_strategy || 'DCA'}</span>
           </div>
         </td>
         <td class="right ${colorClass}" style="font-weight:500">${price}</td>
         <td class="right ${colorClass}">${hasChange ? `${sign}${(item.change_pct || 0).toFixed(2)}%` : '—'}</td>
-        <td class="right ${colorClass}">${hasChange ? `${sign}${chg}` : '—'}</td>
         <td class="center" onclick="event.stopPropagation()">
-          <div style="display:flex; align-items:center; justify-content:center; gap:6px; flex-wrap:wrap;">
-            <button onclick="openBotModal('${(item.symbol || '').replace(/'/g, "\\'")}'); event.stopPropagation();" style="padding:4px 10px; background:#089981; border:none; border-radius:6px; color:#fff; font-size:11px; font-weight:600; cursor:pointer;" title="Create bot from recommendation">Trade</button>
-            <span class="expand-icon" onclick="toggleScoreBreakdown('${(item.symbol || '').replace(/'/g, "\\'")}', event)" title="Show score breakdown">&#9432;</span>
-            <span class="score-badge ${scoreClass}" title="Score">${score}</span>
-            <span class="rating-badge ${ratingClass}" title="${(tooltip || '').replace(/"/g, '&quot;')}">${item.rating || 'Neutral'}</span>
+          <div class="status-cell-wrap">
+            <span style="display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; color:#fff; background:${statusColor}; letter-spacing:0.5px;">${statusLabel}</span>
+            <span class="score-badge ${scoreClass} score-tooltip" title="Score: ${scoreDisplay}" data-breakdown="RSI: ${item.rsi?.toFixed(2) || 'N/A'} | Trend: ${item.trend || 'N/A'} | Volume: ${item.volume_rating || 'Normal'} | Momentum: ${item.momentum_score?.toFixed(2) || 'N/A'}">
+              ${scoreDisplay}
+              <div class="score-tooltip-content">
+                RSI: ${item.rsi?.toFixed(2) || 'N/A'}<br>
+                Trend: ${item.trend || 'N/A'}<br>
+                Volume: ${item.volume_rating || 'Normal'}<br>
+                Momentum: ${item.momentum_score?.toFixed(2) || 'N/A'}
+              </div>
+            </span>
+            ${isBuy ? `<button class="create-bot-hover create-bot-btn" onclick="openBotModal('${(item.symbol || '').replace(/'/g, "\\'")}'); event.stopPropagation();" title="Create bot">Create Bot</button>` : ''}
+            <span class="expand-icon" onclick="toggleScoreBreakdown('${(item.symbol || '').replace(/'/g, "\\'")}', event)" title="Score breakdown" style="cursor:pointer;">ℹ</span>
+            ${item.macro_warning ? '<span title="' + item.macro_warning.replace(/"/g, '&quot;') + '" style="color:#eab308; font-size:14px; cursor:help;">⚠</span>' : ''}
           </div>
         </td>
         <td class="right">${formatNumber(item.volume)}</td>
-        <td class="right">${formatNumber(item.market_cap)}</td>
         <td style="padding:0 10px" onclick="event.stopPropagation()">
           <canvas id="${rid}" class="sparkline" width="100" height="30"></canvas>
         </td>
         <td onclick="event.stopPropagation()">
           <div style="font-size:11px; color:var(--text-secondary);">
-            ${item.suggested_strategy || item.recommended_strategy || 'DCA'}
+            ${formatLabel(item.suggested_strategy || item.recommended_strategy || 'DCA')}
           </div>
-          ${regime ? `<div style="font-size:10px; color:var(--text-secondary); opacity:0.8;">${regime}</div>` : ''}
+          ${regime ? `<div style="font-size:10px; color:var(--text-secondary); opacity:0.8;">${formatLabel(regime)}</div>` : ''}
+          ${item.crypto_cycle ? `<span style="padding:1px 6px; border-radius:4px; font-size:9px; background:#1a2e1a; color:#22c55e;">${formatLabel(item.crypto_cycle)}</span>` : ''}
         </td>
       </tr>
       <tr id="breakdown-${(item.symbol || '').replace(/[^a-zA-Z0-9]/g, '_')}" class="breakdown-row" style="display:none">
-        <td colspan="9" class="breakdown-cell">
+        <td colspan="8" class="breakdown-cell">
           <div class="breakdown-section">
             <div class="breakdown-label">Score breakdown — ${item.symbol}</div>
             <div class="breakdown-items">
-              <strong>Score:</strong> ${score} &nbsp;|&nbsp; <strong>Rating:</strong> ${item.rating || 'Neutral'} &nbsp;|&nbsp; <strong>Strategy:</strong> ${item.recommended_strategy || item.suggested_strategy || 'DCA'} ${item.volatility != null ? ' | Vol: ' + (typeof item.volatility === 'number' ? (item.volatility * 100).toFixed(2) + '%' : item.volatility) : ''}
+              <strong>Score:</strong> ${scoreDisplay} &nbsp;|&nbsp; <strong>Rating:</strong> ${item.rating || 'Neutral'} &nbsp;|&nbsp; <strong>Strategy:</strong> ${item.recommended_strategy || item.suggested_strategy || 'DCA'} ${item.volatility != null ? ' | Vol: ' + (typeof item.volatility === 'number' ? (item.volatility * 100).toFixed(2) + '%' : item.volatility) : ''}
             </div>
           </div>
+          ${item.ready_now != null ? `<div class="breakdown-section"><div class="breakdown-label">${item.ready_now ? '<span style="color:#22c55e;font-weight:700;">&#x2713; READY</span>' : '<span style="color:#eab308;font-weight:700;">&#x25B6; WATCH</span>'} ${item.entry_type_scanner ? ' &mdash; ' + item.entry_type_scanner : ''} ${item.edge_score ? ' | Edge: ' + (item.edge_score * 100).toFixed(1) + '%' : ''} ${item.confidence ? ' | Confidence: ' + (item.confidence * 100).toFixed(1) + '%' : ''}</div>${item.expected_move_pct ? `<div class="breakdown-items">Expected move: ${(item.expected_move_pct * 100).toFixed(2)}% ${item.target_levels && item.target_levels.tp1 ? '| TP1: ' + Number(item.target_levels.tp1).toFixed(4) : ''} ${item.invalidation_level ? '| SL: ' + Number(item.invalidation_level).toFixed(4) : ''} ${item.time_horizon_scanner ? '| Horizon: ' + item.time_horizon_scanner : ''}</div>` : ''}</div>` : ''}
+          ${(item.evidence || []).length ? `<div class="breakdown-section"><div class="breakdown-label">Why this trade</div><div class="breakdown-items"><ul>${(item.evidence || []).map(e => '<li>' + (e || '').replace(/</g, '&lt;') + '</li>').join('')}</ul></div></div>` : ''}
+          ${item.trigger_conditions && !item.ready_now ? `<div class="breakdown-section"><div class="breakdown-label" style="color:#eab308;">Trigger needed</div><div class="breakdown-items">${(item.trigger_conditions || '').replace(/</g, '&lt;')}</div></div>` : ''}
+          ${(function(){
+            var sb = item.score_breakdown || {};
+            if (Array.isArray(sb) && sb.length) return '<div class="breakdown-section"><div class="breakdown-label">Score contributors</div><div class="breakdown-items"><ul>' + sb.map(function(c){return '<li>'+(c||'').replace(/</g,'&lt;')+'</li>';}).join('') + '</ul></div></div>';
+            if (typeof sb === 'object' && !Array.isArray(sb) && Object.keys(sb).length > 0) {
+              var html = '<div class="breakdown-section"><div class="breakdown-label">Score Breakdown</div><div class="breakdown-items"><table style="width:100%;max-width:400px;border-collapse:collapse;font-size:12px;">';
+              var order = ['regime','trend','momentum_30d','momentum_mtf','volume','rsi','drawdown','volatility','macro'];
+              var labels = {regime:'Regime',trend:'Trend',momentum_30d:'Momentum (30d)',momentum_mtf:'Momentum (MTF)',volume:'Volume',rsi:'RSI',drawdown:'Drawdown',volatility:'Volatility',macro:'Macro'};
+              order.forEach(function(k){
+                if (!sb[k]) return;
+                var v = sb[k].value || 0;
+                var lbl = sb[k].label || labels[k] || k;
+                var c = v > 0 ? '#089981' : (v < 0 ? '#f23645' : 'var(--text-secondary)');
+                var sign = v > 0 ? '+' : '';
+                html += '<tr style="border-bottom:1px solid var(--border-color,#363a45);"><td style="padding:3px 8px;">' + lbl + '</td><td style="padding:3px 8px;text-align:right;color:'+c+';font-weight:600;">'+sign+v+'</td></tr>';
+              });
+              if (sb.final) html += '<tr style="border-top:2px solid var(--border-color,#363a45);font-weight:700;"><td style="padding:4px 8px;">FINAL</td><td style="padding:4px 8px;text-align:right;">'+sb.final.value+'</td></tr>';
+              html += '</table></div></div>';
+              return html;
+            }
+            return '';
+          })()}
           ${(item.reasons || []).length ? `<div class="breakdown-section"><div class="breakdown-label">Reasons</div><div class="breakdown-items"><ul>${(item.reasons || []).map(r => '<li>' + (r || '').replace(/</g, '&lt;') + '</li>').join('')}</ul></div></div>` : ''}
           ${(item.risk_flags || []).length ? `<div class="breakdown-section"><div class="breakdown-label">Risk flags</div><div class="breakdown-items"><ul>${(item.risk_flags || []).map(f => '<li style="color:#c9a227">' + (f || '').replace(/</g, '&lt;') + '</li>').join('')}</ul></div></div>` : ''}
         </td>
@@ -1214,6 +1745,11 @@
     if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
     if (num >= 1e3) return (num / 1e3).toFixed(2) + "K";
     return num.toFixed(0);
+  }
+
+  function formatLabel(s) {
+    if (!s) return '';
+    return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   }
 
   function exportToCsv(e) {
@@ -1267,6 +1803,547 @@
     document.querySelectorAll('[id^="breakdown-"]').forEach(el => el.style.display = 'none');
     row.style.display = isShown ? 'none' : 'table-row';
   }
+
+  // ═══ Live Scan Status Panel JS ═══
+  let _scanPollTimer = null;
+  let _scanWasRunning = false;
+  let _scanErrorsOpen = false;
+
+  function toggleScanErrors() {
+    _scanErrorsOpen = !_scanErrorsOpen;
+    const list = document.getElementById('scanErrorsList');
+    const tog = document.getElementById('errorsToggle');
+    if (list) list.style.display = _scanErrorsOpen ? 'block' : 'none';
+    if (tog) tog.textContent = (_scanErrorsOpen ? '▾' : '▸') + ' Last errors (' + (document.getElementById('errorsCount')?.textContent || '0') + ')';
+  }
+
+  function _fmtAgo(sec) {
+    if (sec == null) return 'never';
+    if (sec < 60) return sec + 's ago';
+    if (sec < 3600) return Math.floor(sec/60) + 'm ago';
+    if (sec < 86400) return Math.floor(sec/3600) + 'h ago';
+    return Math.floor(sec/86400) + 'd ago';
+  }
+
+  function _fmtEta(sec) {
+    if (sec == null) return '';
+    if (sec < 60) return 'About ' + sec + ' seconds remaining';
+    return 'About ' + Math.ceil(sec/60) + ' minute' + (Math.ceil(sec/60)!==1?'s':'') + ' remaining';
+  }
+
+  function _fmtTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }
+
+  function _showToast(msg, durationMs) {
+    const t = document.getElementById('scanToast');
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), durationMs || 5000);
+  }
+
+  function _updateHorizonDot(dotId, statusId, h) {
+    const dot = document.getElementById(dotId);
+    const lbl = document.getElementById(statusId);
+    if (!dot || !lbl) return;
+    if (h.scanning) {
+      dot.className = 'status-dot yellow';
+      const pct = h.total > 0 ? Math.round(h.scanned / h.total * 100) : 0;
+      lbl.textContent = 'Scanning… ' + h.scanned + '/' + h.total + ' (' + pct + '%)';
+    } else if (h.last_run_ts && h.last_run_ts > 0) {
+      const ageOk = h.last_run_ago_sec != null && h.last_run_ago_sec < 7200;
+      dot.className = 'status-dot ' + (h.error ? 'red' : (ageOk ? 'green' : 'yellow'));
+      lbl.textContent = (h.error ? 'Error: ' + h.error.substring(0,40) : h.scanned + ' scanned, ' + h.eligible + ' eligible') + ' · ' + _fmtAgo(h.last_run_ago_sec);
+    } else {
+      dot.className = 'status-dot red';
+      lbl.textContent = 'Never scanned';
+    }
+  }
+
+  async function pollScanProgress() {
+    try {
+      const res = await fetch('/api/recommendations/scan_progress');
+      if (!res.ok) return;
+      const d = await res.json();
+      if (!d.ok) return;
+
+      const bar = document.getElementById('scanBarFill');
+      const lbl = document.getElementById('scanProgressLabel');
+      const pctEl = document.getElementById('scanProgressPct');
+      const curWrap = document.getElementById('scanCurrentWrap');
+      const curSym = document.getElementById('scanCurrentSymbol');
+      const etaWrap = document.getElementById('scanEta');
+      const etaText = document.getElementById('scanEtaText');
+      const buyCount = document.getElementById('scanBuyCount');
+
+      if (d.any_scanning) {
+        const ch = d.horizons[d.current_horizon] || {};
+        const done = ch.scanned || 0;
+        const total = ch.total || 0;
+        const pct = total > 0 ? Math.round(done / total * 100) : 0;
+
+        if (bar) { bar.style.width = (total > 0 ? pct : 0) + '%'; bar.classList.toggle('indeterminate', total === 0); }
+        if (lbl) lbl.textContent = total > 0 ? ('Scanning ' + done + ' of ' + total + ' symbols (' + d.current_horizon + ')') : ('Scanning ' + d.current_horizon + '…');
+        if (pctEl) pctEl.textContent = total > 0 ? pct + '%' : '';
+        if (curWrap) curWrap.style.display = d.current_symbol ? 'flex' : 'none';
+        if (curSym) curSym.textContent = d.current_symbol || '—';
+        if (etaWrap) etaWrap.style.display = d.eta_sec != null ? 'flex' : 'none';
+        if (etaText) etaText.textContent = _fmtEta(d.eta_sec);
+        if (buyCount) buyCount.textContent = d.buy_signals_found || 0;
+        _scanWasRunning = true;
+      } else {
+        if (bar) { bar.style.width = _scanWasRunning ? '100%' : '0%'; bar.classList.remove('indeterminate'); }
+        if (lbl) lbl.textContent = _scanWasRunning ? 'Scan complete' : 'Idle — waiting for scan';
+        if (pctEl) pctEl.textContent = _scanWasRunning ? '100%' : '';
+        if (curWrap) curWrap.style.display = 'none';
+        if (etaWrap) etaWrap.style.display = 'none';
+        if (buyCount) buyCount.textContent = d.buy_signals_found || 0;
+        const lastTimeEl = document.getElementById('scanLastTime');
+        if (lastTimeEl) {
+          const lastRun = (d.scan_history || []).slice(-1)[0];
+          lastTimeEl.textContent = lastRun ? 'Last scan: ' + _fmtTime(lastRun.ts) + ' (' + _fmtAgo(Math.round((Date.now()/1000) - lastRun.ts)) + ')' : 'No scans completed yet';
+        }
+
+        if (_scanWasRunning) {
+          _scanWasRunning = false;
+          const lastH = (d.scan_history || []).slice(-1)[0];
+          const sigMsg = lastH ? lastH.buy_signals : (d.buy_signals_found || 0);
+          _showToast('Scan complete — found ' + sigMsg + ' new signals', 6000);
+          setTimeout(() => loadScreener(false), 1500);
+        }
+      }
+
+      _updateHorizonDot('dotShort', 'statusShort', d.horizons.short || {});
+      _updateHorizonDot('dotMedium', 'statusMedium', d.horizons.medium || {});
+      _updateHorizonDot('dotLong', 'statusLong', d.horizons.long || {});
+
+      const errs = d.recent_errors || [];
+      const errToggle = document.getElementById('errorsToggle');
+      const errCount = document.getElementById('errorsCount');
+      const errList = document.getElementById('scanErrorsList');
+      if (errToggle) errToggle.style.display = errs.length > 0 ? 'block' : 'none';
+      if (errCount) errCount.textContent = errs.length;
+      if (errList && _scanErrorsOpen) {
+        errList.innerHTML = errs.map(e => '<div class="scan-error-item">' + _fmtTime(e.ts) + ' <strong>' + (e.symbol||'') + '</strong>: ' + (e.error||'').substring(0,120) + '</div>').join('');
+      }
+
+      const hist = d.scan_history || [];
+      const histEl = document.getElementById('scanHistoryList');
+      if (histEl) {
+        if (hist.length === 0) {
+          histEl.innerHTML = '<div style="color:var(--text-secondary); font-size:11px;">No scans yet</div>';
+        } else {
+          histEl.innerHTML = hist.slice().reverse().map(h =>
+            '<div class="scan-history-item">' +
+            '<span class="h-horizon h-horizon-' + h.horizon + '">' + h.horizon + '</span>' +
+            '<span>' + h.scanned + ' scanned, ' + h.buy_signals + ' buys</span>' +
+            '<span>' + Math.round(h.duration_sec) + 's</span>' +
+            '<span>' + _fmtTime(h.ts) + '</span>' +
+            '</div>'
+          ).join('');
+        }
+      }
+    } catch (e) {
+      console.warn('scan progress poll error', e);
+    }
+  }
+
+  _scanPollTimer = setInterval(pollScanProgress, 2500);
+  pollScanProgress();
+
+  // ═══ Market Status & Next Scan Countdown ═══
+  function updateStocksMarketStatus() {
+    const dot = document.getElementById('stocksMarketDot');
+    const status = document.getElementById('stocksMarketStatus');
+    if (!dot || !status) return;
+    
+    const alpacaConfigured = {{ 'true' if alpaca_ready else 'false' }};
+    if (!alpacaConfigured) {
+      dot.style.background = 'var(--text-secondary)';
+      status.innerHTML = 'Stocks: <span style="color:var(--text-secondary);">Not configured</span> <span style="font-size:10px; opacity:0.7;">[ALPACA_NOT_CONFIGURED]</span>';
+      return;
+    }
+    
+    const now = new Date();
+    const estOffset = -5; // EST offset (simplified, doesn't account for DST perfectly)
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    const est = new Date(utc + (3600000 * estOffset));
+    const day = est.getDay();
+    const hour = est.getHours();
+    const minute = est.getMinutes();
+    const timeDecimal = hour + minute / 60;
+    
+    // NYSE hours: Mon-Fri 9:30 AM - 4:00 PM EST
+    const isWeekday = day >= 1 && day <= 5;
+    const isMarketHours = timeDecimal >= 9.5 && timeDecimal < 16;
+    const isOpen = isWeekday && isMarketHours;
+    
+    if (isOpen) {
+      dot.style.background = '#089981';
+      status.innerHTML = 'Stocks: <span style="color:#089981;">Open</span>';
+    } else {
+      dot.style.background = '#f23645';
+      let reason = '';
+      if (!isWeekday) {
+        reason = 'Weekend';
+      } else if (timeDecimal < 9.5) {
+        reason = 'Pre-market (opens 9:30 AM EST)';
+      } else {
+        reason = 'After hours (closed at 4:00 PM EST)';
+      }
+      status.innerHTML = `Stocks: <span style="color:#f23645;">Closed</span> <span style="font-size:10px; opacity:0.7;">[${reason}]</span>`;
+    }
+  }
+  updateStocksMarketStatus();
+  setInterval(updateStocksMarketStatus, 60000); // Update every minute
+
+  // ═══ Next Scan Countdown Timer ═══
+  let _nextScanTime = null;
+  let _scanIntervalSec = 900; // Default 15 minutes
+  
+  function updateNextScanCountdown() {
+    const lastTimeEl = document.getElementById('scanLastTime');
+    if (!lastTimeEl) return;
+    
+    if (_nextScanTime && _nextScanTime > Date.now()) {
+      const remaining = Math.floor((_nextScanTime - Date.now()) / 1000);
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      const countdownText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      const existingText = lastTimeEl.textContent;
+      const lastScanPart = existingText.includes('Last scan:') ? existingText.split('|')[0].trim() : 'Last scan: —';
+      lastTimeEl.innerHTML = `${lastScanPart} <span style="margin-left:8px; color:#089981;">| Next scan: ${countdownText}</span>`;
+    }
+  }
+  
+  async function fetchScannerStatus() {
+    try {
+      const res = await fetch('/api/scanner/status');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok && data.next_scan) {
+          _nextScanTime = data.next_scan * 1000; // Convert to ms
+          _scanIntervalSec = data.interval_seconds || 900;
+        }
+      }
+    } catch (e) {
+      console.debug('Scanner status fetch failed:', e);
+    }
+  }
+  fetchScannerStatus();
+  setInterval(fetchScannerStatus, 60000); // Refresh every minute
+  setInterval(updateNextScanCountdown, 1000); // Update countdown every second
+
+  // ═══ NEW FEATURES: Watchlist, CSV Export, Auto-Refresh, Notifications ═══
+
+  // Watchlist Management
+  const WATCHLIST_KEY = 'explore_watchlist';
+
+  function getWatchlist() {
+    try {
+      const stored = localStorage.getItem(WATCHLIST_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveWatchlist(symbols) {
+    try {
+      localStorage.setItem(WATCHLIST_KEY, JSON.stringify(symbols));
+    } catch (e) {
+      console.warn('Failed to save watchlist:', e);
+    }
+  }
+
+  function isInWatchlist(symbol) {
+    return getWatchlist().includes(symbol);
+  }
+
+  function toggleWatchlist(symbol) {
+    const watchlist = getWatchlist();
+    const idx = watchlist.indexOf(symbol);
+    if (idx >= 0) {
+      watchlist.splice(idx, 1);
+    } else {
+      watchlist.push(symbol);
+    }
+    saveWatchlist(watchlist);
+    updateWatchlistUI();
+    applyFilters();
+  }
+
+  function addToWatchlist(symbol) {
+    const watchlist = getWatchlist();
+    if (!watchlist.includes(symbol)) {
+      watchlist.push(symbol);
+      saveWatchlist(watchlist);
+      updateWatchlistUI();
+      showToast('Added to watchlist', `${symbol} added to watchlist`);
+    }
+  }
+
+  function updateWatchlistUI() {
+    const watchlist = getWatchlist();
+    document.querySelectorAll('[data-symbol]').forEach(el => {
+      const symbol = el.getAttribute('data-symbol');
+      const star = el.querySelector('.watchlist-star');
+      if (star) {
+        star.classList.toggle('active', isInWatchlist(symbol));
+      }
+    });
+  }
+
+  // Watchlist filter
+  function applyWatchlistFilter() {
+    if (currentFilter !== 'watchlist') return;
+    const watchlist = getWatchlist();
+    allData = allData.filter(item => watchlist.includes(item.symbol));
+  }
+
+  // Extend applyFilters to support watchlist
+  const _originalApplyFilters = applyFilters;
+  applyFilters = function() {
+    if (currentFilter === 'watchlist') {
+      const watchlist = getWatchlist();
+      if (watchlist.length === 0) {
+        const tbody = document.getElementById('screenerBody');
+        if (tbody) {
+          tbody.innerHTML = '<tr><td colspan="8" class="center muted" style="padding:40px;">Watchlist is empty. Add assets by clicking the star icon.</td></tr>';
+        }
+        return;
+      }
+      // Filter allData to only include watchlist items
+      const originalData = allData;
+      allData = originalData.filter(item => watchlist.includes(item.symbol));
+      _originalApplyFilters.call(this);
+      allData = originalData;
+    } else {
+      _originalApplyFilters.call(this);
+    }
+  };
+
+  // CSV Export
+  function exportToCsv(event) {
+    event.preventDefault();
+    const tbody = document.getElementById('screenerBody');
+    if (!tbody) return;
+
+    const rows = [];
+    rows.push(['Symbol', 'Price', '24h Change', 'Status', 'Score', 'Volume', 'Strategy', 'Watched']);
+
+    const watchlist = getWatchlist();
+    const visibleRows = tbody.querySelectorAll('tr:not(.breakdown-row)');
+
+    visibleRows.forEach(tr => {
+      const cells = tr.querySelectorAll('td');
+      if (cells.length >= 7) {
+        const symbolEl = cells[0];
+        const symbol = symbolEl.textContent.trim().split('\n')[0];
+        const price = cells[1].textContent.trim();
+        const change = cells[2].textContent.trim();
+        const statusEl = cells[3];
+        const status = statusEl.querySelector('[style*="background"]')?.textContent.trim() || 'N/A';
+        const scoreEl = statusEl.querySelector('.score-badge');
+        const score = scoreEl ? scoreEl.textContent.trim() : 'N/A';
+        const volume = cells[4].textContent.trim();
+        const strategy = cells[6].textContent.trim().replace(/\n/g, ' ');
+        const watched = isInWatchlist(symbol) ? 'Yes' : 'No';
+
+        rows.push([symbol, price, change, status, score, volume, strategy, watched]);
+      }
+    });
+
+    const csv = rows.map(row =>
+      row.map(cell => {
+        const str = String(cell || '').replace(/"/g, '""');
+        return str.includes(',') || str.includes('"') ? `"${str}"` : str;
+      }).join(',')
+    ).join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `explore_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    document.body.removeChild(a);
+    showToast('Export complete', 'CSV file downloaded');
+  }
+
+  // Real-time Price Updates
+  let _priceUpdateTimer = null;
+  function startPriceUpdates() {
+    if (_priceUpdateTimer) return;
+    _priceUpdateTimer = setInterval(async () => {
+      try {
+        const symbols = allData.map(d => d.symbol).slice(0, 50).join(',');
+        if (!symbols) return;
+        const res = await fetch(`/api/prices?symbols=${encodeURIComponent(symbols)}`, _authHeaders());
+        if (!res.ok) return;
+        const prices = await res.json();
+        if (!prices.ok || !prices.prices) return;
+
+        allData.forEach(item => {
+          if (prices.prices[item.symbol]) {
+            item.price = prices.prices[item.symbol].price;
+            item.change_pct = prices.prices[item.symbol].change_pct;
+          }
+        });
+        renderTable(false);
+      } catch (e) {
+        console.debug('Price update failed:', e);
+      }
+    }, 10000); // Every 10 seconds
+  }
+
+  function stopPriceUpdates() {
+    if (_priceUpdateTimer) {
+      clearInterval(_priceUpdateTimer);
+      _priceUpdateTimer = null;
+    }
+  }
+
+  // Unusual Volume Alert
+  function checkUnusualVolume() {
+    if (allData.length === 0) return;
+    const volumes = allData.map(d => d.volume || 0).filter(v => v > 0);
+    const avgVolume = volumes.length > 0 ? volumes.reduce((a, b) => a + b, 0) / volumes.length : 0;
+    const threshold = avgVolume * 3;
+
+    allData.forEach(item => {
+      item.unusualVolume = item.volume && item.volume > threshold;
+    });
+
+    // Re-render to show badges
+    const tbody = document.getElementById('screenerBody');
+    if (tbody && allData.length > 0) {
+      const volumeCells = tbody.querySelectorAll('td:nth-child(5)');
+      volumeCells.forEach((cell, idx) => {
+        if (allData[idx] && allData[idx].unusualVolume && !cell.querySelector('.volume-alert')) {
+          cell.insertAdjacentHTML('beforeend', '<span class="volume-alert">3x Vol</span>');
+        }
+      });
+    }
+  }
+
+  // Browser Notifications
+  function requestNotificationPermission() {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }
+
+  function showNotification(title, options) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, options);
+    }
+  }
+
+  let _lastHighScore = 0;
+  function checkForHighScoreSignals() {
+    const highScores = allData.filter(d => (d.score || 0) > 80 && (d.score || 0) > _lastHighScore);
+    highScores.forEach(item => {
+      showNotification(`High Score Signal: ${item.symbol}`, {
+        body: `Score: ${item.score?.toFixed(1)} | ${item.rating} | ${item.recommended_strategy || 'DCA'}`,
+        icon: '/static/favicon.ico'
+      });
+      _lastHighScore = Math.max(_lastHighScore, item.score || 0);
+    });
+  }
+
+  // Scan Countdown Timer (already partially in place, enhance)
+  function updateScanCountdown() {
+    const countdownEl = document.querySelector('.countdown-timer');
+    if (!countdownEl || !_nextScanTime) return;
+
+    const remaining = Math.max(0, Math.floor((_nextScanTime - Date.now()) / 1000));
+    const mins = Math.floor(remaining / 60);
+    const secs = remaining % 60;
+    const text = remaining > 0 ? (mins > 0 ? `${mins}m ${secs}s` : `${secs}s`) : 'Scanning...';
+    countdownEl.textContent = text;
+  }
+
+  // Score Breakdown Tooltip Enhancement
+  function toggleScoreBreakdown(symbol, event) {
+    event.stopPropagation();
+    const item = allData.find(d => d.symbol === symbol);
+    if (!item) return;
+
+    const tbody = document.getElementById('screenerBody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    const mainRowIdx = rows.findIndex(r => r.textContent.includes(symbol) && !r.classList.contains('breakdown-row'));
+    if (mainRowIdx < 0) return;
+
+    const breakdownRow = rows[mainRowIdx + 1];
+    if (breakdownRow && breakdownRow.classList.contains('breakdown-row')) {
+      breakdownRow.style.display = breakdownRow.style.display === 'none' ? '' : 'none';
+    } else {
+      const breakdown = `
+        <tr class="breakdown-row" style="display:none">
+          <td colspan="8" class="breakdown-cell">
+            <div class="breakdown-section">
+              <div class="breakdown-label">RSI Value</div>
+              <div class="breakdown-items">${item.rsi?.toFixed(2) || 'N/A'}</div>
+            </div>
+            <div class="breakdown-section">
+              <div class="breakdown-label">Trend Direction</div>
+              <div class="breakdown-items">${item.trend || 'N/A'}</div>
+            </div>
+            <div class="breakdown-section">
+              <div class="breakdown-label">Volume Rating</div>
+              <div class="breakdown-items">${item.volume_rating || 'Normal'}</div>
+            </div>
+            <div class="breakdown-section">
+              <div class="breakdown-label">Momentum Score</div>
+              <div class="breakdown-items">${item.momentum_score?.toFixed(2) || 'N/A'}</div>
+            </div>
+          </td>
+        </tr>
+      `;
+      rows[mainRowIdx].insertAdjacentHTML('afterend', breakdown);
+    }
+  }
+
+  // Initialize new features
+  requestNotificationPermission();
+
+  // Enhance the original loadScreener to include new features
+  const _originalLoadScreener = loadScreener;
+  loadScreener = async function(append = false) {
+    const result = await _originalLoadScreener.call(this, append);
+    checkUnusualVolume();
+    checkForHighScoreSignals();
+    return result;
+  };
+
+  // Add auto-refresh timer
+  let _autoRefreshTimer = null;
+  function toggleAutoRefresh() {
+    const chk = document.getElementById('chk-auto-refresh');
+    if (chk && chk.checked) {
+      if (_autoRefreshTimer) clearInterval(_autoRefreshTimer);
+      _autoRefreshTimer = setInterval(() => {
+        loadScreener(false);
+        console.log('Auto-refresh triggered');
+      }, 30000); // Every 30 seconds
+      showToast('Auto-refresh enabled', 'Table will update every 30 seconds');
+      startPriceUpdates();
+    } else {
+      if (_autoRefreshTimer) clearInterval(_autoRefreshTimer);
+      _autoRefreshTimer = null;
+      stopPriceUpdates();
+      showToast('Auto-refresh disabled', '');
+    }
+  }
+
+  // Countdown timer update loop
+  setInterval(updateScanCountdown, 1000);
 
   // Initial load: restore saved prefs then apply
   loadFilterPrefs();

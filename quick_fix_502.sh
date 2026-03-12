@@ -31,13 +31,24 @@ echo "Starting ai-bot..."
 sudo systemctl start ai-bot
 
 echo "Waiting for app (up to 60s)..."
+APP_UP=""
 for i in $(seq 1 30); do
   if curl -sf -m 5 http://127.0.0.1:8000/health >/dev/null 2>&1 || curl -sf -m 5 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
     echo "App ready after ${i}*2s"
+    APP_UP=1
     break
+  fi
+  if [ "$i" -eq 10 ]; then
+    echo "ai-bot not up after 20s; starting tradingserver (one_server) as fallback..."
+    sudo systemctl stop ai-bot 2>/dev/null || true
+    sleep 2
+    sudo systemctl start tradingserver 2>/dev/null || true
   fi
   sleep 2
 done
+if [ -z "$APP_UP" ]; then
+  echo "WARNING: App may still be starting. Check: sudo journalctl -u ai-bot -n 30; sudo journalctl -u tradingserver -n 30"
+fi
 
 echo "Reloading nginx..."
 sudo systemctl reload nginx 2>/dev/null || true

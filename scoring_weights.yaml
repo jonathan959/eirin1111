@@ -1,0 +1,15 @@
+# Multi-factor scoring weights (0-1). Tune without code changes.
+# Weights are normalized; total should roughly sum to 1.0 for interpretability.
+
+technical: 0.20      # RSI, MACD, EMA, BB, ADX
+ml_confidence: 0.15  # ML prediction confidence from trained models
+pattern: 0.10       # Pattern recognition score
+sentiment: 0.05      # Sentiment analyzer
+multi_timeframe: 0.10  # Multi-timeframe confirmation
+volume: 0.08        # Volume confirmation
+sector_rotation: 0.07  # Sector rotation score (stocks)
+crypto_cycle: 0.05  # Crypto cycle detector (crypto only)
+funding_penalty: -0.05  # Penalty for high funding (crypto)
+earnings_penalty: -0.08  # Penalty for earnings within 5 days (stocks)
+insider_bonus: 0.05  # Insider buying bonus (if available)
+short_interest_penalty: -0.03  # Short interest risk flag

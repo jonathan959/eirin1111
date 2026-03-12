@@ -344,44 +344,30 @@ class AlpacaAdapter:
     def create_limit_buy_base(
         self, symbol: str, amount: float, price: float, client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        res = self.client.place_limit_order(symbol, amount, price, "buy")
-        return {"id": res.get("id"), "info": res}
+        res = self.client.place_limit_order(symbol, amount, price, "buy", client_order_id=client_order_id)
+        return {"id": res.get("id"), "client_order_id": client_order_id, "info": res}
 
     def create_limit_sell_base(
         self, symbol: str, amount: float, price: float, client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        res = self.client.place_limit_order(symbol, amount, price, "sell")
-        return {"id": res.get("id"), "info": res}
+        res = self.client.place_limit_order(symbol, amount, price, "sell", client_order_id=client_order_id)
+        return {"id": res.get("id"), "client_order_id": client_order_id, "info": res}
 
     def create_market_buy_quote(
         self, symbol: str, quote_amount: float, client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        # Market buy by QUOTE amount (spend $100).
-        # Alpaca supports `notional` for market orders.
-        # My AlpacaClient wrapper `place_market_order` takes `qty` (shares).
-        # Does it support notional?
-        # Looking at `alpaca_client.py`:
-        # `data = {"symbol": symbol, "qty": str(qty), ...}` 
-        # It doesn't seem to support `notional` in the wrapper yet.
-        # I might need to approximate shares: qty = quote_amount / last_price.
-        
         last = self.fetch_ticker_last(symbol)
         if last <= 0:
             raise ValueError(f"Cannot calculate qty for market buy, no price for {symbol}")
-        
-        # Alpaca supports fractional shares? Client says "qty can be fractional".
         qty = quote_amount / last
-        # Truncate to safe precision?
-        # Alpaca handles high precision.
-        
-        res = self.client.place_market_order(symbol, qty, "buy")
-        return {"id": res.get("id"), "info": res}
+        res = self.client.place_market_order(symbol, qty, "buy", client_order_id=client_order_id)
+        return {"id": res.get("id"), "client_order_id": client_order_id, "info": res}
 
     def create_market_sell_base(
         self, symbol: str, amount: float, client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        res = self.client.place_market_order(symbol, amount, "sell")
-        return {"id": res.get("id"), "info": res}
+        res = self.client.place_market_order(symbol, amount, "sell", client_order_id=client_order_id)
+        return {"id": res.get("id"), "client_order_id": client_order_id, "info": res}
 
     def fetch_my_trades(self, symbol: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         # This is used for deal metrics (avg entry calculation).

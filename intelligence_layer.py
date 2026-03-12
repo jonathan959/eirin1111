@@ -377,10 +377,10 @@ class IntelligenceLayer:
         self.score_weak_bull = (float(os.getenv("SCORE_WEAK_BULL", "60")), float(os.getenv("SCORE_WEAK_BULL_CONF", "10")))
         self.score_breakout = (float(os.getenv("SCORE_BREAKOUT", "75")), float(os.getenv("SCORE_BREAKOUT_CONF", "15")))
         self.score_range = (float(os.getenv("SCORE_RANGE", "45")), float(os.getenv("SCORE_RANGE_CONF", "10")))
-        self.score_high_vol = float(os.getenv("SCORE_HIGH_VOL", "30"))
-        self.score_weak_bear = float(os.getenv("SCORE_WEAK_BEAR", "30"))
-        self.score_strong_bear = float(os.getenv("SCORE_STRONG_BEAR", "25"))
-        self.score_risk_off = float(os.getenv("SCORE_RISK_OFF", "10"))
+        self.score_high_vol = float(os.getenv("SCORE_HIGH_VOL", "40"))
+        self.score_weak_bear = float(os.getenv("SCORE_WEAK_BEAR", "38"))
+        self.score_strong_bear = float(os.getenv("SCORE_STRONG_BEAR", "30"))
+        self.score_risk_off = float(os.getenv("SCORE_RISK_OFF", "35"))
         
         # Hysteresis state cache (per symbol)
         self._hysteresis_cache: Dict[str, Dict[str, Any]] = {}
@@ -660,8 +660,8 @@ class IntelligenceLayer:
                 reasons=reasons,
             )
         
-        # Check daily loss limit
-        if context.portfolio_total_usd > 0:
+        # Check daily loss limit (only block on actual losses, not gains)
+        if context.portfolio_total_usd > 0 and context.daily_realized_pnl < 0:
             daily_loss_pct = abs(context.daily_realized_pnl) / context.portfolio_total_usd
             if daily_loss_pct >= self.max_daily_loss_pct:
                 allowed_actions = AllowedAction.NO_TRADE
@@ -1846,6 +1846,7 @@ class IntelligenceLayer:
 
         # --- 2. Scoring Model ---
         _ml_metrics = {}
+        breakdown = {}  # structured score breakdown for explainability
         if eligible:
             # A. Regime Foundation (0-100 base)
             regime = decision.regime_detection.regime
@@ -1879,6 +1880,10 @@ class IntelligenceLayer:
             elif regime == RegimeType.RISK_OFF:
                 score = self.score_risk_off
                 risk_flags.append("Risk-off conditions")
+            
+            regime_label = regime.value if hasattr(regime, "value") else str(regime)
+            breakdown["regime"] = {"value": round(score, 1), "label": f"{regime_label} (conf {conf:.0%})"}
+            _score_after_regime = score
 
             # B. Trend Alignment (Bonus, cap +12 total)
             # Check EMA alignment - cap combined trend bonuses to avoid all 100s
@@ -1897,15 +1902,16 @@ class IntelligenceLayer:
                 trend_bonus += 6.0
                 reasons.append("Price above Weekly EMA50")
             score += min(trend_bonus, 12.0)  # Cap trend at +12
+            breakdown["trend"] = {"value": round(min(trend_bonus, 12.0), 1), "label": "EMA alignment"}
 
-            # B1b. Horizon-aware bonus: short = recent momentum; long = established trend (200 SMA, weekly)
+            # B1b. Horizon-aware bonus: short = recent momentum; medium/long = established trend (200 SMA, weekly)
             horizon_str = (str(horizon or "short")).strip().lower()
             if horizon_str == "short" and regime in (RegimeType.BREAKOUT, RegimeType.STRONG_BULL, RegimeType.BULL):
                 ret_5d = rolling_return(closes_1d, 5) if closes_1d and len(closes_1d) >= 6 else None
                 if ret_5d is not None and ret_5d > 0.01:
                     score += 3.0
                     reasons.append("Short-term: strong 5d momentum")
-            elif horizon_str == "long":
+            elif horizon_str in ("medium", "long"):
                 ema200_1d = ema(closes_1d, 200) if closes_1d else None
                 if ema200_1d and context.last_price > ema200_1d and ema50_1w and context.last_price > ema50_1w:
                     score += 3.0
@@ -1994,6 +2000,7 @@ class IntelligenceLayer:
                 elif ret_30 < -0.10: momentum_bonus -= 5.0
                 elif ret_30 < -0.25: momentum_bonus -= 10.0
             score += momentum_bonus
+            breakdown["momentum_30d"] = {"value": round(momentum_bonus, 1), "label": "30d return"}
 
             # C1b. Multi-timeframe momentum (5d + 10d weighted for better signal quality)
             mtf_bonus = 0.0
@@ -2007,9 +2014,10 @@ class IntelligenceLayer:
                     if mtf_bonus >= 2.0:
                         reasons.append(f"Multi-TF momentum: 5d +{ret_5d_mtf:.1%}, 10d +{ret_10d_mtf:.1%}")
                 elif ret_5d_mtf < -0.03 and ret_10d_mtf < -0.05:
-                    mtf_bonus = max(-8.0, (ret_5d_mtf * 30 + ret_10d_mtf * 20))
+                    mtf_bonus = max(-5.0, (ret_5d_mtf * 20 + ret_10d_mtf * 10))
                     risk_flags.append(f"Declining momentum: 5d {ret_5d_mtf:.1%}, 10d {ret_10d_mtf:.1%}")
             score += mtf_bonus
+            breakdown["momentum_mtf"] = {"value": round(mtf_bonus, 1), "label": "5d/10d momentum"}
 
             # C1c. Volume confirmation (above-average volume confirms move)
             vol_bonus = 0.0
@@ -2028,6 +2036,7 @@ class IntelligenceLayer:
                         vol_bonus = -3.0
                         risk_flags.append("Very low volume (weak conviction)")
             score += vol_bonus
+            breakdown["volume"] = {"value": round(vol_bonus, 1), "label": "Volume vs avg"}
 
             # C1d. Trend strength via ADX (strong trends are more reliable)
             try:
@@ -2057,34 +2066,36 @@ class IntelligenceLayer:
 
             # C2. RSI Oversold Bonus (mean-reversion opportunity in range/bull)
             rsi_val = rsi(closes_1d or [], 14)
+            _rsi_adj = 0.0
             if rsi_val is not None:
                 if rsi_val <= 30 and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL, RegimeType.WEAK_BEAR):
-                    score += 6.0
+                    _rsi_adj = 6.0
                     reasons.append(f"RSI oversold ({rsi_val:.0f}) — mean-reversion opportunity")
                 elif rsi_val <= 35 and regime in (RegimeType.RANGE, RegimeType.WEAK_BULL):
-                    score += 3.0
+                    _rsi_adj = 3.0
                     reasons.append(f"RSI approaching oversold ({rsi_val:.0f})")
                 elif rsi_val >= 80:
-                    score -= 6.0
+                    _rsi_adj = -6.0
                     risk_flags.append(f"RSI overbought ({rsi_val:.0f}) — extended, risk of pullback")
                 elif rsi_val >= 70 and regime not in (RegimeType.STRONG_BULL, RegimeType.BREAKOUT):
-                    score -= 3.0
+                    _rsi_adj = -3.0
                     risk_flags.append(f"RSI overbought ({rsi_val:.0f})")
+            score += _rsi_adj
+            breakdown["rsi"] = {"value": round(_rsi_adj, 1), "label": f"RSI {rsi_val:.0f}" if rsi_val else "RSI n/a"}
             
-            # D. Drawdown Penalty (Max -20)
-            # Don't buy bags
+            # D. Drawdown Penalty (capped — penalize, don't zero out)
+            _dd_penalty = 0.0
             if len(closes_1d) > 200:
                 peak_1y = max(closes_1d[-200:])
                 if peak_1y > 0:
                     dd = (peak_1y - closes_1d[-1]) / peak_1y
                     if dd > 0.60: 
-                        score -= 20.0
-                        risk_flags.append("Deep Drawdown >60%")
+                        _dd_penalty = -10.0
+                        risk_flags.append(f"Drawdown {dd*100:.0f}% from peak")
                     elif dd > 0.40:
-                        score -= 10.0
+                        _dd_penalty = -5.0
 
-            # D2. Sustained long-term downtrend - only recommend with proof
-            # Downtrend assets need clear reversal evidence (RSI oversold + short-term bounce)
+            # D2. Sustained long-term downtrend — note but don't destroy score
             long_term_downtrend_no_proof = False
             if len(closes_1d) >= 60:
                 first_price = float(closes_1d[0])
@@ -2097,37 +2108,38 @@ class IntelligenceLayer:
                     regime_supports_reversal = regime in (RegimeType.RANGE, RegimeType.WEAK_BULL)
 
                     if long_term_ret < -0.50:
-                        # Hard exclude: never recommend assets down 50%+ over history
-                        score -= 20.0
-                        risk_flags.append("Sustained downtrend (long-term -50%+)")
+                        _dd_penalty += -10.0
+                        risk_flags.append(f"Down {long_term_ret*100:.0f}% long-term")
                         long_term_downtrend_no_proof = True
                     elif long_term_ret < -0.30:
-                        # Only recommend if we have proof of potential reversal
                         has_proof = (
-                            (rsi_for_dd is not None and rsi_for_dd <= 35 and ret_5d > 0)  # oversold + bounce
-                            or (regime_supports_reversal and ret_5d > 0.08)  # mean-reversion setup
+                            (rsi_for_dd is not None and rsi_for_dd <= 35 and ret_5d > 0)
+                            or (regime_supports_reversal and ret_5d > 0.08)
                         )
                         if has_proof:
-                            score -= 8.0
-                            reasons.append("Reversal setup (downtrend with oversold/early bounce)")
+                            _dd_penalty += -3.0
+                            reasons.append("Reversal setup (downtrend + oversold bounce)")
                         else:
-                            score -= 18.0
-                            risk_flags.append("Long-term downtrend (-30%+), no reversal proof")
+                            _dd_penalty += -8.0
+                            risk_flags.append(f"Down {long_term_ret*100:.0f}% long-term, no reversal")
                             long_term_downtrend_no_proof = True
+            score += _dd_penalty
+            breakdown["drawdown"] = {"value": round(_dd_penalty, 1), "label": "Drawdown / trend"}
 
             # E. Volatility Guardrails (Max -20)
             atr_val = _atr(context.candles_1d, 14)
             atr_pct = (atr_val / context.last_price) if atr_val and context.last_price > 0 else 0.0
-            
-            if atr_pct > 0.15: # >15% daily moves is meme territory
-                score -= 20.0
-                risk_flags.append("Extreme Volatility")
-            elif atr_pct > 0.08:
-                score -= 5.0
+            _vol_adj = 0.0
+            if atr_pct > 0.15:
+                _vol_adj = -8.0
                 risk_flags.append("High Volatility")
+            elif atr_pct > 0.08:
+                _vol_adj = -3.0
             elif atr_pct < 0.005:
-                score -= 10.0 # Stablecoin or dead
+                _vol_adj = -10.0
                 reasons.append("Low volatility")
+            score += _vol_adj
+            breakdown["volatility"] = {"value": round(_vol_adj, 1), "label": f"ATR {atr_pct:.1%}" if atr_pct else "Volatility"}
 
             # F. Stock-Specific Scoring (sector, liquidity tier, earnings, sector ETF, market cap, IPO)
             mb = context.market_breadth or {}
@@ -2177,17 +2189,21 @@ class IntelligenceLayer:
                     score -= 10.0
                     risk_flags.append(f"Earnings in {int(earnings_days)}d")
             
-            # G. Macro Context (Risk Off)
+            # G. Macro Context (Risk Off) — moderate penalty, but don't kill scores
+            _macro_adj = 0.0
             if context.btc_context.get("risk_off") and context.symbol not in ("BTC/USD", "XBT/USD", "USDT/USD"):
-                score -= 20.0
+                _macro_adj = -float(os.getenv("MACRO_RISK_OFF_PENALTY", "8"))
+                score += _macro_adj
                 risk_flags.append("Macro Risk-Off")
+            breakdown["macro"] = {"value": round(_macro_adj, 1), "label": "Macro environment"}
 
-            # H. Earnings proximity filter (stocks)
+            # H. Earnings proximity filter (stocks) - block from buy signals within 5 days
             earnings_days = context.bot_config.get("earnings_days") or (context.market_breadth or {}).get("earnings_days")
             if isinstance(earnings_days, (int, float)) and earnings_days >= 0:
                 if earnings_days <= 5:
                     score -= 10.0
                     risk_flags.append(f"Earnings in {int(earnings_days)}d")
+                    eligible = False  # Block from appearing as buy signal
 
         # --- 3. Final Clamping & Formatting ---
         # Cap at 95.0 to preserve differentiation at top (avoids "all 100" clustering)
@@ -2274,6 +2290,9 @@ class IntelligenceLayer:
         except Exception:
             pass
 
+        # Build final breakdown summary
+        breakdown["final"] = {"value": round(score, 1), "label": "Final score"}
+
         return {
             "symbol": context.symbol,
             "horizon": horizon,
@@ -2281,12 +2300,13 @@ class IntelligenceLayer:
             "eligible": eligible,
             "data_ok": decision.data_validity.data_ok,
             "research_only": False,
-            "regime_json": json.dumps(regime_json), # Returning JSON string for worker_api to store
-            "metrics_json": json.dumps(metrics),      # Returning JSON string
+            "regime_json": json.dumps(regime_json),
+            "metrics_json": json.dumps(metrics),
             "reasons_json": json.dumps(reasons[:5]),
             "risk_flags_json": json.dumps(risk_flags),
+            "score_breakdown": breakdown,
+            "score_breakdown_json": json.dumps(breakdown),
             "created_ts": int(time.time()),
-            # Legacy fields for compat if needed, but we prefer the JSON fields above
             "regime": regime_json, 
             "metrics": metrics,
             "reasons": reasons,

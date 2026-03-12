@@ -36,8 +36,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 # ---------------------------
-# Stable DB path
+# Load env first, then stable DB path
 # ---------------------------
+from env_utils import load_env
+load_env()
 _THIS_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("BOT_DB_PATH", str(_THIS_DIR / "botdb.sqlite3"))
 
@@ -163,7 +165,10 @@ def ui_autopilot(request: Request):
     """Autopilot Dashboard (full UI with sidebar). Works on live server after deploy."""
     if templates is None:
         raise HTTPException(status_code=503, detail="Templates not found. Deploy with templates folder.")
-    return templates.TemplateResponse("autopilot_dashboard.html", _base_ctx(request))
+    if not hasattr(request.state, "user"):
+        request.state.user = None
+    ctx = _base_ctx(request)
+    return templates.TemplateResponse("autopilot_dashboard.html", ctx)
 
 
 @app.get("/setup-autopilot", include_in_schema=False)

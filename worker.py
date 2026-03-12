@@ -1,11 +1,17 @@
 # worker.py
 import os
 import sys
-import uvicorn
+from pathlib import Path
 
 from env_utils import load_env
 
 load_env()
+# Canonical DB path so bots persist (same as one_server / one_server_v2)
+if not os.getenv("BOT_DB_PATH"):
+    _root = Path(__file__).resolve().parent
+    os.environ["BOT_DB_PATH"] = str(_root / "botdb.sqlite3")
+
+import uvicorn
 
 
 def _bool_env(name: str, default: bool = False) -> bool:

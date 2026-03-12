@@ -416,7 +416,7 @@ class TestExploreV2(unittest.TestCase):
 
     def test_gate_passes_normal(self):
         from explore_v2 import apply_universe_gates
-        ok, reason = apply_universe_gates("TEST", volume_24h_quote=100000, spread_bps=20)
+        ok, reason = apply_universe_gates("TEST", volume_24h_quote=15_000_000, spread_bps=20)
         self.assertTrue(ok)
 
     def test_score_clamp(self):

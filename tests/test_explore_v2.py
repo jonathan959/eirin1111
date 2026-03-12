@@ -12,9 +12,10 @@ os.environ["EXPLORE_V2"] = "1"
 class TestExploreV2Gates(unittest.TestCase):
     def test_gate_passes_normal(self):
         from explore_v2 import apply_universe_gates
+        # Volume must be >= MIN_24H_QUOTE_VOLUME (default 10M)
         ok, reason = apply_universe_gates(
             "BTC/USD",
-            volume_24h_quote=100000,
+            volume_24h_quote=15_000_000,
             spread_bps=25,
         )
         self.assertTrue(ok)
@@ -31,9 +32,10 @@ class TestExploreV2Gates(unittest.TestCase):
 
     def test_gate_blocks_wide_spread(self):
         from explore_v2 import apply_universe_gates
+        # Volume high enough to pass; spread 150 > MAX_SPREAD_BPS (100)
         ok, reason = apply_universe_gates(
             "BTC/USD",
-            volume_24h_quote=10000,
+            volume_24h_quote=15_000_000,
             spread_bps=150,
         )
         self.assertFalse(ok)

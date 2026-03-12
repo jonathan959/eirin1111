@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+  <defs>
+    <linearGradient id="hexGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7c3aed;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#3b82f6;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Hexagon background -->
+  <path d="M 96 12 L 156 48 L 156 144 L 96 180 L 36 144 L 36 48 Z" fill="url(#hexGradient)" stroke="none"/>
+
+  <!-- Hexagon border -->
+  <path d="M 96 12 L 156 48 L 156 144 L 96 180 L 36 144 L 36 48 Z" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="2"/>
+
+  <!-- Letter "E" -->
+  <g font-family="Arial, sans-serif" font-size="96" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="central">
+    <text x="96" y="96">E</text>
+  </g>
+</svg>

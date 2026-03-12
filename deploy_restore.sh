@@ -12,6 +12,14 @@ done
 [ -d .previous/templates ] && rm -rf templates && cp -rp .previous/templates .
 [ -d .previous/static ] && rm -rf static && cp -rp .previous/static .
 [ -f .previous/tradingserver.service ] && cp -p .previous/tradingserver.service .
+# Restore DB from backup if present (recovers bots/data after bad deploy)
+if [ -f .previous/botdb.sqlite3 ]; then
+  echo "Restoring database from .previous/botdb.sqlite3 (recover bots)..."
+  cp -p .previous/botdb.sqlite3 . 2>/dev/null || true
+  for w in .previous/botdb.sqlite3-wal .previous/botdb.sqlite3-shm; do
+    [ -f "$w" ] && cp -p "$w" . 2>/dev/null || true
+  done
+fi
 
 sudo cp tradingserver.service /etc/systemd/system/
 sudo systemctl daemon-reload

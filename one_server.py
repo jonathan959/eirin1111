@@ -21,7 +21,14 @@ import os
 import secrets
 import time as time_mod
 from datetime import datetime, time, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+# Load env first so .env can set BOT_DB_PATH; then ensure default DB path
+from env_utils import load_env
+load_env()
+_ROOT = Path(__file__).resolve().parent
+os.environ.setdefault("BOT_DB_PATH", str(_ROOT / "botdb.sqlite3"))
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -36,10 +43,13 @@ app: FastAPI = worker_api.app
 templates = Jinja2Templates(directory="templates")
 
 
-def _base_ctx(request: Request) -> Dict[str, Any]:
+def _base_ctx(request: Request, active_page: str = "") -> Dict[str, Any]:
     """Base context for all pages; includes api_token for fetch when WORKER_API_TOKEN is set."""
     token = getattr(worker_api, "WORKER_API_TOKEN", "") or ""
     lang = (request.cookies.get("lang") or "").strip() or os.getenv("LANGUAGE", "en").strip() or "en"
+    if not active_page:
+        path = str(request.url.path).strip("/").split("/")[0] or "dashboard"
+        active_page = path
     return {
         "request": request,
         "api_token": token,
@@ -47,6 +57,7 @@ def _base_ctx(request: Request) -> Dict[str, Any]:
         "default_theme": os.getenv("DEFAULT_THEME", "auto").strip() or "auto",
         "language": lang,
         "enable_voice_alerts": os.getenv("ENABLE_VOICE_ALERTS", "0").strip().lower() in ("1", "true", "yes"),
+        "active_page": active_page,
     }
 
 UI_PASSWORD = os.getenv("UI_PASSWORD", "").strip()
@@ -391,7 +402,12 @@ async def page_strategies(request: Request):
 
 @app.get("/explore", include_in_schema=False)
 def ui_explore(request: Request):
-    return templates.TemplateResponse("explore.html", _base_ctx(request))
+    ctx = {
+        **_base_ctx(request),
+        "kraken_ready": bool(getattr(worker_api, "KRAKEN_READY", False)),
+        "alpaca_ready": bool(getattr(worker_api, "ALPACA_PAPER_READY", False) or getattr(worker_api, "ALPACA_LIVE_READY", False)),
+    }
+    return templates.TemplateResponse("explore.html", ctx)
 
 
 @app.get("/safety", include_in_schema=False)

@@ -19,6 +19,24 @@
     </div>
   </div>
 
+  <!-- Portfolio Summary Bar -->
+  <div class="card section" style="background: linear-gradient(135deg, rgba(79,70,229,.08) 0%, transparent 100%);">
+    <div class="row gap-20 row-wrap">
+      <div>
+        <div class="card-label">Total Portfolio Value</div>
+        <div class="card-value" id="portfolioTotal">—</div>
+      </div>
+      <div>
+        <div class="card-label">Total P&L Today</div>
+        <div class="card-value" id="portfolioTodayPnL">—</div>
+      </div>
+      <div>
+        <div class="card-label">Total P&L All Time</div>
+        <div class="card-value" id="portfolioAllTimePnL">—</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Bots list -->
   <div class="card section">
     <div class="card-head">
@@ -32,7 +50,30 @@
       </div>
       <div class="row gap-8 row-wrap row-end">
         <span class="muted text-sm" id="lastRefreshSpan">Last refresh: —</span>
+        <button class="btn" onclick="exportBotConfigs()">📥 Export All</button>
+        <button class="btn" onclick="openImportDialog()">📤 Import</button>
         <button class="btn" onclick="refreshAllStatuses()">Refresh now</button>
+      </div>
+    </div>
+
+    <!-- Filter and sort controls -->
+    <div class="row gap-8 row-wrap mb-12" style="padding: 12px 0; border-bottom: 1px solid var(--border);">
+      <div class="chip-group">
+        <button class="chip chip-active" onclick="filterBots('all')">All Bots</button>
+        <button class="chip" onclick="filterBots('running')">Running</button>
+        <button class="chip" onclick="filterBots('paused')">Paused</button>
+        <button class="chip" onclick="filterBots('profitable')">Profitable</button>
+      </div>
+      <div style="margin-left: auto; display: flex; gap: 8px;">
+        <select class="input input-sm" onchange="sortBots(this.value)" style="min-width: 150px;">
+          <option value="name">Sort by Name</option>
+          <option value="pnl">Sort by P&L</option>
+          <option value="symbol">Sort by Symbol</option>
+          <option value="status">Sort by Status</option>
+        </select>
+        <button class="btn btn-secondary" onclick="bulkStartAll()">▶ Start All</button>
+        <button class="btn btn-secondary" onclick="bulkStopAll()">⏸ Stop All</button>
+        <button class="btn btn-secondary" onclick="bulkPauseAll()">⏸ Pause All</button>
       </div>
     </div>
 
@@ -45,17 +86,17 @@
             <th>Symbol</th>
             <th title="DRY = paper only. LIVE = real money. Edit bot to change.">Mode</th>
             <th>Status</th>
-            <th>Action</th>
-            <th>Strategy</th>
-            <th>Regime</th>
-            <th>Risk</th>
-            <th class="right">Position</th>
-            <th class="right">Last price</th>
-            <th class="right">uPnL</th>
-            <th class="right">Realized</th>
-            <th class="right">Poll</th>
-            <th class="right">Max spend</th>
-            <th class="right">TP (%)</th>
+            <th title="Current action the bot is performing">Action</th>
+            <th title="Strategy algorithm selected for this bot">Strategy</th>
+            <th title="Current market regime (trend, consolidation, risk-off)">Regime</th>
+            <th title="Current risk level: Low, Medium, or High">Risk</th>
+            <th class="right" title="Quantity of asset currently held">Position</th>
+            <th class="right" title="Most recent price on market">Last price</th>
+            <th class="right" title="Current profit/loss on open positions (not locked in yet)">uPnL</th>
+            <th class="right" title="Profit/Loss on closed deals">Realized</th>
+            <th class="right" title="How often the bot checks for trading conditions (seconds)">Poll</th>
+            <th class="right" title="Maximum amount of quote currency to spend per order">Max spend</th>
+            <th class="right" title="Take Profit target percentage">TP (%)</th>
             <th class="right">Actions</th>
           </tr>
         </thead>
@@ -88,6 +129,7 @@
               <td class="right">
                 <a class="btn" href="/bots/{{ b.id }}">Open</a>
                 <button class="btn" onclick="openEdit({{ b.id }})">Edit</button>
+                <button class="btn" onclick="cloneBot({{ b.id }})">Clone</button>
                 <button class="btn btn-purple" onclick="startBot({{ b.id }})">Start</button>
                 <button class="btn" onclick="stopBot({{ b.id }})">Stop</button>
                 <button class="btn btn-neg" onclick="deleteBot({{ b.id }})">Delete</button>
@@ -116,6 +158,26 @@
     </div>
 
     <div id="formErr" class="muted hidden mb-8"></div>
+
+    <!-- Bot Templates -->
+    <div class="section-md mb-12">
+      <div class="label">Quick Start Templates</div>
+      <div class="row gap-8 row-wrap">
+        <button class="btn" onclick="applyTemplate('conservative')">
+          <span style="font-size: 18px; margin-right: 8px;">🛡️</span>
+          Conservative DCA
+        </button>
+        <button class="btn" onclick="applyTemplate('aggressive')">
+          <span style="font-size: 18px; margin-right: 8px;">⚡</span>
+          Aggressive Trend
+        </button>
+        <button class="btn" onclick="applyTemplate('grid')">
+          <span style="font-size: 18px; margin-right: 8px;">📊</span>
+          Grid Trading
+        </button>
+      </div>
+      <div class="muted text-xs mt-6">Select a template to auto-fill recommended settings, or manually customize below.</div>
+    </div>
 
     <div class="grid grid-3">
       <div>
@@ -840,6 +902,10 @@
 
     try{
       const payload = payloadFromForm();
+      if (EDITING_ID == null && !(payload.symbol && String(payload.symbol).trim())) {
+        showErr("Please choose a symbol (search and select from the list).");
+        return;
+      }
 
       let res;
       if(EDITING_ID == null){
@@ -886,9 +952,11 @@
   async function startBot(id){
     try{
       const res = await getJSON(`/api/bots/${id}/start`, { method:"POST" });
+      if (typeof showToast === 'function') showToast('Bot Started', 'Bot #' + id + ' is now running.', 'success');
       await refreshStatusRow(id);
     }catch(e){
       console.error(e);
+      if (typeof showToast === 'function') showToast('Start Failed', e.message || 'Unknown error', 'error');
       await refreshStatusRow(id);
     }
   }
@@ -896,9 +964,11 @@
   async function stopBot(id){
     try{
       const res = await getJSON(`/api/bots/${id}/stop`, { method:"POST" });
+      if (typeof showToast === 'function') showToast('Bot Stopped', 'Bot #' + id + ' has been stopped.', 'info');
       await refreshStatusRow(id);
     }catch(e){
       console.error(e);
+      if (typeof showToast === 'function') showToast('Stop Failed', e.message || 'Unknown error', 'error');
       await refreshStatusRow(id);
     }
   }
@@ -915,18 +985,39 @@
     const upnl = $("upnl-" + id);
 
     if(st){
-      var isErr = lastEvent && (String(lastEvent).toLowerCase().indexOf("error") >= 0 || String(lastEvent).toLowerCase().indexOf("unavailable") >= 0 || String(lastEvent).toLowerCase().indexOf("blocked") >= 0);
-      var isRetry = lastEvent && (String(lastEvent).indexOf("retrying") >= 0 || String(lastEvent).indexOf("timed out") >= 0);
-      var txt = running ? "RUNNING" : (isErr ? "ERROR" : (isRetry ? "RETRY" : "PAUSED"));
-      if (isErr && lastEvent) txt = "Blocked";
+      var evLower = (lastEvent || '').toLowerCase();
+      var isErr = lastEvent && (evLower.indexOf("error") >= 0 || evLower.indexOf("unavailable") >= 0 || evLower.indexOf("blocked") >= 0);
+      var isRetry = lastEvent && (evLower.indexOf("retrying") >= 0 || evLower.indexOf("timed out") >= 0);
+      var isConfig = lastEvent && (evLower.indexOf("not initialized") >= 0 || evLower.indexOf("api key") >= 0 || evLower.indexOf(".env") >= 0);
+      var txt, cls;
+      if (running) { txt = "Running"; cls = "badge badge-success badge-dot badge-pulse"; }
+      else if (isConfig) { txt = "Config"; cls = "badge badge-warning badge-dot"; }
+      else if (isErr) { txt = "Blocked"; cls = "badge badge-danger badge-dot"; }
+      else if (isRetry) { txt = "Retry"; cls = "badge badge-warning badge-dot"; }
+      else { txt = "Paused"; cls = "badge badge-neutral badge-dot"; }
       st.textContent = txt;
-      st.className = "tag " + (running ? "status-st-running" : (isErr || isRetry ? "status-st-error" : "status-st-paused"));
+      st.className = cls;
+      st.title = lastEvent || '';
     }
     if(ev){
-      ev.textContent = lastEvent || "—";
+      var evText = lastEvent || "—";
+      var gate = BOT_SNAP[id]?.gate_details;
+      if(gate && !gate.allowed && gate.spread_pct != null){
+        evText = `Spread: ${(gate.spread_pct*100).toFixed(3)}% (max ${(gate.spread_threshold*100).toFixed(3)}%)`;
+        if(gate.bid && gate.ask) evText += ` | Bid: ${gate.bid.toFixed(4)} Ask: ${gate.ask.toFixed(4)}`;
+      }
+      // Truncate long messages for table readability; full text on hover
+      if (evText.length > 60) {
+        ev.title = evText;
+        evText = evText.substring(0, 57) + '...';
+      }
+      ev.textContent = evText;
+      if(gate && !gate.allowed) ev.title = lastEvent + (gate.reason ? '\n' + gate.reason : '');
     }
     if(act){
-      act.textContent = lastEvent || "—";
+      var actText = lastEvent || "—";
+      if (actText.length > 50) { act.title = actText; actText = actText.substring(0, 47) + '...'; }
+      act.textContent = actText;
     }
     if(strat){
       strat.textContent = (BOT_SNAP[id]?.active_strategy || "—");
@@ -950,8 +1041,12 @@
       }
     }
     if(pos){
-      if(window.__botPos && window.__botPos[id] != null){
+      if(window.__botPos && window.__botPos[id] != null && Number(window.__botPos[id]) > 0){
         pos.textContent = Number(window.__botPos[id]).toFixed(8);
+      }else if(running){
+        pos.textContent = "Awaiting entry";
+        pos.className = "right mono muted";
+        pos.title = "Strategy is analyzing the market for optimal entry";
       }else{
         pos.textContent = "—";
       }
@@ -961,7 +1056,8 @@
         const v = Number(window.__botUpnl[id]);
         const isPos = v > 0;
         const isNeg = v < 0;
-        upnl.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + v.toFixed(2);
+        const sign = isPos ? "+" : "";
+        upnl.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + v.toFixed(2);
         upnl.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
       }else{
         upnl.textContent = "—";
@@ -1011,7 +1107,8 @@
       if(rp){
         const isPos = realized > 0;
         const isNeg = realized < 0;
-        rp.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + realized.toFixed(2);
+        const sign = isPos ? "+" : "";
+        rp.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + realized.toFixed(2);
         rp.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
       }
     }catch(e){
@@ -1051,6 +1148,21 @@
 
   // init
   refreshSymbols();
+  // If server rendered "No bots yet" but API has bots (e.g. just created, or race), reload to show them
+  (async function ensureBotsListSynced(){
+    var body = document.getElementById("botsBody");
+    if (!body) return;
+    var rows = body.querySelectorAll("tr");
+    if (rows.length !== 1) return;
+    if (!rows[0].textContent || rows[0].textContent.indexOf("No bots yet") === -1) return;
+    try {
+      var res = await getJSON("/api/bots");
+      if (res && res.bots && res.bots.length > 0) {
+        window.location.reload();
+      }
+    } catch (e) { /* ignore */ }
+  })();
+
   refreshAllStatuses();
   setInterval(refreshAllStatuses, 4000);
   var fBudget = $("f_budget");
@@ -1114,6 +1226,286 @@
       }
     }
   }catch(_){}
+
+  /* Filtering and sorting */
+  let currentFilter = "all";
+  let currentSort = "name";
+
+  function filterBots(filter){
+    currentFilter = filter;
+    document.querySelectorAll(".chip").forEach((chip, i) => {
+      if(i === ["all", "running", "paused", "profitable"].indexOf(filter)){
+        chip.classList.add("chip-active");
+      } else {
+        chip.classList.remove("chip-active");
+      }
+    });
+
+    const rows = document.querySelectorAll("#botsBody tr[data-bot-id]");
+    rows.forEach(row => {
+      const status = row.querySelector(".tag")?.textContent || "";
+      const upnl = parseFloat(row.querySelector("[id^='upnl-']")?.textContent) || 0;
+
+      let show = true;
+      if(filter === "running") show = status.includes("RUNNING");
+      else if(filter === "paused") show = status.includes("PAUSED");
+      else if(filter === "profitable") show = upnl > 0;
+
+      row.style.display = show ? "" : "none";
+    });
+  }
+
+  function sortBots(sortBy){
+    currentSort = sortBy;
+    const tbody = document.getElementById("botsBody");
+    const rows = Array.from(tbody.querySelectorAll("tr[data-bot-id]"));
+
+    rows.sort((a, b) => {
+      if(sortBy === "name"){
+        return a.cells[1]?.textContent.localeCompare(b.cells[1]?.textContent) || 0;
+      } else if(sortBy === "pnl"){
+        const aPnL = parseFloat(a.querySelector("[id^='upnl-']")?.textContent) || 0;
+        const bPnL = parseFloat(b.querySelector("[id^='upnl-']")?.textContent) || 0;
+        return bPnL - aPnL;
+      } else if(sortBy === "symbol"){
+        return a.cells[2]?.textContent.localeCompare(b.cells[2]?.textContent) || 0;
+      } else if(sortBy === "status"){
+        return a.cells[4]?.textContent.localeCompare(b.cells[4]?.textContent) || 0;
+      }
+      return 0;
+    });
+
+    rows.forEach(row => tbody.appendChild(row));
+  }
+
+  async function bulkStartAll(){
+    confirmAction("Start All Bots?", "This will start all paused bots.", async function(){
+      try{
+        const r = await fetch("/api/bots/start-all", {method: "POST"});
+        const data = await r.json();
+        if(r.ok){
+          showToast("Success", "All bots started", "success");
+          setTimeout(refreshAllStatuses, 500);
+        } else {
+          showToast("Error", data.error || "Failed to start bots", "error");
+        }
+      }catch(e){
+        showToast("Error", e.message, "error");
+      }
+    });
+  }
+
+  async function bulkStopAll(){
+    confirmAction("Stop All Bots?", "This will stop all running bots.", async function(){
+      try{
+        const r = await fetch("/api/bots/stop-all", {method: "POST"});
+        const data = await r.json();
+        if(r.ok){
+          showToast("Success", "All bots stopped", "success");
+          setTimeout(refreshAllStatuses, 500);
+        } else {
+          showToast("Error", data.error || "Failed to stop bots", "error");
+        }
+      }catch(e){
+        showToast("Error", e.message, "error");
+      }
+    });
+  }
+
+  async function bulkPauseAll(){
+    confirmAction("Pause All Bots?", "This will pause all running bots.", async function(){
+      try{
+        const r = await fetch("/api/bots/pause-all", {method: "POST"});
+        const data = await r.json();
+        if(r.ok){
+          showToast("Success", "All bots paused", "success");
+          setTimeout(refreshAllStatuses, 500);
+        } else {
+          showToast("Error", data.error || "Failed to pause bots", "error");
+        }
+      }catch(e){
+        showToast("Error", e.message, "error");
+      }
+    });
+  }
+
+  // Update portfolio summary
+  async function updatePortfolioSummary(){
+    try{
+      const r = await fetch("/api/portfolio");
+      const portfolio = await r.json();
+      document.getElementById("portfolioTotal").textContent = "$" + (portfolio.total_usd || 0).toFixed(2);
+      document.getElementById("portfolioTodayPnL").textContent = (portfolio.pnl_today >= 0 ? "+" : "") + (portfolio.pnl_today || 0).toFixed(2) + " USD";
+      document.getElementById("portfolioAllTimePnL").textContent = (portfolio.pnl_all_time >= 0 ? "+" : "") + (portfolio.pnl_all_time || 0).toFixed(2) + " USD";
+    }catch(e){
+      console.warn("Failed to update portfolio summary", e);
+    }
+  }
+
+  // Call on page load
+  updatePortfolioSummary();
+  setInterval(updatePortfolioSummary, 15000);
+
+  // ===== Bot Templates =====
+  function applyTemplate(templateName) {
+    const templates = {
+      conservative: {
+        base_quote: 50,
+        max_safety: 8,
+        tp: 0.015,
+        first_dev: 0.02,
+        step_mult: 1.3,
+        strategy: "smart_dca"
+      },
+      aggressive: {
+        base_quote: 100,
+        max_safety: 3,
+        tp: 0.025,
+        first_dev: 0.01,
+        step_mult: 1.1,
+        strategy: "trend_follow"
+      },
+      grid: {
+        base_quote: 30,
+        max_safety: 12,
+        tp: 0.01,
+        first_dev: 0.008,
+        step_mult: 1.05,
+        strategy: "classic_dca"
+      }
+    };
+
+    const template = templates[templateName];
+    if (!template) return;
+
+    document.getElementById("f_base").value = template.base_quote;
+    document.getElementById("f_safety").value = template.base_quote;
+    document.getElementById("f_max_safety").value = template.max_safety;
+    document.getElementById("f_tp").value = (template.tp * 100).toFixed(2);
+    document.getElementById("f_first_dev").value = (template.first_dev * 100).toFixed(2);
+    document.getElementById("f_step_mult").value = template.step_mult;
+    document.getElementById("f_strategy").value = template.strategy;
+
+    showToast("Template Applied", `${templateName} template settings loaded`, "success");
+  }
+
+  // ===== Bot Cloning =====
+  async function cloneBot(botId) {
+    try {
+      const r = await fetch(`/api/bots/${botId}`);
+      const bot = await r.json();
+
+      if (!r.ok || !bot.ok) {
+        showToast("Error", "Failed to load bot data", "error");
+        return;
+      }
+
+      // Open modal and populate with cloned data
+      openCreate();
+
+      const botData = bot.bot;
+      document.getElementById("f_name").value = botData.name + " (Copy)";
+      document.getElementById("f_symbol_search").value = botData.symbol;
+      document.getElementById("f_symbol").value = botData.symbol;
+      document.getElementById("f_market_type").value = botData.market_type || "crypto";
+      document.getElementById("f_alpaca_mode").value = botData.alpaca_mode || "paper";
+      document.getElementById("f_dry").value = botData.dry_run ? "1" : "0";
+      document.getElementById("f_strategy").value = botData.strategy_mode || "classic_dca";
+      document.getElementById("f_forced_strategy").value = botData.forced_strategy || "";
+      document.getElementById("f_auto_restart").value = botData.auto_restart ? "1" : "0";
+      document.getElementById("f_base").value = botData.base_quote;
+      document.getElementById("f_safety").value = botData.safety_quote;
+
+      showToast("Clone Ready", `All settings copied from ${botData.name}. Modify as needed.`, "info");
+    } catch (e) {
+      showToast("Error", "Failed to clone bot: " + e.message, "error");
+    }
+  }
+
+  // ===== Bot Config Export/Import =====
+  async function exportBotConfigs() {
+    try {
+      const r = await fetch("/api/bots");
+      const data = await r.json();
+
+      if (!r.ok || !data.bots) {
+        showToast("Error", "Failed to fetch bot configurations", "error");
+        return;
+      }
+
+      const configs = data.bots.map(b => ({
+        name: b.name,
+        symbol: b.symbol,
+        market_type: b.market_type,
+        strategy_mode: b.strategy_mode,
+        base_quote: b.base_quote,
+        safety_quote: b.safety_quote,
+        max_safety: b.max_safety,
+        tp: b.tp,
+        first_dev: b.first_dev,
+        step_mult: b.step_mult,
+        dry_run: b.dry_run,
+        alpaca_mode: b.alpaca_mode,
+        auto_restart: b.auto_restart,
+        forced_strategy: b.forced_strategy
+      }));
+
+      const json = JSON.stringify(configs, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `bot-configs-${new Date().toISOString().split('T')[0]}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      showToast("Exported", `${configs.length} bot configurations exported`, "success");
+    } catch (e) {
+      showToast("Error", "Export failed: " + e.message, "error");
+    }
+  }
+
+  function openImportDialog() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        const configs = JSON.parse(text);
+
+        if (!Array.isArray(configs)) {
+          showToast("Error", "Invalid file format. Expected JSON array.", "error");
+          return;
+        }
+
+        let imported = 0;
+        for (const cfg of configs) {
+          try {
+            const r = await fetch("/api/bots/create", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(cfg)
+            });
+            if (r.ok) imported++;
+          } catch (err) {
+            console.warn("Failed to import config:", cfg.name, err);
+          }
+        }
+
+        showToast("Import Complete", `${imported} bots created from configuration`, "success");
+        setTimeout(refreshAllStatuses, 500);
+      } catch (e) {
+        showToast("Error", "Failed to parse JSON: " + e.message, "error");
+      }
+    };
+    input.click();
+  }
 </script>
 
 {% endblock %}

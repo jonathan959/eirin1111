@@ -1,6 +1,7 @@
 # app.py  (REPLACE ENTIRE FILE)  -- UI ONLY (no trading engine)
 import os
 import time
+import json
 from typing import Any, Dict, Optional
 
 import requests
@@ -510,6 +511,12 @@ def explore_page(request: Request):
     return templates.TemplateResponse("explore.html", ctx)
 
 
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics_page(request: Request):
+    ctx = _build_dashboard_context(request)
+    return templates.TemplateResponse("analytics.html", ctx)
+
+
 @app.get("/bots", response_class=HTMLResponse)
 def bots_page(request: Request):
     health = _safe_worker_health()
@@ -628,6 +635,165 @@ def deal_detail(deal_id: int, request: Request):
             "kraken_error": kraken_error,
         },
     )
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    return templates.TemplateResponse(
+        "settings.html",
+        {"request": request, "active_page": "settings"},
+    )
+
+
+# =========================================================
+# Settings API (GET, POST)
+# =========================================================
+def _get_settings_path() -> str:
+    """Get the settings.json file path."""
+    return os.path.join(os.path.dirname(__file__), "settings.json")
+
+
+def _load_settings() -> Dict[str, Any]:
+    """Load settings from settings.json."""
+    try:
+        path = _get_settings_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to load settings: %s", e)
+
+    # Return default settings
+    return {
+        "default_capital": 100,
+        "default_tp": 1.5,
+        "default_safety_orders": 5,
+        "default_so_size": 25,
+        "default_first_dev": 1.0,
+        "default_step_mult": 1.2,
+        "default_strategy": "Classic DCA",
+        "notifications_enabled": True,
+        "discord_webhook": "",
+        "telegram_token": "",
+        "telegram_chat_id": "",
+        "notify_trade_executed": True,
+        "notify_tp_hit": True,
+        "notify_sl_hit": True,
+        "notify_bot_error": True,
+        "notify_drawdown": True,
+        "notify_daily_summary": True,
+        "theme": "dark",
+        "default_timeframe": "1H",
+        "auto_refresh_interval": 15,
+        "show_debug_logs": False,
+        "max_drawdown": 10,
+        "max_position_pct": 20,
+        "max_correlated": 50,
+        "cooldown_loss": 30,
+        "max_deals_day": 5,
+        "log_level": "INFO",
+        "db_path": "botdb.sqlite3",
+        "worker_url": WORKER_URL,
+    }
+
+
+def _save_settings(settings: Dict[str, Any]) -> bool:
+    """Save settings to settings.json."""
+    try:
+        path = _get_settings_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Failed to save settings: %s", e)
+        return False
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    """Get current settings."""
+    try:
+        settings = _load_settings()
+        return _json({"ok": True, **settings})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.post("/api/settings")
+async def api_settings_post(request: Request):
+    """Save settings."""
+    try:
+        body = await request.json()
+        settings = _load_settings()
+        settings.update(body)
+
+        if _save_settings(settings):
+            return _json({"ok": True, "message": "Settings saved"})
+        else:
+            return _json({"ok": False, "error": "Failed to save settings"}, 500)
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 400)
+
+
+@app.post("/api/settings/test-discord")
+async def api_test_discord(request: Request):
+    """Test Discord webhook."""
+    try:
+        body = await request.json()
+        webhook_url = body.get("webhook_url", "").strip()
+
+        if not webhook_url:
+            return _json({"ok": False, "error": "Webhook URL is empty"}, 400)
+
+        # Try to send a test message
+        test_payload = {
+            "content": "✓ Eirin Bot test notification - Settings check",
+            "username": "Eirin Bot",
+        }
+
+        resp = requests.post(webhook_url, json=test_payload, timeout=5)
+
+        if resp.status_code == 204:
+            return _json({"ok": True, "message": "Discord webhook is valid"})
+        else:
+            return _json({"ok": False, "error": f"Discord returned {resp.status_code}"}, 400)
+    except requests.exceptions.RequestException as e:
+        return _json({"ok": False, "error": f"Connection error: {str(e)}"}, 400)
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 400)
+
+
+@app.post("/api/settings/test-telegram")
+async def api_test_telegram(request: Request):
+    """Test Telegram bot."""
+    try:
+        body = await request.json()
+        token = body.get("token", "").strip()
+        chat_id = body.get("chat_id", "").strip()
+
+        if not token or not chat_id:
+            return _json({"ok": False, "error": "Token and chat ID are required"}, 400)
+
+        # Try to send a test message
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": "✓ Eirin Bot test notification - Settings check",
+        }
+
+        resp = requests.post(url, json=payload, timeout=5)
+        data = resp.json()
+
+        if data.get("ok"):
+            return _json({"ok": True, "message": "Telegram is valid"})
+        else:
+            return _json({"ok": False, "error": data.get("description", "Invalid credentials")}, 400)
+    except requests.exceptions.RequestException as e:
+        return _json({"ok": False, "error": f"Connection error: {str(e)}"}, 400)
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 400)
 
 
 # =========================================================
