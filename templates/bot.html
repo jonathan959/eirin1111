@@ -1699,7 +1699,7 @@
 
     // Autopilot evaluation
     try {
-      const resp = await fetch(`/api/autopilot/evaluate/${encodeURIComponent(symbol)}`, {method: 'POST'});
+      const resp = await fetch(`/api/autopilot/intelligence/${encodeURIComponent(symbol)}`);
       if (!resp.ok) return;
       const ap = await resp.json();
 

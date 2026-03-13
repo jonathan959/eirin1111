@@ -316,6 +316,65 @@ def api_rebalance_proxy():
     return _worker_json("GET", "/api/portfolio/rebalance_suggestions")
 
 
+# ── Intelligence endpoints proxy ──────────────────────────────
+
+@app.get("/api/patterns/{symbol}")
+def api_patterns_proxy(symbol: str, request: Request):
+    params = dict(request.query_params)
+    return _worker_json("GET", f"/api/patterns/{symbol}", params=params)
+
+
+@app.get("/api/anomalies/{symbol}")
+def api_anomalies_proxy(symbol: str, request: Request):
+    params = dict(request.query_params)
+    return _worker_json("GET", f"/api/anomalies/{symbol}", params=params)
+
+
+@app.get("/api/intelligence/{symbol}")
+def api_intelligence_proxy(symbol: str, request: Request):
+    params = dict(request.query_params)
+    return _worker_json("GET", f"/api/intelligence/{symbol}", params=params)
+
+
+@app.get("/api/autopilot/intelligence/{symbol}")
+def api_autopilot_intelligence_proxy(symbol: str):
+    return _worker_json("GET", f"/api/autopilot/intelligence/{symbol}")
+
+
+@app.get("/api/autopilot/health")
+def api_autopilot_health_proxy():
+    return _worker_json("GET", "/api/autopilot/health")
+
+
+@app.post("/api/backtest/run")
+async def api_backtest_run_proxy(request: Request):
+    payload = await request.json()
+    return _worker_json("POST", "/api/backtest/run", body=payload)
+
+
+@app.post("/api/backtest/optimize")
+async def api_backtest_optimize_proxy(request: Request):
+    payload = await request.json()
+    return _worker_json("POST", "/api/backtest/optimize", body=payload)
+
+
+@app.post("/api/backtest/monte_carlo")
+async def api_backtest_monte_carlo_proxy(request: Request):
+    payload = await request.json()
+    return _worker_json("POST", "/api/backtest/monte_carlo", body=payload)
+
+
+@app.post("/api/backtest/walk_forward")
+async def api_backtest_walk_forward_proxy(request: Request):
+    payload = await request.json()
+    return _worker_json("POST", "/api/backtest/walk_forward", body=payload)
+
+
+@app.post("/api/ml/signal_scorer/retrain")
+def api_ml_retrain_proxy():
+    return _worker_json("POST", "/api/ml/signal_scorer/retrain")
+
+
 @app.post("/api/orders/buy")
 async def api_orders_buy_proxy(request: Request):
     payload = await request.json()
