@@ -107,7 +107,7 @@ function initThemeToggle() {
 }
 
 /**
- * Global search modal
+ * Enhanced command palette with navigation and actions
  */
 function initGlobalSearch() {
   const globalSearchModal = document.getElementById("globalSearchModal");
@@ -117,9 +117,84 @@ function initGlobalSearch() {
 
   if (!globalSearchBtn) return;
 
+  // Command palette entries
+  const commands = [
+    { category: "Navigation", icon: "📊", name: "Go to Dashboard", action: () => window.location.href = "/dashboard", keywords: ["dashboard", "home"] },
+    { category: "Navigation", icon: "🤖", name: "Go to Bots", action: () => window.location.href = "/bots", keywords: ["bots", "my bots"] },
+    { category: "Navigation", icon: "🔍", name: "Go to Explore", action: () => window.location.href = "/explore", keywords: ["explore", "recommendations", "search"] },
+    { category: "Navigation", icon: "📈", name: "Go to Analytics", action: () => window.location.href = "/analytics", keywords: ["analytics", "stats"] },
+    { category: "Navigation", icon: "⚙️", name: "Go to Settings", action: () => window.location.href = "/settings", keywords: ["settings", "config"] },
+    { category: "Navigation", icon: "📔", name: "Go to Journal", action: () => window.location.href = "/journal", keywords: ["journal", "trades"] },
+    { category: "Actions", icon: "➕", name: "Create new bot", action: () => window.location.href = "/bots?action=create", keywords: ["create", "new", "bot"] },
+    { category: "Actions", icon: "🧪", name: "Run backtest", action: () => window.location.href = "/backtest", keywords: ["backtest", "test"] },
+    { category: "Theme", icon: "🌙", name: "Toggle dark mode", action: () => {
+      const html = document.documentElement;
+      const current = html.getAttribute("data-theme") || "light";
+      const next = current === "dark" ? "light" : "dark";
+      html.setAttribute("data-theme", next);
+      localStorage.setItem("theme", next);
+    }, keywords: ["theme", "dark", "light", "mode"] }
+  ];
+
+  // Fuzzy match function
+  function fuzzyMatch(query, text) {
+    let qIdx = 0;
+    let score = 0;
+    for (let i = 0; i < text.length && qIdx < query.length; i++) {
+      if (text[i].toLowerCase() === query[qIdx].toLowerCase()) {
+        qIdx++;
+        score += 10;
+      } else {
+        score -= 1;
+      }
+    }
+    return qIdx === query.length ? Math.max(score, 0) : -1;
+  }
+
   function openSearch() {
     globalSearchModal.classList.remove("hidden");
     setTimeout(() => globalSearchInput?.focus(), 0);
+    updateResults("");
+  }
+
+  function updateResults(query) {
+    if (!query || query.length === 0) {
+      globalSearchResults.innerHTML = commands.map(cmd => `
+        <div class="search-result" onclick="(${cmd.action.toString()})(); document.getElementById('globalSearchModal').classList.add('hidden')">
+          <div class="search-result-icon">${cmd.icon}</div>
+          <div class="search-result-text">
+            <div class="search-result-title">${cmd.name}</div>
+            <div class="search-result-sub">${cmd.category}</div>
+          </div>
+        </div>
+      `).join("");
+      return;
+    }
+
+    const q = query.toLowerCase();
+    const results = commands.map(cmd => {
+      let score = 0;
+      score = Math.max(fuzzyMatch(q, cmd.name), score);
+      cmd.keywords.forEach(kw => {
+        score = Math.max(fuzzyMatch(q, kw), score);
+      });
+      return { ...cmd, score };
+    }).filter(cmd => cmd.score > 0).sort((a, b) => b.score - a.score);
+
+    if (results.length === 0) {
+      globalSearchResults.innerHTML = '<div class="search-empty">No commands found</div>';
+      return;
+    }
+
+    globalSearchResults.innerHTML = results.map(cmd => `
+      <div class="search-result" onclick="(${cmd.action.toString()})(); document.getElementById('globalSearchModal').classList.add('hidden')">
+        <div class="search-result-icon">${cmd.icon}</div>
+        <div class="search-result-text">
+          <div class="search-result-title">${cmd.name}</div>
+          <div class="search-result-sub">${cmd.category}</div>
+        </div>
+      </div>
+    `).join("");
   }
 
   globalSearchBtn.addEventListener("click", openSearch);
@@ -136,17 +211,16 @@ function initGlobalSearch() {
     globalSearchInput.addEventListener("keydown", function(e) {
       if (e.key === "Escape") {
         globalSearchModal.classList.add("hidden");
+      } else if (e.key === "Enter") {
+        const first = globalSearchResults.querySelector(".search-result");
+        if (first) first.click();
       }
     });
 
     globalSearchInput.addEventListener("input", debounce(function() {
       const q = globalSearchInput.value.trim();
-      if (!q || q.length < 2) {
-        globalSearchResults.innerHTML = "";
-        return;
-      }
-      searchBots(q);
-    }, 200));
+      updateResults(q);
+    }, 100));
   }
 
   // Keyboard shortcut Cmd+K or Ctrl+K
@@ -245,6 +319,77 @@ function initNotificationBell() {
 }
 
 /**
+ * Number animation utility
+ */
+function easeOutQuad(t) {
+  return t * (2 - t);
+}
+
+window.formatNumber = function(value) {
+  if (typeof value !== 'number') return '0';
+  if (Math.abs(value) >= 1e6) {
+    return (value / 1e6).toFixed(1) + 'M';
+  }
+  if (Math.abs(value) >= 1e3) {
+    return (value / 1e3).toFixed(1) + 'K';
+  }
+  return value.toFixed(2);
+};
+
+window.animateValue = function(el, start, end, duration = 500) {
+  const range = end - start;
+  const startTime = performance.now();
+  function update(currentTime) {
+    const elapsed = currentTime - startTime;
+    const progress = Math.min(elapsed / duration, 1);
+    const value = start + range * easeOutQuad(progress);
+    if (el && el.textContent !== undefined) {
+      el.textContent = formatNumber(value);
+    }
+    if (progress < 1) requestAnimationFrame(update);
+  }
+  requestAnimationFrame(update);
+};
+
+/**
+ * Real-time P&L ticker
+ */
+function initPnLTicker() {
+  const ticker = document.getElementById("pnlTicker");
+  if (!ticker) return;
+
+  function updateTicker() {
+    fetch("/api/portfolio")
+      .then(r => r.json())
+      .then(data => {
+        if (!data.portfolio) return;
+        const portfolio = data.portfolio;
+        const todayPnL = parseFloat(portfolio.today_pnl || 0);
+        const totalValue = parseFloat(portfolio.total_value || 0);
+        const activeBotsEl = document.getElementById("tickerBots");
+        const valueEl = document.getElementById("tickerValue");
+        const pnlEl = document.getElementById("tickerPnl");
+
+        if (valueEl) {
+          const oldValue = parseFloat(valueEl.textContent.replace(/[^0-9.-]/g, '') || 0);
+          animateValue(valueEl, oldValue, totalValue, 300);
+        }
+        if (pnlEl) {
+          pnlEl.textContent = (todayPnL >= 0 ? '+' : '') + formatNumber(todayPnL);
+          pnlEl.className = todayPnL >= 0 ? 'pos' : 'neg';
+        }
+        if (activeBotsEl) {
+          activeBotsEl.textContent = portfolio.active_bot_count || 0;
+        }
+      })
+      .catch(() => {});
+  }
+
+  updateTicker();
+  setInterval(updateTicker, 10000);
+}
+
+/**
  * Initialize all UI enhancements on page load
  */
 document.addEventListener("DOMContentLoaded", function() {
@@ -252,4 +397,5 @@ document.addEventListener("DOMContentLoaded", function() {
   initGlobalSearch();
   initSidebarToggle();
   initNotificationBell();
+  initPnLTicker();
 });

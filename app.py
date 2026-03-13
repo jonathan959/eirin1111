@@ -2,13 +2,17 @@
 import os
 import time
 import json
+import hashlib
+import logging
 from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.cors import CORSMiddleware
 from db import (
     init_db,
     list_bots,
@@ -22,7 +26,10 @@ from db import (
     get_deal,
     list_logs_window,
     get_setting,
+    log_audit,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
@@ -63,11 +70,31 @@ WORKER_API_TOKEN = os.getenv("WORKER_API_TOKEN", "").strip()
 # Requests timeouts (1-60 seconds)
 WORKER_TIMEOUT_SEC = max(1.0, min(60.0, float(os.getenv("WORKER_TIMEOUT_SEC", "8"))))
 
+# Security config
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+ENABLE_CORS = os.getenv("ENABLE_CORS", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+
+# Rate limiting state (simple per-IP request counter)
+_rate_limit_state: Dict[str, list] = {}  # {ip: [timestamps]}
+RATE_LIMIT_REQUESTS = 60  # Max requests per minute
+RATE_LIMIT_WINDOW = 60  # Time window in seconds
+
 
 # =========================================================
 # App init
 # =========================================================
 app = FastAPI()
+
+# Add CORS middleware if enabled
+if ENABLE_CORS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 def _check_worker_health() -> Dict[str, Any]:
@@ -92,6 +119,119 @@ def health() -> JSONResponse:
 templates = Jinja2Templates(directory="templates")
 def _json(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(content=data, status_code=status_code, headers={'Cache-Control': 'no-store'})
+
+
+# =========================================================
+# Security & Authentication
+# =========================================================
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers or connection."""
+    if x_forwarded_for := request.headers.get("X-Forwarded-For"):
+        return x_forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Check if IP has exceeded rate limit."""
+    if not RATE_LIMIT_ENABLED:
+        return True
+    now = time.time()
+    if ip not in _rate_limit_state:
+        _rate_limit_state[ip] = []
+    # Remove old timestamps
+    _rate_limit_state[ip] = [ts for ts in _rate_limit_state[ip] if now - ts < RATE_LIMIT_WINDOW]
+    if len(_rate_limit_state[ip]) >= RATE_LIMIT_REQUESTS:
+        return False
+    _rate_limit_state[ip].append(now)
+    return True
+
+
+def _check_auth(request: Request) -> bool:
+    """Check if request is authenticated (has valid session cookie)."""
+    if not DASHBOARD_PASSWORD:
+        return True
+    session = request.cookies.get("eirin_session")
+    expected = hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
+    return session == expected
+
+
+@app.get("/login")
+def login_page():
+    """Serve login page."""
+    return HTMLResponse(open("templates/login.html").read())
+
+
+@app.post("/api/auth/login")
+async def api_login(request: Request):
+    """Authenticate with password and set session cookie."""
+    if not DASHBOARD_PASSWORD:
+        return _json({"ok": True, "message": "No password required"})
+
+    ip = _get_client_ip(request)
+
+    # Rate limiting
+    if not _check_rate_limit(ip):
+        log_audit("auth_fail_rate_limit", f"IP={ip}", ip)
+        return _json({"ok": False, "message": "Too many login attempts"}, 429)
+
+    try:
+        payload = await request.json()
+        password = str(payload.get("password", "")).strip()
+    except Exception:
+        return _json({"ok": False, "message": "Invalid request"}, 400)
+
+    expected = hashlib.sha256(DASHBOARD_PASSWORD.encode()).hexdigest()
+    provided = hashlib.sha256(password.encode()).hexdigest()
+
+    if provided != expected:
+        log_audit("auth_fail", f"IP={ip}", ip)
+        return _json({"ok": False, "message": "Invalid password"}, 401)
+
+    log_audit("auth_success", f"IP={ip}", ip)
+    response = _json({"ok": True, "message": "Logged in"})
+    response.set_cookie(
+        "eirin_session",
+        expected,
+        max_age=86400 * 30,  # 30 days
+        httponly=True,
+        samesite="Lax",
+        secure=False,  # Set to True in production with HTTPS
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def api_logout(request: Request):
+    """Clear session cookie."""
+    ip = _get_client_ip(request)
+    log_audit("logout", f"IP={ip}", ip)
+    response = _json({"ok": True, "message": "Logged out"})
+    response.delete_cookie("eirin_session")
+    return response
+
+
+# Middleware for auth protection
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Protect dashboard routes with authentication."""
+    if not DASHBOARD_PASSWORD:
+        return await call_next(request)
+
+    # Allow static files, health, and login
+    if (request.url.path.startswith("/static") or
+        request.url.path == "/health" or
+        request.url.path == "/login" or
+        request.url.path == "/api/auth/login"):
+        return await call_next(request)
+
+    # All other routes require auth
+    if not _check_auth(request):
+        if request.url.path.startswith("/api/"):
+            return _json({"ok": False, "message": "Unauthorized"}, 401)
+        return RedirectResponse("/login")
+
+    return await call_next(request)
 
 
 @app.post("/api/bots")
@@ -515,6 +655,12 @@ def explore_page(request: Request):
 def analytics_page(request: Request):
     ctx = _build_dashboard_context(request)
     return templates.TemplateResponse("analytics.html", ctx)
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+def backtest_page(request: Request):
+    ctx = _build_dashboard_context(request)
+    return templates.TemplateResponse("backtest.html", ctx)
 
 
 @app.get("/bots", response_class=HTMLResponse)

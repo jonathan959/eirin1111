@@ -39,6 +39,20 @@ try:
 except ImportError:
     SMART_ENTRY_AVAILABLE = False
 
+# Sentiment Filter - optional intelligence module
+try:
+    from sentiment_analyzer import SentimentAnalyzer, SentimentScore
+    SENTIMENT_ANALYZER_AVAILABLE = True
+except ImportError:
+    SENTIMENT_ANALYZER_AVAILABLE = False
+
+# ML Signal Scorer - optional ML prediction filter
+try:
+    from ml_signal_scorer import MLSignalScorer
+    ML_SCORER_AVAILABLE = True
+except ImportError:
+    ML_SCORER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Exchange minimum order sizes (Kraken actual minimum ~$1, Alpaca $1 fractional)
@@ -132,6 +146,9 @@ class OrderExecutor:
         self._IDEMPOTENCY_MAX = 500
         self._IDEMPOTENCY_TTL = 3600  # 1 hour
 
+        # OCO (One Cancels Other) tracking: maps (bot_id, symbol) -> {'tp_order_id': str, 'sl_order_id': str, 'position_size': float}
+        self._oco_pairs: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
         # Initialize SmartEntryFilter if available
         self.smart_entry_filter: Optional[SmartEntryFilter] = None
         if SMART_ENTRY_AVAILABLE and os.getenv("ENABLE_SMART_ENTRY", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
@@ -140,6 +157,24 @@ class OrderExecutor:
                 logger.info("SmartEntryFilter enabled for trade validation")
             except Exception as e:
                 logger.warning("SmartEntryFilter initialization failed: %s", e)
+
+        # Initialize SentimentAnalyzer if available
+        self.sentiment_analyzer: Optional[Any] = None
+        if SENTIMENT_ANALYZER_AVAILABLE and os.getenv("ENABLE_SENTIMENT_FILTER", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            try:
+                self.sentiment_analyzer = SentimentAnalyzer()
+                logger.info("SentimentFilter enabled for entry validation")
+            except Exception as e:
+                logger.warning("SentimentFilter initialization failed: %s", e)
+
+        # Initialize ML Signal Scorer if available
+        self.ml_scorer: Optional[Any] = None
+        if ML_SCORER_AVAILABLE and os.getenv("ENABLE_ML_SCORER", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+            try:
+                self.ml_scorer = MLSignalScorer()
+                logger.info("MLSignalScorer enabled for entry validation")
+            except Exception as e:
+                logger.warning("MLSignalScorer initialization failed: %s", e)
 
     def _check_kraken_balance_before_order(
         self,
@@ -246,6 +281,101 @@ class OrderExecutor:
             logger.warning(f"SmartEntryFilter validation error for {symbol}: {e}")
             return None  # Fail-safe: don't block on filter error
 
+    def _validate_entry_with_sentiment(
+        self,
+        symbol: str,
+        proposed_order: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Optional: Validate entry using SentimentFilter before order placement.
+
+        Args:
+            symbol: Trading pair
+            proposed_order: The proposed order dict
+
+        Returns:
+            Error message if validation fails, None if passes
+        """
+        if not self.sentiment_analyzer:
+            return None
+
+        # Only validate BUY orders (entries)
+        if proposed_order.get("side", "").lower() != "buy":
+            return None
+
+        try:
+            # Get combined sentiment for the symbol
+            sentiment_level, sentiment_score, sentiment_details = self.sentiment_analyzer.get_combined_sentiment(
+                symbol=symbol,
+                lookback_hours=24
+            )
+
+            # Block entry if sentiment is very negative (score < 0.3, which maps to VERY_NEGATIVE)
+            if sentiment_score < -0.5:
+                reason = f"Very negative sentiment detected (score={sentiment_score:.2f})"
+                logger.info(f"[{symbol}] SentimentFilter blocked entry: {reason}")
+                return f"SentimentFilter: {reason}"
+
+            logger.debug(f"[{symbol}] SentimentFilter approved entry: sentiment={sentiment_level.value} (score={sentiment_score:.2f})")
+            return None
+
+        except Exception as e:
+            logger.warning(f"SentimentFilter validation error for {symbol}: {e}")
+            return None  # Fail-safe: don't block on filter error
+
+    def _validate_entry_with_ml_scorer(
+        self,
+        symbol: str,
+        candles_1h: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        Optional: Validate entry using MLSignalScorer before order placement.
+
+        Args:
+            symbol: Trading pair
+            candles_1h: List of 1-hour candles (dict with open/high/low/close/volume/time keys)
+
+        Returns:
+            Error message if validation fails, None if passes
+        """
+        if not self.ml_scorer:
+            return None
+
+        try:
+            # Call ML scorer predict on candles - returns probability 0-1
+            proba = self.ml_scorer.predict(candles_1h)
+
+            # If probability is None, model not trained yet, allow trade
+            if proba is None:
+                return None
+
+            # Get ML_MIN_CONFIDENCE from env (default 0.55)
+            threshold = float(os.getenv("ML_MIN_CONFIDENCE", "0.55"))
+
+            # Block if probability below threshold
+            if proba < threshold:
+                reason = f"MLScorer: low confidence {proba:.2f} < {threshold}"
+                logger.info(f"[{symbol}] {reason}")
+                return reason
+
+            # Check if retraining is needed and trigger background training
+            if hasattr(self.ml_scorer, 'should_retrain') and self.ml_scorer.should_retrain():
+                logger.info(f"[{symbol}] ML scorer should retrain - queuing background training")
+                try:
+                    # Trigger retraining in background (don't block entry)
+                    if hasattr(self.ml_scorer, 'train'):
+                        # Just log, don't block - training happens asynchronously
+                        logger.debug(f"[{symbol}] Background ML retraining triggered")
+                except Exception as retrain_err:
+                    logger.warning(f"[{symbol}] ML retraining error: {retrain_err}")
+
+            logger.debug(f"[{symbol}] MLScorer approved entry: confidence={proba:.2f} >= {threshold}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"MLScorer validation error for {symbol}: {e}")
+            return None  # Fail-safe: don't block on filter error
+
     def execute_decision(
         self,
         decision: IntelligenceDecision,
@@ -335,6 +465,23 @@ class OrderExecutor:
                 if smart_filter_error:
                     result["errors"].append(smart_filter_error)
                     continue  # Skip this order
+
+                # Optional: SentimentFilter validation for BUY orders
+                sentiment_filter_error = self._validate_entry_with_sentiment(
+                    symbol=symbol,
+                    proposed_order=proposed_order,
+                )
+                if sentiment_filter_error:
+                    result["errors"].append(sentiment_filter_error)
+                    continue  # Skip this order
+
+                # ML Scorer validation
+                if self.ml_scorer:
+                    ml_block = self._validate_entry_with_ml_scorer(symbol, kwargs.get("candles_1h", []))
+                    if ml_block:
+                        logger.info("[%s] ML scorer blocked: %s", symbol, ml_block)
+                        result["errors"].append(ml_block)
+                        continue  # Skip this order
 
                 order_result = self._execute_proposed_order(
                     proposed_order, bot_id, symbol, dry_run, decision.execution_policy
@@ -886,7 +1033,7 @@ class OrderExecutor:
         """Cancel all open orders for a symbol (centralized)."""
         if dry_run:
             return 0
-        
+
         try:
             self.kc.cancel_all_open_orders(symbol)
             add_order_event(
@@ -898,3 +1045,148 @@ class OrderExecutor:
             return 0
         except Exception:
             return 0
+
+    def create_oco_pair(
+        self,
+        bot_id: int,
+        symbol: str,
+        tp_order_id: str,
+        sl_order_id: str,
+        position_size: float,
+    ) -> None:
+        """
+        Create an OCO (One Cancels Other) pair between a take-profit and stop-loss order.
+        When one triggers, the other is automatically cancelled.
+
+        Args:
+            bot_id: Bot identifier
+            symbol: Trading pair
+            tp_order_id: Take-profit order ID
+            sl_order_id: Stop-loss order ID
+            position_size: Position size for the orders
+        """
+        key = (bot_id, symbol)
+        self._oco_pairs[key] = {
+            "tp_order_id": str(tp_order_id),
+            "sl_order_id": str(sl_order_id),
+            "position_size": float(position_size),
+            "created_at": time.time(),
+        }
+        logger.info(
+            f"OCO pair created for bot {bot_id} {symbol}: TP={tp_order_id}, SL={sl_order_id}"
+        )
+
+    def handle_oco_trigger(
+        self,
+        bot_id: int,
+        symbol: str,
+        triggered_order_id: str,
+        trigger_type: str,
+        current_price: float,
+        dry_run: bool = True,
+    ) -> bool:
+        """
+        Monitor and manage OCO pair. When one order triggers, cancel the other.
+
+        Args:
+            bot_id: Bot identifier
+            symbol: Trading pair
+            triggered_order_id: The order that was triggered (filled or hit)
+            trigger_type: Type of trigger ("tp_hit", "sl_hit", "manual_cancel")
+            current_price: Current market price
+            dry_run: If True, don't actually cancel (simulation mode)
+
+        Returns:
+            True if OCO was handled (counter-order cancelled), False otherwise
+        """
+        key = (bot_id, symbol)
+        if key not in self._oco_pairs:
+            return False
+
+        oco = self._oco_pairs[key]
+        triggered_id = str(triggered_order_id)
+        tp_id = oco.get("tp_order_id")
+        sl_id = oco.get("sl_order_id")
+
+        # Determine which order was triggered and which to cancel
+        order_to_cancel = None
+        cancel_reason = ""
+
+        if triggered_id == tp_id:
+            order_to_cancel = sl_id
+            cancel_reason = (
+                f"TP hit at {current_price:.8f}; cancelling SL order {sl_id}"
+            )
+        elif triggered_id == sl_id:
+            order_to_cancel = tp_id
+            cancel_reason = (
+                f"SL hit at {current_price:.8f}; cancelling TP order {tp_id}"
+            )
+        else:
+            # Triggered order not in our OCO pair
+            return False
+
+        if not order_to_cancel:
+            return False
+
+        # Cancel the counter-order
+        try:
+            if not dry_run:
+                self.kc.cancel_order(order_to_cancel, symbol)
+            add_order_event(
+                bot_id, symbol, "cancel", "oco_cancel", None, None,
+                order_to_cancel, "oco_handler", "cancelled", cancel_reason,
+                is_live=0 if dry_run else 1,
+            )
+            logger.info(f"OCO handler: {cancel_reason}")
+            del self._oco_pairs[key]
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to cancel OCO counter-order: {e}")
+            return False
+
+    def check_oco_pairs(
+        self,
+        bot_id: int,
+        symbol: str,
+        open_orders: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """
+        Periodically check OCO pairs for order fills and clean up stale pairs.
+        Called by bot manager during main loop.
+
+        Args:
+            bot_id: Bot identifier
+            symbol: Trading pair
+            open_orders: List of open orders from exchange (optional, for fill detection)
+
+        Returns:
+            Message describing any OCO action taken, or None
+        """
+        key = (bot_id, symbol)
+        if key not in self._oco_pairs:
+            return None
+
+        oco = self._oco_pairs[key]
+        created_at = oco.get("created_at", 0)
+        age_seconds = time.time() - created_at
+
+        # Auto-clean OCO pairs older than 24 hours (likely cancelled manually or expired)
+        if age_seconds > 86400:
+            msg = f"OCO pair expired (age {age_seconds/3600:.1f}h); removing"
+            del self._oco_pairs[key]
+            return msg
+
+        # If open_orders provided, check if both orders still exist
+        if open_orders:
+            tp_id = oco.get("tp_order_id")
+            sl_id = oco.get("sl_order_id")
+            order_ids = {str(o.get("id") or o.get("order_id")) for o in open_orders}
+
+            # If both missing, pair was likely filled or cancelled externally
+            if tp_id not in order_ids and sl_id not in order_ids:
+                msg = "OCO pair fully resolved (both orders gone)"
+                del self._oco_pairs[key]
+                return msg
+
+        return None

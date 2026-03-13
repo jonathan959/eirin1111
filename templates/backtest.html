@@ -1,0 +1,970 @@
+{% extends "layout.html" %}
+{% block title %}Backtest Engine{% endblock %}
+
+{% block content %}
+<style>
+  .backtest-container {
+    display: grid;
+    grid-template-columns: 350px 1fr;
+    gap: 24px;
+    max-width: 100%;
+  }
+
+  .settings-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .settings-section {
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+
+  .settings-label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    color: var(--muted, #64748b);
+    margin-bottom: 8px;
+    display: block;
+  }
+
+  .form-group {
+    margin-bottom: 12px;
+  }
+
+  .form-group:last-child {
+    margin-bottom: 0;
+  }
+
+  .form-input, .form-select {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 6px;
+    background: var(--bg, #f5f7fb);
+    color: var(--text, #0f172a);
+    font-size: 13px;
+    font-family: inherit;
+  }
+
+  .form-input:focus, .form-select:focus {
+    outline: none;
+    background: var(--panel, #ffffff);
+    border-color: #4f46e5;
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+  }
+
+  .radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .radio-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .radio-option input {
+    cursor: pointer;
+  }
+
+  .radio-option label {
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .button-group {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .btn {
+    flex: 1;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .btn-primary {
+    background: #4f46e5;
+    color: white;
+  }
+
+  .btn-primary:hover {
+    background: #4338ca;
+  }
+
+  .btn-primary:active {
+    transform: scale(0.98);
+  }
+
+  .btn-secondary {
+    background: var(--bg, #f5f7fb);
+    color: var(--text, #0f172a);
+    border: 1px solid var(--border, #e2e8f0);
+  }
+
+  .btn-secondary:hover {
+    background: var(--border, #e2e8f0);
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .results-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  .metrics-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+
+  .metric-card {
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+
+  .metric-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted, #64748b);
+    margin-bottom: 8px;
+  }
+
+  .metric-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--text, #0f172a);
+  }
+
+  .metric-value.positive {
+    color: #10b981;
+  }
+
+  .metric-value.negative {
+    color: #ef4444;
+  }
+
+  .chart-container {
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    min-height: 300px;
+  }
+
+  .chart-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text, #0f172a);
+    margin-bottom: 12px;
+  }
+
+  #equityChart {
+    width: 100%;
+    height: 280px;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    background: var(--panel, #ffffff);
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 8px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  }
+
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .table th {
+    background: var(--bg, #f5f7fb);
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text, #0f172a);
+    border-bottom: 1px solid var(--border, #e2e8f0);
+  }
+
+  .table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    color: var(--text, #0f172a);
+  }
+
+  .table tr:hover {
+    background: var(--bg, #f5f7fb);
+  }
+
+  .table th.right, .table td.right {
+    text-align: right;
+  }
+
+  .tag {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(79, 70, 229, 0.1);
+    color: #4f46e5;
+  }
+
+  .tag.positive {
+    background: rgba(16, 185, 129, 0.1);
+    color: #10b981;
+  }
+
+  .tag.negative {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+  }
+
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted, #64748b);
+  }
+
+  .error {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+
+  .success {
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: #10b981;
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+
+  .section-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text, #0f172a);
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 8px;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+    margin-bottom: 16px;
+  }
+
+  .tab {
+    padding: 10px 16px;
+    border: none;
+    background: none;
+    color: var(--muted, #64748b);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s ease;
+  }
+
+  .tab.active {
+    color: #4f46e5;
+    border-bottom-color: #4f46e5;
+  }
+
+  .tab-content {
+    display: none;
+  }
+
+  .tab-content.active {
+    display: block;
+  }
+
+  .heatmap-container {
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 4px;
+    margin-top: 12px;
+  }
+
+  .heatmap-cell {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: help;
+    background: #f5f7fb;
+    color: #64748b;
+  }
+
+  .heatmap-cell.positive {
+    background: rgba(16, 185, 129, 0.3);
+    color: #10b981;
+  }
+
+  .heatmap-cell.negative {
+    background: rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+  }
+
+  .optimization-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .optimization-table th, .optimization-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border, #e2e8f0);
+  }
+
+  .optimization-table th {
+    background: var(--bg, #f5f7fb);
+    font-weight: 600;
+    color: var(--text, #0f172a);
+  }
+
+  .optimization-table tr:hover {
+    background: var(--bg, #f5f7fb);
+  }
+
+  @media (max-width: 1200px) {
+    .backtest-container {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(0, 0, 0, 0.1);
+    border-radius: 50%;
+    border-top-color: #4f46e5;
+    animation: spin 0.6s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>
+
+<div class="page">
+  <div class="page-head">
+    <div>
+      <div class="h1">Backtest Engine</div>
+      <div class="muted">Test strategies on historical data</div>
+    </div>
+  </div>
+
+  <div class="backtest-container">
+    <!-- Left Panel: Settings -->
+    <div class="settings-panel">
+      <div id="settingsError" class="error" style="display: none;"></div>
+
+      <!-- Symbol & Strategy -->
+      <div class="settings-section">
+        <label class="settings-label">Symbol</label>
+        <input type="text" id="symbol" class="form-input" value="BTC/USD" placeholder="e.g., BTC/USD, AAPL">
+
+        <label class="settings-label" style="margin-top: 12px;">Strategy</label>
+        <select id="strategy" class="form-select">
+          <option value="dca">DCA with Safety Orders</option>
+          <option value="trend_follow">Trend Following (EMA)</option>
+          <option value="mean_reversion">Mean Reversion (BB)</option>
+          <option value="momentum">Momentum (Breakout)</option>
+          <option value="grid">Grid Trading</option>
+        </select>
+      </div>
+
+      <!-- Date Range -->
+      <div class="settings-section">
+        <label class="settings-label">Historical Data</label>
+        <div class="radio-group">
+          <div class="radio-option">
+            <input type="radio" id="days30" name="days" value="30" checked>
+            <label for="days30">Last 30 days</label>
+          </div>
+          <div class="radio-option">
+            <input type="radio" id="days90" name="days" value="90">
+            <label for="days90">Last 90 days</label>
+          </div>
+          <div class="radio-option">
+            <input type="radio" id="days180" name="days" value="180">
+            <label for="days180">Last 180 days</label>
+          </div>
+          <div class="radio-option">
+            <input type="radio" id="days365" name="days" value="365">
+            <label for="days365">Last 365 days</label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Strategy Parameters -->
+      <div class="settings-section">
+        <label class="settings-label">Parameters</label>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">Base Order ($)</label>
+          <input type="number" id="baseQuote" class="form-input" value="100" step="10" min="1">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">Take Profit (%)</label>
+          <input type="number" id="tpPct" class="form-input" value="1.5" step="0.1" min="0.1">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">Stop Loss (%, 0 = off)</label>
+          <input type="number" id="slPct" class="form-input" value="0" step="0.1" min="0">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">Max Safety Orders</label>
+          <input type="number" id="maxSafety" class="form-input" value="5" step="1" min="0" max="20">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">Safety Order Size ($)</label>
+          <input type="number" id="safetyQuote" class="form-input" value="25" step="5" min="1">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">RSI Period</label>
+          <input type="number" id="rsiPeriod" class="form-input" value="14" step="1" min="5" max="50">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">EMA Fast</label>
+          <input type="number" id="emaFast" class="form-input" value="20" step="1" min="5" max="100">
+        </div>
+
+        <div class="form-group">
+          <label style="font-size: 12px; display: block; margin-bottom: 4px;">EMA Slow</label>
+          <input type="number" id="emaSlow" class="form-input" value="50" step="1" min="5" max="200">
+        </div>
+      </div>
+
+      <!-- Buttons -->
+      <div class="button-group">
+        <button id="runBtn" class="btn btn-primary" onclick="runBacktest()">Run Backtest</button>
+        <button id="optimizeBtn" class="btn btn-secondary" onclick="showOptimizeDialog()">Optimize</button>
+      </div>
+    </div>
+
+    <!-- Right Panel: Results -->
+    <div class="results-panel">
+      <div id="loadingIndicator" class="loading" style="display: none;">
+        <div class="spinner"></div>
+        <div style="margin-top: 12px;">Running backtest...</div>
+      </div>
+
+      <div id="resultsContainer" style="display: none;">
+        <!-- Metrics -->
+        <div>
+          <div class="section-title">Key Metrics</div>
+          <div class="metrics-row">
+            <div class="metric-card">
+              <div class="metric-label">Total Return</div>
+              <div class="metric-value" id="metricReturn">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Win Rate</div>
+              <div class="metric-value" id="metricWinRate">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Max Drawdown</div>
+              <div class="metric-value negative" id="metricDrawdown">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Sharpe Ratio</div>
+              <div class="metric-value" id="metricSharpe">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Profit Factor</div>
+              <div class="metric-value" id="metricProfitFactor">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Total Trades</div>
+              <div class="metric-value" id="metricTrades">-</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Equity Curve Chart -->
+        <div class="chart-container">
+          <div class="chart-title">Equity Curve</div>
+          <canvas id="equityChart"></canvas>
+        </div>
+
+        <!-- Tabs -->
+        <div>
+          <div class="tabs">
+            <button class="tab active" onclick="switchTab('trades')">Trades</button>
+            <button class="tab" onclick="switchTab('monthly')">Monthly Returns</button>
+            <button class="tab" onclick="switchTab('monte')">Monte Carlo</button>
+          </div>
+
+          <!-- Trades Tab -->
+          <div id="tradesTab" class="tab-content active">
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Entry Date</th>
+                    <th>Exit Date</th>
+                    <th class="right">Entry Price</th>
+                    <th class="right">Exit Price</th>
+                    <th class="right">P&L ($)</th>
+                    <th class="right">P&L (%)</th>
+                    <th class="right">Duration (h)</th>
+                  </tr>
+                </thead>
+                <tbody id="tradesTable">
+                  <tr>
+                    <td colspan="7" class="loading">No trades yet</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Monthly Returns Tab -->
+          <div id="monthlyTab" class="tab-content">
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Month</th>
+                    <th class="right">Return (%)</th>
+                  </tr>
+                </thead>
+                <tbody id="monthlyTable">
+                  <tr>
+                    <td colspan="2" class="loading">No monthly data</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Monte Carlo Tab -->
+          <div id="monteTab" class="tab-content">
+            <div class="metric-card">
+              <div class="metric-label">Run Monte Carlo Simulation</div>
+              <button class="btn btn-primary" style="margin-top: 8px; width: 100%;" onclick="runMonteCarlo()">Simulate (1000 runs)</button>
+            </div>
+            <div id="monteResults" style="margin-top: 16px;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Optimize Dialog -->
+<div id="optimizeModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+  <div style="background: var(--panel, #ffffff); border-radius: 8px; padding: 24px; max-width: 500px; width: 90%;">
+    <div style="font-size: 18px; font-weight: 700; margin-bottom: 16px;">Parameter Optimization</div>
+    <p style="font-size: 13px; color: var(--muted, #64748b); margin-bottom: 16px;">Test multiple parameter combinations and find the best Sharpe ratio.</p>
+
+    <div style="margin-bottom: 16px;">
+      <label style="font-size: 12px; display: block; margin-bottom: 8px; font-weight: 600;">Base Quote Range ($)</label>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <input type="number" id="optBaseQuoteMin" class="form-input" value="50" placeholder="Min">
+        <input type="number" id="optBaseQuoteMax" class="form-input" value="200" placeholder="Max">
+        <input type="number" id="optBaseQuoteStep" class="form-input" value="50" placeholder="Step" style="grid-column: 1 / -1;">
+      </div>
+    </div>
+
+    <div style="margin-bottom: 16px;">
+      <label style="font-size: 12px; display: block; margin-bottom: 8px; font-weight: 600;">Take Profit Range (%)</label>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <input type="number" id="optTpMin" class="form-input" value="0.5" placeholder="Min">
+        <input type="number" id="optTpMax" class="form-input" value="3" placeholder="Max">
+        <input type="number" id="optTpStep" class="form-input" value="0.5" placeholder="Step" style="grid-column: 1 / -1;">
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 8px; justify-content: flex-end;">
+      <button class="btn btn-secondary" onclick="document.getElementById('optimizeModal').style.display = 'none';">Cancel</button>
+      <button class="btn btn-primary" onclick="startOptimization();">Start Optimization</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+  let lastBacktestResult = null;
+
+  function getParams() {
+    return {
+      symbol: document.getElementById('symbol').value,
+      strategy: document.getElementById('strategy').value,
+      days: parseInt(document.querySelector('input[name="days"]:checked').value),
+      params: {
+        base_quote: parseFloat(document.getElementById('baseQuote').value),
+        tp_pct: parseFloat(document.getElementById('tpPct').value),
+        sl_pct: parseFloat(document.getElementById('slPct').value),
+        max_safety: parseInt(document.getElementById('maxSafety').value),
+        safety_quote: parseFloat(document.getElementById('safetyQuote').value),
+        rsi_period: parseInt(document.getElementById('rsiPeriod').value),
+        ema_fast: parseInt(document.getElementById('emaFast').value),
+        ema_slow: parseInt(document.getElementById('emaSlow').value),
+      }
+    };
+  }
+
+  function showError(msg) {
+    const err = document.getElementById('settingsError');
+    err.textContent = msg;
+    err.style.display = 'block';
+    setTimeout(() => { err.style.display = 'none'; }, 5000);
+  }
+
+  function formatNumber(n, decimals = 2) {
+    return parseFloat(n).toFixed(decimals);
+  }
+
+  function formatDate(ts) {
+    return new Date(ts * 1000).toLocaleDateString();
+  }
+
+  async function runBacktest() {
+    const params = getParams();
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+
+    document.getElementById('loadingIndicator').style.display = 'block';
+    document.getElementById('resultsContainer').style.display = 'none';
+
+    try {
+      const res = await fetch('/api/backtest/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+
+      const data = await res.json();
+
+      if (!data.ok) {
+        showError(data.error || 'Backtest failed');
+        return;
+      }
+
+      lastBacktestResult = data.result;
+      displayResults(data.result);
+
+    } catch (e) {
+      showError(e.message);
+    } finally {
+      document.getElementById('loadingIndicator').style.display = 'none';
+      btn.disabled = false;
+    }
+  }
+
+  function displayResults(result) {
+    // Metrics
+    const returnClass = result.total_return_pct >= 0 ? 'positive' : 'negative';
+    document.getElementById('metricReturn').innerHTML = `<span class="${returnClass}">${formatNumber(result.total_return_pct)}%</span>`;
+    document.getElementById('metricWinRate').textContent = `${formatNumber(result.win_rate)}%`;
+    document.getElementById('metricDrawdown').textContent = `${formatNumber(result.max_drawdown_pct)}%`;
+    document.getElementById('metricSharpe').textContent = formatNumber(result.sharpe_ratio, 2);
+    document.getElementById('metricProfitFactor').textContent = formatNumber(result.profit_factor, 2);
+    document.getElementById('metricTrades').textContent = result.total_trades;
+
+    // Equity curve
+    drawEquityCurve(result.equity_curve);
+
+    // Trades table
+    const tbody = document.getElementById('tradesTable');
+    tbody.innerHTML = result.trades.length ? result.trades.map(t => `
+      <tr>
+        <td>${formatDate(t.entry_time)}</td>
+        <td>${formatDate(t.exit_time)}</td>
+        <td class="right mono">${formatNumber(t.entry_price, 2)}</td>
+        <td class="right mono">${formatNumber(t.exit_price, 2)}</td>
+        <td class="right mono ${t.pnl_usd >= 0 ? 'positive' : 'negative'}">${formatNumber(t.pnl_usd, 2)}</td>
+        <td class="right mono ${t.pnl_pct >= 0 ? 'positive' : 'negative'}">${formatNumber(t.pnl_pct, 2)}%</td>
+        <td class="right mono">${formatNumber(t.duration_hours, 1)}</td>
+      </tr>
+    `).join('') : '<tr><td colspan="7" class="loading">No trades</td></tr>';
+
+    // Monthly returns
+    const mtbody = document.getElementById('monthlyTable');
+    mtbody.innerHTML = Object.entries(result.monthly_returns).length ? Object.entries(result.monthly_returns).map(([month, ret]) => `
+      <tr>
+        <td>${month}</td>
+        <td class="right mono ${ret >= 0 ? 'positive' : 'negative'}">${formatNumber(ret, 2)}%</td>
+      </tr>
+    `).join('') : '<tr><td colspan="2" class="loading">No monthly data</td></tr>';
+
+    document.getElementById('resultsContainer').style.display = 'block';
+  }
+
+  function drawEquityCurve(equityCurve) {
+    const canvas = document.getElementById('equityChart');
+    const ctx = canvas.getContext('2d');
+
+    if (!equityCurve || equityCurve.length === 0) return;
+
+    canvas.width = canvas.parentElement.offsetWidth - 32;
+    canvas.height = 280;
+
+    const minEq = Math.min(...equityCurve.map(e => e.value));
+    const maxEq = Math.max(...equityCurve.map(e => e.value));
+    const range = maxEq - minEq || 1;
+    const padding = 40;
+
+    // Draw background
+    ctx.fillStyle = 'var(--panel, #ffffff)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw grid
+    ctx.strokeStyle = 'var(--border, #e2e8f0)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 5; i++) {
+      const y = padding + (i / 4) * (canvas.height - padding * 2);
+      ctx.beginPath();
+      ctx.moveTo(padding, y);
+      ctx.lineTo(canvas.width - padding, y);
+      ctx.stroke();
+    }
+
+    // Draw line
+    ctx.strokeStyle = '#4f46e5';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    for (let i = 0; i < equityCurve.length; i++) {
+      const x = padding + (i / (equityCurve.length - 1)) * (canvas.width - padding * 2);
+      const y = canvas.height - padding - ((equityCurve[i].value - minEq) / range) * (canvas.height - padding * 2);
+
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+
+    ctx.stroke();
+
+    // Draw axes
+    ctx.strokeStyle = '#64748b';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padding, padding);
+    ctx.lineTo(padding, canvas.height - padding);
+    ctx.lineTo(canvas.width - padding, canvas.height - padding);
+    ctx.stroke();
+
+    // Draw labels
+    ctx.fillStyle = '#64748b';
+    ctx.font = '11px system-ui';
+    ctx.textAlign = 'right';
+    for (let i = 0; i < 5; i++) {
+      const val = minEq + (i / 4) * range;
+      const y = canvas.height - padding - (i / 4) * (canvas.height - padding * 2);
+      ctx.fillText('$' + formatNumber(val, 0), padding - 8, y + 4);
+    }
+  }
+
+  function switchTab(tabName) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+
+    event.target.classList.add('active');
+    document.getElementById(tabName + 'Tab').classList.add('active');
+  }
+
+  async function runMonteCarlo() {
+    if (!lastBacktestResult || !lastBacktestResult.trades.length) {
+      showError('Run a backtest first');
+      return;
+    }
+
+    const div = document.getElementById('monteResults');
+    div.innerHTML = '<div class="loading"><div class="spinner"></div><div style="margin-top: 12px;">Running 1000 simulations...</div></div>';
+
+    try {
+      const res = await fetch('/api/backtest/monte_carlo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          trades: lastBacktestResult.trades,
+          n_simulations: 1000
+        })
+      });
+
+      const data = await res.json();
+
+      if (!data.ok) {
+        div.innerHTML = `<div class="error">${data.error}</div>`;
+        return;
+      }
+
+      const r = data.results;
+      div.innerHTML = `
+        <div class="metrics-row">
+          <div class="metric-card">
+            <div class="metric-label">Median Return</div>
+            <div class="metric-value ${r.median_return >= 0 ? 'positive' : 'negative'}">$${formatNumber(r.median_return)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Best Return</div>
+            <div class="metric-value positive">$${formatNumber(r.best_return)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Worst Return</div>
+            <div class="metric-value negative">$${formatNumber(r.worst_return)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">5th Percentile</div>
+            <div class="metric-value ${r.p5_return >= 0 ? 'positive' : 'negative'}">$${formatNumber(r.p5_return)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">95th Percentile</div>
+            <div class="metric-value ${r.p95_return >= 0 ? 'positive' : 'negative'}">$${formatNumber(r.p95_return)}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Worst Drawdown</div>
+            <div class="metric-value negative">${formatNumber(r.worst_drawdown)}%</div>
+          </div>
+        </div>
+      `;
+
+    } catch (e) {
+      div.innerHTML = `<div class="error">${e.message}</div>`;
+    }
+  }
+
+  function showOptimizeDialog() {
+    document.getElementById('optimizeModal').style.display = 'flex';
+  }
+
+  async function startOptimization() {
+    const params = getParams();
+    params.param_grid = {
+      base_quote: generateRange(
+        parseFloat(document.getElementById('optBaseQuoteMin').value),
+        parseFloat(document.getElementById('optBaseQuoteMax').value),
+        parseFloat(document.getElementById('optBaseQuoteStep').value)
+      ),
+      tp_pct: generateRange(
+        parseFloat(document.getElementById('optTpMin').value),
+        parseFloat(document.getElementById('optTpMax').value),
+        parseFloat(document.getElementById('optTpStep').value)
+      )
+    };
+
+    document.getElementById('optimizeModal').style.display = 'none';
+    document.getElementById('loadingIndicator').style.display = 'block';
+    document.getElementById('resultsContainer').style.display = 'none';
+
+    try {
+      const res = await fetch('/api/backtest/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+      });
+
+      const data = await res.json();
+
+      if (!data.ok) {
+        showError(data.error || 'Optimization failed');
+        return;
+      }
+
+      displayOptimizationResults(data);
+
+    } catch (e) {
+      showError(e.message);
+    } finally {
+      document.getElementById('loadingIndicator').style.display = 'none';
+    }
+  }
+
+  function generateRange(min, max, step) {
+    const arr = [];
+    for (let i = min; i <= max; i += step) {
+      arr.push(parseFloat(i.toFixed(2)));
+    }
+    return arr;
+  }
+
+  function displayOptimizationResults(data) {
+    const resultsDiv = document.getElementById('resultsContainer');
+    resultsDiv.innerHTML = `
+      <div class="section-title">Optimization Results</div>
+      <p style="font-size: 13px; color: var(--muted, #64748b); margin-bottom: 16px;">
+        Tested ${data.total_combinations} combinations. Top 10 by Sharpe ratio:
+      </p>
+      <div class="table-wrap">
+        <table class="optimization-table">
+          <thead>
+            <tr>
+              <th>Base Quote</th>
+              <th>TP %</th>
+              <th class="right">Sharpe</th>
+              <th class="right">Return %</th>
+              <th class="right">Win Rate</th>
+              <th class="right">Drawdown</th>
+              <th class="right">Trades</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.top_results.map(r => `
+              <tr>
+                <td>$${formatNumber(r.params.base_quote, 0)}</td>
+                <td>${formatNumber(r.params.tp_pct, 2)}%</td>
+                <td class="right">${formatNumber(r.sharpe_ratio, 2)}</td>
+                <td class="right ${r.total_return_pct >= 0 ? 'positive' : 'negative'}">${formatNumber(r.total_return_pct, 2)}%</td>
+                <td class="right">${formatNumber(r.win_rate, 1)}%</td>
+                <td class="right">${formatNumber(r.max_drawdown_pct, 2)}%</td>
+                <td class="right">${r.total_trades}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+    resultsDiv.style.display = 'block';
+  }
+</script>
+{% endblock %}

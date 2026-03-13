@@ -1352,6 +1352,142 @@ class BreakoutStrategy(StrategyBase):
         return Decision("HOLD", "Breakout position held.", None, {"regime": ctx.regime}, self.name)
 
 
+class MeanReversionStrategy(StrategyBase):
+    name = "mean_reversion"
+
+    def propose_orders(self, ctx: StrategyContext) -> Decision:
+        """
+        Mean Reversion Strategy:
+        - Calculate 20-period SMA and standard deviation
+        - Entry: price drops below SMA - 2*stddev (oversold)
+        - Exit: price returns to SMA (mean)
+        - Position size: ATR-adjusted
+        """
+        candles = ctx.candles_15m
+        if len(candles) < 25:
+            return Decision("HOLD", "Not enough data for mean reversion.", None, {"regime": ctx.regime}, self.name)
+
+        closes = [float(c[4]) for c in candles]
+        sma_val = sma(closes, 20)
+        if sma_val is None or sma_val <= 0:
+            return Decision("HOLD", "SMA unavailable.", None, {"regime": ctx.regime}, self.name)
+
+        # Calculate standard deviation
+        recent_closes = closes[-20:]
+        if len(recent_closes) < 20:
+            return Decision("HOLD", "Insufficient closes for stddev.", None, {"regime": ctx.regime}, self.name)
+
+        try:
+            stddev = statistics.stdev(recent_closes)
+        except Exception:
+            stddev = 0.0
+
+        lower_band = sma_val - (2.0 * stddev)
+        last = ctx.last_price
+        atr_val = _atr(candles, 14) or 0.01
+
+        # No position: look for oversold entry
+        if ctx.deal.position_size <= 0:
+            if last <= lower_band and stddev > 0:
+                base_size = float(ctx.cfg.get("base_quote", 0.0))
+                if last > 0:
+                    size_quote = base_size * (atr_val / (sma_val * 0.02))  # Scale by ATR relative to price
+                else:
+                    size_quote = base_size
+                return Decision(
+                    "ENTER",
+                    f"Mean reversion oversold entry at {last:.2f} (SMA {sma_val:.2f}, lower band {lower_band:.2f}).",
+                    {"side": "buy", "type": "market", "size_quote": size_quote},
+                    {"regime": ctx.regime, "sma": sma_val, "lower_band": lower_band, "stddev": stddev},
+                    self.name,
+                )
+            return Decision("HOLD", "Awaiting oversold condition.", None, {"regime": ctx.regime}, self.name)
+
+        # Have position: exit at SMA (mean reversion target)
+        if last >= sma_val:
+            return Decision(
+                "TAKE_PROFIT",
+                f"Mean reversion target reached at {last:.2f}.",
+                {"side": "sell", "type": "market", "size_base": ctx.deal.position_size},
+                {"regime": ctx.regime, "sma": sma_val},
+                self.name,
+            )
+
+        # Trailing stop at 2x ATR below entry
+        stop_price = (ctx.deal.avg_entry or last) - (atr_val * 2.0)
+        if last <= stop_price:
+            return Decision(
+                "STOP_LOSS",
+                f"Mean reversion stop hit at {last:.2f}.",
+                {"side": "sell", "type": "market", "size_base": ctx.deal.position_size},
+                {"regime": ctx.regime},
+                self.name,
+            )
+
+        return Decision("HOLD", "Mean reversion position held.", None, {"regime": ctx.regime}, self.name)
+
+
+class MomentumStrategy(StrategyBase):
+    name = "momentum"
+
+    def propose_orders(self, ctx: StrategyContext) -> Decision:
+        """
+        Momentum Strategy:
+        - Calculate highest high of last 20 candles
+        - Entry: price breaks above highest high with volume > 1.5x average
+        - Exit: trailing stop at 2x ATR below entry
+        - Only enter in uptrending regime
+        """
+        candles = ctx.candles_15m
+        if len(candles) < 25:
+            return Decision("HOLD", "Not enough data for momentum.", None, {"regime": ctx.regime}, self.name)
+
+        # Check if in uptrending regime
+        if ctx.regime not in ("uptrend", "strong_uptrend", "UPTREND"):
+            return Decision("HOLD", "Momentum requires uptrend regime.", None, {"regime": ctx.regime}, self.name)
+
+        closes = [float(c[4]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        volumes = [float(c[5]) if len(c) > 5 else 0.0 for c in candles]
+
+        # Get highest high of last 20 candles
+        recent_highs = highs[-20:]
+        highest_high = max(recent_highs) if recent_highs else 0.0
+
+        # Calculate average volume (last 20 candles)
+        recent_volumes = volumes[-20:]
+        avg_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 0.0
+
+        last = ctx.last_price
+        current_volume = volumes[-1] if volumes else 0.0
+        atr_val = _atr(candles, 14) or 0.01
+
+        # No position: look for breakout with volume confirmation
+        if ctx.deal.position_size <= 0:
+            if last > highest_high and current_volume > (avg_volume * 1.5) and avg_volume > 0:
+                return Decision(
+                    "ENTER",
+                    f"Momentum breakout at {last:.2f} above highest high {highest_high:.2f} with {current_volume/avg_volume:.1f}x volume.",
+                    {"side": "buy", "type": "market", "size_quote": float(ctx.cfg.get("base_quote", 0.0))},
+                    {"regime": ctx.regime, "highest_high": highest_high, "volume_ratio": current_volume / avg_volume if avg_volume > 0 else 0},
+                    self.name,
+                )
+            return Decision("HOLD", "Awaiting momentum breakout.", None, {"regime": ctx.regime}, self.name)
+
+        # Have position: trailing stop at 2x ATR below entry
+        stop_price = (ctx.deal.avg_entry or last) - (atr_val * 2.0)
+        if last <= stop_price:
+            return Decision(
+                "STOP_LOSS",
+                f"Momentum stop hit at {last:.2f}.",
+                {"side": "sell", "type": "market", "size_base": ctx.deal.position_size},
+                {"regime": ctx.regime},
+                self.name,
+            )
+
+        return Decision("HOLD", "Momentum position held.", None, {"regime": ctx.regime}, self.name)
+
+
 try:
     from scalping_strategy import ScalpingStrategy
     _SCALPING_AVAILABLE = True
@@ -1377,6 +1513,8 @@ STRATEGY_REGISTRY: Dict[str, StrategyBase] = {
     "range_mean_reversion": RangeMeanReversionStrategy(),
     "high_vol_defensive": HighVolDefensiveStrategy(),
     "breakout": BreakoutStrategy(),
+    "mean_reversion": MeanReversionStrategy(),
+    "momentum": MomentumStrategy(),
 }
 if _SCALPING_AVAILABLE and ScalpingStrategy:
     STRATEGY_REGISTRY["scalping"] = ScalpingStrategy()

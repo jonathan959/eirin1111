@@ -79,6 +79,12 @@ except ImportError:
     PortfolioCorrelationAnalyzer = None
 
 try:
+    from anomaly_detector import AnomalyDetector
+    ANOMALY_DETECTOR_AVAILABLE = True
+except ImportError:
+    ANOMALY_DETECTOR_AVAILABLE = False
+
+try:
     from risk_circuit_breaker import check_circuit_breakers, trip_and_alert
 except ImportError:
     check_circuit_breakers = None
@@ -413,6 +419,21 @@ class BotRunner:
         # Initialize Intelligence Layer and Executor
         self.intelligence_layer = IntelligenceLayer()
         self.executor = OrderExecutor(kc)
+        self._anomaly_detector = AnomalyDetector() if ANOMALY_DETECTOR_AVAILABLE else None
+
+    def _check_anomaly_risk(self, symbol: str, candles: list) -> tuple:
+        """Check for market anomalies before trading. Returns (ok_to_trade: bool, risk_info: dict)."""
+        if not self._anomaly_detector or not candles:
+            return True, {}
+        try:
+            assessment = self._anomaly_detector.get_risk_assessment(candles)
+            if assessment.get("should_pause_trading"):
+                return False, assessment
+            # Reduce position size based on anomaly risk
+            return True, assessment
+        except Exception as e:
+            logger.warning("Anomaly check failed for %s: %s", symbol, e)
+            return True, {}
 
     # -----------------
     # State + logging
@@ -915,6 +936,34 @@ class BotRunner:
                     f"profit +{profit_pct*100:.2f}%)"
                 )
                 return True, reason
+        return False, None
+
+    def _check_hard_stop_loss(
+        self,
+        current_price: float,
+        avg_entry: float,
+        hard_sl_pct: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Hard stop loss - closes entire position immediately if price drops X% below entry.
+
+        Args:
+            current_price: Current market price
+            avg_entry: Average entry price (cost basis)
+            hard_sl_pct: Hard stop loss percentage (e.g., 0.05 = 5% below entry)
+
+        Returns:
+            (should_exit, reason_message)
+        """
+        sl_pct = float(hard_sl_pct or 0)  # 0 = disabled
+        if sl_pct <= 0 or avg_entry <= 0 or current_price <= 0:
+            return False, None
+
+        sl_price = avg_entry * (1.0 - sl_pct)
+        if current_price <= sl_price:
+            loss_pct = ((current_price / avg_entry) - 1.0) * 100.0
+            reason = f"Hard stop loss triggered at {loss_pct:.2f}% loss (SL price: ${sl_price:.2f}, current: ${current_price:.2f})"
+            return True, reason
         return False, None
 
     def _check_partial_exit(
@@ -1567,17 +1616,27 @@ class BotRunner:
                     reason = partial_result[2]
                 elif avg_entry and price and float(self.state.base_pos or 0) > 0:
                     self._pending_partial = None
-                    should_exit_ts, ts_reason = self._check_trailing_stop(
-                        price=price, entry=avg_entry, tp_pct=tp_pct_val, dry_run=dry_run,
-                        trailing_activation_pct=float(bot.get("trailing_activation_pct") or 0) or None,
-                        trailing_distance_pct=float(bot.get("trailing_distance_pct") or 0) or None,
+                    # Check hard stop loss FIRST (highest priority safety mechanism)
+                    hard_sl_pct = float(bot.get("hard_sl_pct") or 0)
+                    should_exit_hsl, hsl_reason = self._check_hard_stop_loss(
+                        current_price=price, avg_entry=avg_entry, hard_sl_pct=hard_sl_pct
                     )
-                    if should_exit_ts and ts_reason:
-                        mapped_action = "TRAILING_EXIT"
-                        reason = ts_reason
+                    if should_exit_hsl and hsl_reason:
+                        mapped_action = "HARD_STOP_LOSS"
+                        reason = hsl_reason
+                    else:
+                        # Then check trailing stop
+                        should_exit_ts, ts_reason = self._check_trailing_stop(
+                            price=price, entry=avg_entry, tp_pct=tp_pct_val, dry_run=dry_run,
+                            trailing_activation_pct=float(bot.get("trailing_activation_pct") or 0) or None,
+                            trailing_distance_pct=float(bot.get("trailing_distance_pct") or 0) or None,
+                        )
+                        if should_exit_ts and ts_reason:
+                            mapped_action = "TRAILING_EXIT"
+                            reason = ts_reason
                 else:
                     self._pending_partial = None
-                
+
                 # Fallback to smart_decide logic for TP if Intelligence didn't explicitly trigger an exit?
                 # Actually, legacy smart_decide handled TP internally via 'tp_price'.
                 # We need to make sure handle TP logic is preserved.
@@ -2933,7 +2992,16 @@ class BotRunner:
                             self._notify_discord(f"⚠️ {self._bot_label()}: {block_msg}", force=True)
                     # Still execute trade management actions
                     if intel_decision.trade_management.manage_actions:
-                        exec_result = self.executor.execute_decision(intel_decision, self.bot_id, symbol, dry_run)
+                        try:
+                            exec_result = self.executor.execute_decision(
+                                intel_decision, self.bot_id, symbol, dry_run,
+                                candles_1h=candles_1h or [],
+                                candles_4h=candles_4h or [],
+                                candles_1d=candles_1d or [],
+                            )
+                        except Exception as e:
+                            self._set(f"Execute decision error: {e}", "ERROR", "EXECUTOR")
+                            exec_result = {"errors": [str(e)], "orders_placed": []}
                         if exec_result.get("errors"):
                             for err in exec_result["errors"]:
                                 # Don't log market closed as ERROR
@@ -3100,9 +3168,22 @@ class BotRunner:
                         proposed_order_usd=order_size_usd,
                         is_safety_order=is_safety,
                     )
+
+                    # Check for anomalies before entry
+                    if hasattr(self, '_anomaly_detector') and self._anomaly_detector:
+                        ok_to_trade, risk_info = self._check_anomaly_risk(symbol, candles_1h)
+                        if not ok_to_trade:
+                            self._set(f"Anomaly detector paused trading: {risk_info.get('risk_level', 'unknown')} risk", "WARN", "INTEL")
+                            add_log(self.bot_id, f"Trading paused by anomaly detector: {risk_info.get('anomaly_count', 0)} anomalies detected", "INTEL")
+                            time.sleep(poll)
+                            continue
+
                     exec_result = self.executor.execute_decision(
                         intel_decision, self.bot_id, symbol, dry_run,
                         risk_context=risk_ctx,
+                        candles_1h=candles_1h or [],
+                        candles_4h=candles_4h or [],
+                        candles_1d=candles_1d or [],
                     )
                     
                     if exec_result.get("errors"):

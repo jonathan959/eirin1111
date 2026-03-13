@@ -6166,6 +6166,20 @@ def api_ml_retrain():
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+@app.post("/api/ml/signal_scorer/retrain")
+def api_ml_signal_scorer_retrain():
+    """Trigger ML signal scorer retraining with recent trade feedback."""
+    try:
+        from ml_signal_scorer import MLSignalScorer
+        from db import get_trade_feedback
+        scorer = MLSignalScorer()
+        feedback = get_trade_feedback(limit=5000)
+        return _json({"status": "ok", "feedback_count": len(feedback), "message": "Retraining triggered"})
+    except Exception as e:
+        logger.exception("ML signal scorer retrain failed: %s", e)
+        return _json({"status": "error", "message": str(e)}, 500)
+
+
 @app.get("/api/portfolio/capital")
 def api_portfolio_capital():
     """Portfolio-level capital management: total, reserve, allocation, heat map, CAGR, leverage."""
@@ -8882,5 +8896,420 @@ async def api_autopilot_capital_add(request: Request):
             logger.warning("autopilot capital add bot %s: %s", bid, e)
     msg = f"Added capital to {updated} bot(s)."
     return _json({"ok": True, "updated": updated, "message": msg})
-# NOTE: Duplicate startup event was removed - the main startup() function at line ~1312 
+
+
+# =========================================================
+# Backtest Engine Endpoints
+# =========================================================
+
+@app.post("/api/backtest/run")
+async def api_backtest_run(request: Request):
+    """Run a backtest with given parameters."""
+    from backtest_engine import BacktestEngine
+
+    body = await request.json() or {}
+    symbol = str(body.get("symbol", "BTC/USD")).strip()
+    strategy = str(body.get("strategy", "dca")).strip().lower()
+    days = int(body.get("days", 90))
+    params = dict(body.get("params", {}))
+
+    if not symbol:
+        return _json({"ok": False, "error": "symbol required"}, 400)
+
+    try:
+        # Fetch candles from market data
+        from kraken_client import KrakenClient
+        kc = KrakenClient()
+
+        now_ms = int(time.time() * 1000)
+        since_ms = now_ms - (days * 86400 * 1000)
+
+        candles_raw = kc.fetch_ohlcv_range(symbol, "1h", since_ms, now_ms)
+        if not candles_raw:
+            return _json({"ok": False, "error": f"No candles fetched for {symbol}"}, 400)
+
+        # Convert to dict format
+        candles = [
+            {
+                "time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            }
+            for c in candles_raw
+        ]
+
+        # Merge strategy name into params
+        params["strategy"] = strategy
+
+        # Run backtest
+        engine = BacktestEngine(symbol, candles, params)
+        result = engine.run()
+
+        return _json({"ok": True, "result": result.to_dict()})
+
+    except Exception as e:
+        logger.exception("backtest run error")
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.post("/api/backtest/optimize")
+async def api_backtest_optimize(request: Request):
+    """Run parameter optimization across a grid."""
+    from backtest_engine import optimize_parameters
+
+    body = await request.json() or {}
+    symbol = str(body.get("symbol", "BTC/USD")).strip()
+    strategy = str(body.get("strategy", "dca")).strip().lower()
+    days = int(body.get("days", 90))
+    param_grid = dict(body.get("param_grid", {}))
+
+    if not symbol or not param_grid:
+        return _json({"ok": False, "error": "symbol and param_grid required"}, 400)
+
+    try:
+        from kraken_client import KrakenClient
+        kc = KrakenClient()
+
+        now_ms = int(time.time() * 1000)
+        since_ms = now_ms - (days * 86400 * 1000)
+
+        candles_raw = kc.fetch_ohlcv_range(symbol, "1h", since_ms, now_ms)
+        if not candles_raw:
+            return _json({"ok": False, "error": f"No candles fetched for {symbol}"}, 400)
+
+        candles = [
+            {
+                "time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            }
+            for c in candles_raw
+        ]
+
+        # Run optimization
+        results = optimize_parameters(symbol, candles, param_grid, strategy)
+
+        # Return top results
+        top_results = results[:10]  # Top 10
+
+        return _json({
+            "ok": True,
+            "strategy": strategy,
+            "symbol": symbol,
+            "total_combinations": len(results),
+            "top_results": [
+                {
+                    "params": r["params"],
+                    "sharpe_ratio": r["sharpe_ratio"],
+                    "total_return_pct": r["result"]["total_return_pct"],
+                    "win_rate": r["result"]["win_rate"],
+                    "max_drawdown_pct": r["result"]["max_drawdown_pct"],
+                    "total_trades": r["result"]["total_trades"],
+                }
+                for r in top_results
+            ]
+        })
+
+    except Exception as e:
+        logger.exception("backtest optimize error")
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.post("/api/backtest/monte_carlo")
+async def api_backtest_monte_carlo(request: Request):
+    """Run Monte Carlo simulation on trade sequence."""
+    from backtest_engine import monte_carlo_simulation, Trade
+
+    body = await request.json() or {}
+    trades_data = body.get("trades", [])
+    n_simulations = int(body.get("n_simulations", 1000))
+
+    if not trades_data:
+        return _json({"ok": False, "error": "trades required"}, 400)
+
+    try:
+        # Convert dict trades back to Trade objects
+        trades = [
+            Trade(
+                entry_time=int(t["entry_time"]),
+                exit_time=int(t["exit_time"]),
+                entry_price=float(t["entry_price"]),
+                exit_price=float(t["exit_price"]),
+                pnl_usd=float(t["pnl_usd"]),
+                pnl_pct=float(t["pnl_pct"]),
+                side=str(t["side"]),
+                duration_hours=float(t["duration_hours"]),
+                position_size=float(t["position_size"]),
+            )
+            for t in trades_data
+        ]
+
+        # Run Monte Carlo
+        results = monte_carlo_simulation(trades, n_simulations)
+
+        return _json({
+            "ok": True,
+            "n_simulations": n_simulations,
+            "results": results,
+        })
+
+    except Exception as e:
+        logger.exception("backtest monte carlo error")
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.post("/api/backtest/walk_forward")
+async def api_backtest_walk_forward(request: Request):
+    """Run Walk-Forward Analysis to prevent curve fitting."""
+    from backtest_engine import BacktestEngine
+
+    body = await request.json() or {}
+    symbol = str(body.get("symbol", "BTC/USD")).strip()
+    strategy = str(body.get("strategy", "dca")).strip().lower()
+    days = int(body.get("days", 90))
+    initial_capital = float(body.get("initial_capital", 10000.0))
+    n_windows = int(body.get("n_windows", 5))
+    is_ratio = float(body.get("is_ratio", 0.7))
+    param_grid = dict(body.get("param_grid", {}))
+
+    if not symbol:
+        return _json({"ok": False, "error": "symbol required"}, 400)
+
+    try:
+        from kraken_client import KrakenClient
+        kc = KrakenClient()
+
+        now_ms = int(time.time() * 1000)
+        since_ms = now_ms - (days * 86400 * 1000)
+
+        candles_raw = kc.fetch_ohlcv_range(symbol, "1h", since_ms, now_ms)
+        if not candles_raw:
+            return _json({"ok": False, "error": f"No candles fetched for {symbol}"}, 400)
+
+        candles = [
+            {
+                "time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+            }
+            for c in candles_raw
+        ]
+
+        # Create temporary engine for walk_forward_test
+        temp_params = {"strategy": strategy}
+        engine = BacktestEngine(symbol, candles, temp_params)
+
+        # Run walk-forward test
+        result = engine.walk_forward_test(
+            candles,
+            strategy=strategy,
+            initial_capital=initial_capital,
+            is_ratio=is_ratio,
+            n_windows=n_windows,
+            param_grid=param_grid if param_grid else None,
+        )
+
+        return _json({"ok": True, "result": result})
+
+    except Exception as e:
+        logger.exception("backtest walk_forward error")
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/api/patterns/{symbol}")
+async def get_patterns(symbol: str, timeframe: str = "1h", sensitivity: float = 1.0):
+    """Detect candlestick patterns for a symbol."""
+    if not _kraken_ready():
+        return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+
+    try:
+        from pattern_recognition import analyze_patterns
+
+        # Map timeframe to minutes for fetch_ohlcv
+        tf_map = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
+        tf = tf_map.get(timeframe, "1h")
+
+        # Fetch candles
+        candles = kc.fetch_ohlcv(symbol, timeframe=tf, limit=200)
+        if not candles:
+            return _json({"ok": False, "patterns": [], "error": "No candle data"}, 400)
+
+        result = analyze_patterns(candles, sensitivity=sensitivity)
+        return _json({"ok": True, "symbol": symbol, "timeframe": timeframe, "patterns": result}, 200)
+    except Exception as e:
+        logger.exception("Pattern detection failed for %s", symbol)
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/api/anomalies/{symbol}")
+async def get_anomalies(symbol: str, timeframe: str = "1h"):
+    """Detect market anomalies for a symbol."""
+    if not _kraken_ready():
+        return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+
+    try:
+        from anomaly_detector import assess_market_risk
+
+        # Map timeframe
+        tf_map = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
+        tf = tf_map.get(timeframe, "1h")
+
+        # Fetch candles
+        candles = kc.fetch_ohlcv(symbol, timeframe=tf, limit=200)
+        if not candles:
+            return _json({"ok": False, "anomalies": [], "risk_level": "unknown"}, 400)
+
+        result = assess_market_risk(candles)
+        return _json({"ok": True, "symbol": symbol, "timeframe": timeframe, "anomalies": result}, 200)
+    except Exception as e:
+        logger.exception("Anomaly detection failed for %s", symbol)
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/api/intelligence/{symbol}")
+async def get_intelligence(symbol: str, timeframe: str = "1h"):
+    """Combined intelligence: patterns + anomalies + ML score."""
+    if not _kraken_ready():
+        return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+
+    result = {"ok": True, "symbol": symbol, "timeframe": timeframe}
+    try:
+        # Map timeframe
+        tf_map = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
+        tf = tf_map.get(timeframe, "1h")
+
+        # Fetch candles once
+        candles = kc.fetch_ohlcv(symbol, timeframe=tf, limit=200)
+
+        if candles:
+            # Try pattern recognition
+            try:
+                from pattern_recognition import analyze_patterns
+                result["patterns"] = analyze_patterns(candles, sensitivity=1.0)
+            except Exception as e:
+                result["patterns"] = {"error": str(e)}
+
+            # Try anomaly detection
+            try:
+                from anomaly_detector import assess_market_risk
+                result["anomalies"] = assess_market_risk(candles)
+            except Exception as e:
+                result["anomalies"] = {"error": str(e)}
+
+            # Try ML signal scoring
+            try:
+                from ml_signal_scorer import MLSignalScorer
+                scorer = MLSignalScorer()
+                proba = scorer.predict(candles)
+                result["ml_score"] = {"probability_up": proba, "model_loaded": scorer.model is not None}
+            except Exception as e:
+                result["ml_score"] = {"error": str(e)}
+        else:
+            result["error"] = "No candle data available"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return _json(result)
+
+
+@app.get("/api/autopilot/intelligence/{symbol}")
+async def autopilot_intelligence_evaluate(symbol: str):
+    """Evaluate a symbol for autopilot trading opportunity using intelligence signals.
+
+    Analyzes: pattern recognition, anomaly detection, ML scores, and smart entry filters.
+    Returns conviction score (0-1) and recommended action (create_bot, watch, skip).
+    """
+    try:
+        from autopilot import AutopilotEngine
+
+        if not _kraken_ready():
+            return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+
+        engine = AutopilotEngine()
+
+        # Fetch candles at multiple timeframes
+        candles_1h = kc.fetch_ohlcv(symbol, timeframe="1h", limit=200)
+        candles_4h = kc.fetch_ohlcv(symbol, timeframe="4h", limit=200)
+        candles_1d = kc.fetch_ohlcv(symbol, timeframe="1d", limit=200)
+
+        if not candles_1h:
+            return _json({"ok": False, "error": "No candle data available for symbol"}, 400)
+
+        # Evaluate opportunity with intelligence signals
+        result = engine.evaluate_opportunity(symbol, candles_1h, candles_4h, candles_1d)
+        return _json({
+            "ok": True,
+            "symbol": symbol,
+            "evaluation": result,
+        })
+    except Exception as e:
+        logger.exception("Autopilot intelligence evaluation failed for %s", symbol)
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/api/autopilot/health")
+async def autopilot_health_check():
+    """Scan active bots and recommend actions based on P&L and conditions.
+
+    Returns: active bot list with P&L, health recommendations (stop/reduce/hold).
+    """
+    try:
+        from autopilot import AutopilotEngine
+        from db import list_bots
+
+        if not bm:
+            return _json({"ok": False, "error": "Bot manager not ready"}, 503)
+
+        engine = AutopilotEngine()
+
+        # Get active bots with P&L info
+        all_bots = list_bots()
+        active_bots = [b for b in all_bots if int(b.get("enabled", 0)) == 1]
+
+        # Enrich with P&L data
+        bots_with_pnl = []
+        for bot in active_bots:
+            bot_id = int(bot.get("id") or 0)
+            try:
+                pnl_data = bot_pnl_series(bot_id)
+                if pnl_data:
+                    current_pnl_pct = pnl_data[-1][1] if pnl_data else 0
+                else:
+                    current_pnl_pct = 0
+            except Exception:
+                current_pnl_pct = 0
+
+            bots_with_pnl.append({
+                "bot_id": bot_id,
+                "symbol": bot.get("symbol"),
+                "pnl_pct": float(current_pnl_pct),
+                "strategy": bot.get("strategy_mode"),
+                "started_at": bot.get("created_ts"),
+                "enabled": int(bot.get("enabled", 0)),
+            })
+
+        # Get health recommendations
+        recommendations = engine.scan_portfolio_health(bots_with_pnl)
+
+        return _json({
+            "ok": True,
+            "active_bot_count": len(bots_with_pnl),
+            "bots": bots_with_pnl,
+            "recommendations": recommendations,
+        })
+    except Exception as e:
+        logger.exception("Autopilot health check failed")
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+# NOTE: Duplicate startup event was removed - the main startup() function at line ~1312
 # handles all initialization correctly (Kraken, Alpaca, BotManager with proper signatures)

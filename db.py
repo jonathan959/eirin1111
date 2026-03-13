@@ -23,6 +23,8 @@ _ALLOWED_TABLES = frozenset({
     "autopilot_audit_log",  # LIVE-HARDENED: autopilot decision traceability
     "scanner_watchlist",  # Purposed-entry watchlist: symbols awaiting trigger
     "notifications",  # User-facing notifications: trades, alerts, summaries
+    "audit_log",  # Security and compliance tracking
+    "trade_feedback",  # ML learning from closed trades
 })
 _ALLOWED_COLUMNS = frozenset({"bot_id", "id"})
 
@@ -100,6 +102,7 @@ def init_db() -> None:
             first_dev REAL NOT NULL DEFAULT 0.01,
             step_mult REAL NOT NULL DEFAULT 1.2,
             tp REAL NOT NULL DEFAULT 0.01,
+            hard_sl_pct REAL NOT NULL DEFAULT 0.0,
 
             trend_filter INTEGER NOT NULL DEFAULT 0,
             trend_sma INTEGER NOT NULL DEFAULT 200,
@@ -702,6 +705,36 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);")
 
+    # --- audit log: security and compliance tracking
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            ip TEXT
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);")
+
+    # --- trade_feedback: ML learning from closed trades
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trade_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            features_json TEXT,
+            profitable INTEGER NOT NULL
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_feedback_symbol ON trade_feedback(symbol);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_feedback_profitable ON trade_feedback(profitable);")
+
     # Helpful indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_ts ON bot_logs(bot_id, ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_bot_id ON bot_logs(bot_id);")
@@ -772,7 +805,15 @@ def init_db() -> None:
         # Phase 1: Volatility-Based TP Scaling
         _ensure_column(con, "bots", "adaptive_tp_enabled", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(con, "bots", "tp_volatility_mult", "REAL NOT NULL DEFAULT 1.5")
-        
+
+        # Phase 2: Hard Stop Loss (Emergency Exit)
+        _ensure_column(con, "bots", "hard_sl_pct", "REAL NOT NULL DEFAULT 0.0")
+
+        # Phase 2: Grid Trading Parameters
+        _ensure_column(con, "bots", "grid_lower", "REAL NOT NULL DEFAULT 0.0")
+        _ensure_column(con, "bots", "grid_upper", "REAL NOT NULL DEFAULT 0.0")
+        _ensure_column(con, "bots", "grid_levels", "INTEGER NOT NULL DEFAULT 10")
+
         # Phase 1: BTC Correlation Guard
         _ensure_column(con, "bots", "btc_correlation_guard", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(con, "bots", "btc_dump_threshold_pct", "REAL NOT NULL DEFAULT 0.05")
@@ -1079,6 +1120,7 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
             first_dev=?,
             step_mult=?,
             tp=?,
+            hard_sl_pct=?,
             trend_filter=?,
             trend_sma=?,
             max_spend_quote=?,
@@ -1110,7 +1152,10 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
             conviction_level=?,
             auto_dip_buy=?,
             fundamental_exit_only=?,
-            rebalance_enabled=?
+            rebalance_enabled=?,
+            grid_lower=?,
+            grid_upper=?,
+            grid_levels=?
         WHERE id=?
         """,
         (
@@ -1124,6 +1169,7 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
             float(data["first_dev"]),
             float(data["step_mult"]),
             float(data["tp"]),
+            float(data.get("hard_sl_pct", 0.0)),
             int(data.get("trend_filter", 0)),
             int(data.get("trend_sma", 200)),
             float(data["max_spend_quote"]),
@@ -1156,6 +1202,9 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
             int(data.get("auto_dip_buy", 0)),
             int(data.get("fundamental_exit_only", 0)),
             int(data.get("rebalance_enabled", 0)),
+            float(data.get("grid_lower", 0.0)),
+            float(data.get("grid_upper", 0.0)),
+            int(data.get("grid_levels", 10)),
             int(bot_id),
         ),
     )
@@ -1418,6 +1467,25 @@ def close_deal(
         ),
     )
     con.commit()
+
+    # Record trade feedback for ML learning
+    try:
+        profitable_flag = 1 if (realized_pnl_quote or 0) > 0 else 0
+        # Fetch symbol from deal
+        deal_row = con.execute("SELECT symbol FROM deals WHERE id=?", (int(deal_id),)).fetchone()
+        deal_symbol = deal_row["symbol"] if deal_row else ""
+        import json as _json
+        features = _json.dumps({
+            "entry_avg": float(entry_avg) if entry_avg else 0,
+            "exit_avg": float(exit_avg) if exit_avg else 0,
+            "pnl": float(realized_pnl_quote) if realized_pnl_quote else 0,
+            "exit_strategy": str(exit_strategy or ""),
+            "entry_regime": str(entry_regime or ""),
+            "hold_sec": int(hold_sec) if hold_sec else 0,
+        })
+        record_trade_feedback(deal_symbol, features, profitable_flag)
+    except Exception as fb_err:
+        logger.warning("Failed to record trade feedback on deal close: %s", fb_err)
 
     # Record outcome for recommendation performance tracking (if bot was created from recommendation)
     if bot_id_val and entry_avg is not None and exit_avg is not None and realized_pnl_quote is not None:
@@ -3158,3 +3226,53 @@ def cleanup_old_portfolio_snapshots(keep_days: int = 90) -> int:
         return 0
     finally:
         con.close()
+
+
+def log_audit(action: str, details: str = "", ip: str = "") -> None:
+    """Log an audit event for security and compliance tracking."""
+    try:
+        con = _conn()
+        con.execute(
+            "INSERT INTO audit_log(timestamp, action, details, ip) VALUES (?, ?, ?, ?)",
+            (time.time(), str(action), str(details) if details else None, str(ip) if ip else None),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.warning(f"Failed to log audit event: {e}")
+
+
+def record_trade_feedback(symbol: str, features_json: str = "", profitable: int = 0) -> None:
+    """Record trade outcome for ML model feedback and learning."""
+    try:
+        con = _conn()
+        con.execute(
+            "INSERT INTO trade_feedback(symbol, timestamp, features_json, profitable) VALUES (?, ?, ?, ?)",
+            (str(symbol), time.time(), str(features_json) if features_json else None, int(profitable)),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.warning(f"Failed to record trade feedback: {e}")
+
+
+def get_trade_feedback(symbol: str = "", profitable: Optional[int] = None, limit: int = 1000) -> List[Dict[str, Any]]:
+    """Get recorded trade feedback for ML training."""
+    try:
+        con = _conn()
+        query = "SELECT * FROM trade_feedback WHERE 1=1"
+        params = []
+        if symbol:
+            query += " AND symbol = ?"
+            params.append(str(symbol))
+        if profitable is not None:
+            query += " AND profitable = ?"
+            params.append(int(profitable))
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(int(limit))
+        rows = con.execute(query, params).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"Failed to get trade feedback: {e}")
+        return []

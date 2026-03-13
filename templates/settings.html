@@ -174,6 +174,16 @@
       </div>
 
       <div style="margin-bottom: 16px;">
+        <div class="form-label" style="margin-bottom: 8px;">Accent Color</div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="accent-color-btn" id="accent-purple" data-color="#7c3aed" title="Purple" style="width: 40px; height: 40px; border-radius: 6px; background-color: #7c3aed; border: 2px solid transparent; cursor: pointer;"></button>
+          <button class="accent-color-btn" id="accent-blue" data-color="#3b82f6" title="Blue" style="width: 40px; height: 40px; border-radius: 6px; background-color: #3b82f6; border: 2px solid transparent; cursor: pointer;"></button>
+          <button class="accent-color-btn" id="accent-green" data-color="#10b981" title="Green" style="width: 40px; height: 40px; border-radius: 6px; background-color: #10b981; border: 2px solid transparent; cursor: pointer;"></button>
+          <button class="accent-color-btn" id="accent-orange" data-color="#f97316" title="Orange" style="width: 40px; height: 40px; border-radius: 6px; background-color: #f97316; border: 2px solid transparent; cursor: pointer;"></button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 16px;">
         <label class="form-label">Default Chart Timeframe</label>
         <select id="default-timeframe" class="input">
           <option value="1H">1H</option>
@@ -283,6 +293,7 @@
 
 <script>
   let currentTheme = localStorage.getItem("theme") || "dark";
+  let currentAccentColor = localStorage.getItem("accentColor") || "#7c3aed";
 
   function switchTab(e, tabId) {
     e.preventDefault();
@@ -308,6 +319,29 @@
     document.getElementById("theme-dark").className = theme === "dark" ? "btn btn-primary" : "btn";
     document.getElementById("theme-light").className = theme === "light" ? "btn btn-primary" : "btn";
   }
+
+  function setAccentColor(color) {
+    currentAccentColor = color;
+    localStorage.setItem("accentColor", color);
+    document.documentElement.style.setProperty("--primary", color);
+    document.documentElement.style.setProperty("--primary-dark", color);
+
+    // Update button borders
+    document.querySelectorAll(".accent-color-btn").forEach(btn => {
+      btn.style.borderColor = btn.getAttribute("data-color") === color ? "#fff" : "transparent";
+    });
+  }
+
+  // Initialize accent color buttons
+  document.querySelectorAll(".accent-color-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      setAccentColor(btn.getAttribute("data-color"));
+    });
+    if (btn.getAttribute("data-color") === currentAccentColor) {
+      btn.style.borderColor = "#fff";
+    }
+  });
 
   async function loadSettings() {
     try {

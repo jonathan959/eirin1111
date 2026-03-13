@@ -145,6 +145,63 @@
         <div id="chartErr" class="text-xs mt-8 text-danger hidden"></div>
       </div>
 
+      <!-- Intelligence Panel -->
+      <div class="card" style="margin-top:1rem;" id="intelligence-panel">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;border-bottom:1px solid var(--border);">
+          <h3 style="margin:0;font-size:1rem;font-weight:600;">
+            <span style="margin-right:0.5rem;">🧠</span>Market Intelligence
+          </h3>
+          <div style="display:flex;gap:0.75rem;align-items:center;">
+            <span id="pattern-count-badge" class="badge" style="display:none;background:var(--accent, #7c3aed);color:#fff;padding:2px 8px;border-radius:12px;font-size:0.75rem;"></span>
+            <span style="font-size:0.75rem;color:var(--text-secondary);">Risk: <strong id="anomaly-risk-level" style="color:#22c55e;">LOW</strong></span>
+            <button onclick="refreshIntelligence()" style="background:none;border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.75rem;color:var(--text-secondary);">↻ Refresh</button>
+          </div>
+        </div>
+        <div style="padding:1rem;display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+          <!-- Patterns -->
+          <div>
+            <h4 style="font-size:0.85rem;margin:0 0 0.5rem;color:var(--text-secondary);">Detected Patterns</h4>
+            <div id="patterns-list" style="font-size:0.8rem;">
+              <div style="color:var(--text-tertiary);font-style:italic;">Loading...</div>
+            </div>
+          </div>
+          <!-- Anomalies -->
+          <div>
+            <h4 style="font-size:0.85rem;margin:0 0 0.5rem;color:var(--text-secondary);">Anomalies (<span id="anomaly-count">0</span>)</h4>
+            <div id="anomalies-list" style="font-size:0.8rem;">
+              <div style="color:var(--text-tertiary);font-style:italic;">Loading...</div>
+            </div>
+          </div>
+        </div>
+        <!-- ML Score Bar -->
+        <div style="padding:0 1rem 1rem;border-top:1px solid var(--border);margin-top:0.5rem;padding-top:0.75rem;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.4rem;">
+            <span style="font-size:0.8rem;color:var(--text-secondary);">ML Signal Score</span>
+            <span id="ml-score-value" style="font-size:0.85rem;font-weight:600;">—</span>
+          </div>
+          <div style="background:var(--bg-tertiary);border-radius:6px;height:8px;overflow:hidden;">
+            <div id="ml-score-bar" style="height:100%;width:50%;background:linear-gradient(90deg,#ef4444,#eab308,#22c55e);border-radius:6px;transition:width 0.5s;"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.65rem;color:var(--text-tertiary);margin-top:2px;">
+            <span>Bearish</span><span>Neutral</span><span>Bullish</span>
+          </div>
+        </div>
+        <!-- Autopilot Recommendation -->
+        <div style="padding:0 1rem 1rem;" id="autopilot-section">
+          <div style="background:var(--bg-tertiary);border-radius:8px;padding:0.75rem;display:flex;align-items:center;gap:0.75rem;">
+            <div id="autopilot-action-icon" style="font-size:1.5rem;">⏸</div>
+            <div>
+              <div id="autopilot-action" style="font-size:0.85rem;font-weight:600;">Evaluating...</div>
+              <div id="autopilot-reasons" style="font-size:0.75rem;color:var(--text-secondary);margin-top:2px;"></div>
+            </div>
+            <div style="margin-left:auto;text-align:right;">
+              <div style="font-size:0.65rem;color:var(--text-tertiary);">Conviction</div>
+              <div id="autopilot-conviction" style="font-size:1.1rem;font-weight:700;">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Bot stats -->
       <div class="card section">
         <div class="card-head">
@@ -1560,6 +1617,107 @@
     }
     return result;
   };
+
+  /* Intelligence Panel */
+  async function refreshIntelligence() {
+    const symbol = '{{ bot.pair }}';
+    const tf = window._currentTimeframe || '1h';
+
+    // Fetch combined intelligence
+    try {
+      const resp = await fetch(`/api/intelligence/${encodeURIComponent(symbol)}?timeframe=${tf}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+
+      // Patterns
+      const pList = document.getElementById('patterns-list');
+      const patterns = data.patterns?.patterns || [];
+      if (patterns.length === 0) {
+        pList.innerHTML = '<div style="color:var(--text-tertiary);">No patterns detected</div>';
+      } else {
+        pList.innerHTML = patterns.slice(0, 6).map(p => {
+          const color = p.type === 'bullish' ? '#22c55e' : p.type === 'bearish' ? '#ef4444' : '#94a3b8';
+          const arrow = p.type === 'bullish' ? '▲' : p.type === 'bearish' ? '▼' : '●';
+          return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);">
+              <span style="color:${color};">${arrow} ${p.pattern}</span>
+              <span style="color:var(--text-tertiary);">${Math.round((p.confidence||0)*100)}%</span>
+          </div>`;
+        }).join('');
+      }
+
+      // Pattern badge
+      const badge = document.getElementById('pattern-count-badge');
+      if (badge) {
+        const b = patterns.filter(p => p.type === 'bullish').length;
+        const s = patterns.filter(p => p.type === 'bearish').length;
+        badge.textContent = `${b}↑ ${s}↓`;
+        badge.style.display = patterns.length > 0 ? 'inline-flex' : 'none';
+      }
+
+      // Anomalies
+      const aList = document.getElementById('anomalies-list');
+      const anomalies = data.anomalies?.anomalies || [];
+      document.getElementById('anomaly-count').textContent = anomalies.length;
+      const riskLevel = data.anomalies?.risk_level || 'low';
+      const riskEl = document.getElementById('anomaly-risk-level');
+      const riskColors = {low:'#22c55e', medium:'#eab308', high:'#f97316', critical:'#ef4444'};
+      riskEl.textContent = riskLevel.toUpperCase();
+      riskEl.style.color = riskColors[riskLevel] || '#94a3b8';
+
+      if (anomalies.length === 0) {
+        aList.innerHTML = '<div style="color:#22c55e;">No anomalies detected</div>';
+      } else {
+        aList.innerHTML = anomalies.slice(0, 5).map(a => {
+          const sevColors = {low:'#94a3b8', medium:'#eab308', high:'#f97316', critical:'#ef4444'};
+          return `<div style="padding:3px 0;border-bottom:1px solid var(--border);">
+              <span style="color:${sevColors[a.severity]||'#94a3b8'};">● ${a.type}</span>
+              <span style="font-size:0.7rem;color:var(--text-tertiary);margin-left:4px;">${a.description || ''}</span>
+          </div>`;
+        }).join('');
+      }
+
+      // ML Score
+      const mlScore = data.ml_score?.probability_up;
+      const mlVal = document.getElementById('ml-score-value');
+      const mlBar = document.getElementById('ml-score-bar');
+      if (mlScore != null) {
+        mlVal.textContent = (mlScore * 100).toFixed(0) + '%';
+        mlBar.style.width = (mlScore * 100) + '%';
+        mlVal.style.color = mlScore > 0.6 ? '#22c55e' : mlScore < 0.4 ? '#ef4444' : '#eab308';
+      } else {
+        mlVal.textContent = 'No model';
+        mlBar.style.width = '50%';
+      }
+
+      // Also load chart pattern markers
+      if (typeof window.loadPatternOverlay === 'function') {
+        window.loadPatternOverlay(symbol, tf);
+      }
+    } catch (e) {
+      console.warn('Intelligence refresh failed:', e);
+    }
+
+    // Autopilot evaluation
+    try {
+      const resp = await fetch(`/api/autopilot/evaluate/${encodeURIComponent(symbol)}`, {method: 'POST'});
+      if (!resp.ok) return;
+      const ap = await resp.json();
+
+      const icons = {create_bot: '🟢', watch: '🟡', skip: '⏸'};
+      const labels = {create_bot: 'Strong Opportunity', watch: 'Watching', skip: 'No Signal'};
+      document.getElementById('autopilot-action-icon').textContent = icons[ap.action] || '⏸';
+      document.getElementById('autopilot-action').textContent = labels[ap.action] || ap.action;
+      document.getElementById('autopilot-conviction').textContent = ((ap.conviction||0)*100).toFixed(0) + '%';
+      document.getElementById('autopilot-conviction').style.color = ap.conviction > 0.7 ? '#22c55e' : ap.conviction > 0.5 ? '#eab308' : '#ef4444';
+      document.getElementById('autopilot-reasons').textContent = (ap.reasons||[]).slice(0,3).join(' · ');
+    } catch(e) { console.warn('Autopilot eval failed:', e); }
+  }
+
+  // Load intelligence on page load and every 5 minutes
+  document.addEventListener('DOMContentLoaded', () => {
+    setTimeout(refreshIntelligence, 2000);
+    setInterval(refreshIntelligence, 300000);
+  });
 
   /* Tab switching */
   document.querySelectorAll(".tab-button").forEach(btn => {

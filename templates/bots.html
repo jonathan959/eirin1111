@@ -223,14 +223,16 @@
       </div>
       <div>
         <div class="label">Strategy</div>
-        <select id="f_strategy" class="input">
+        <select id="f_strategy" class="input" onchange="onStrategyChange(this.value)">
           <option value="classic_dca" selected>Classic DCA</option>
           <option value="smart_dca">Smart DCA</option>
           <option value="trend_follow">Trend follow</option>
           <option value="range_mean_reversion">Range mean reversion</option>
           <option value="high_vol_defensive">High-vol defensive</option>
+          <option value="mean_reversion">Mean Reversion</option>
+          <option value="momentum">Momentum</option>
           <option value="router">Strategy router (auto)</option>
-          <option value="grid">Grid (legacy)</option>
+          <option value="grid">Grid</option>
           <option value="trend">Trend (legacy)</option>
           <option value="breakout">Breakout (legacy)</option>
           <option value="classic">Classic DCA (legacy)</option>
@@ -248,7 +250,9 @@
           <option value="trend_follow">Trend follow</option>
           <option value="range_mean_reversion">Range mean reversion</option>
           <option value="high_vol_defensive">High-vol defensive</option>
-          <option value="grid">Grid (legacy)</option>
+          <option value="mean_reversion">Mean Reversion</option>
+          <option value="momentum">Momentum</option>
+          <option value="grid">Grid</option>
           <option value="trend">Trend (legacy)</option>
           <option value="breakout">Breakout (legacy)</option>
           <option value="smart">Smart DCA (legacy)</option>
@@ -313,8 +317,35 @@
         <div class="label">Take profit (%)</div>
         <input id="f_tp_pct" class="input" type="number" step="0.01" value="1.2" />
       </div>
+
+      <div>
+        <div class="label">Hard Stop Loss (%)</div>
+        <input id="f_hard_sl_pct" class="input" type="number" step="0.01" value="0" />
+        <div class="muted text-xs mt-6">Emergency exit if price drops this % below entry (0 = disabled)</div>
+      </div>
     </div>
-    
+
+    <!-- Grid Trading Parameters (shown when Grid strategy selected) -->
+    <div id="gridParams" class="grid grid-3 section-md" style="display:none;">
+      <div>
+        <div class="label">Grid Lower Price</div>
+        <input id="f_grid_lower" class="input" type="number" step="0.00001" placeholder="e.g. 40000" />
+        <div class="muted text-xs mt-6">Lowest price level for grid</div>
+      </div>
+
+      <div>
+        <div class="label">Grid Upper Price</div>
+        <input id="f_grid_upper" class="input" type="number" step="0.00001" placeholder="e.g. 50000" />
+        <div class="muted text-xs mt-6">Highest price level for grid</div>
+      </div>
+
+      <div>
+        <div class="label">Grid Levels</div>
+        <input id="f_grid_levels" class="input" type="number" step="1" value="10" />
+        <div class="muted text-xs mt-6">Number of grid levels between lower and upper</div>
+      </div>
+    </div>
+
     <!-- Collapsible Advanced Settings -->
     <div class="section-md">
       <button type="button" class="btn btn-ghost" onclick="toggleAdvanced()" style="width:100%; text-align:left;">
@@ -504,7 +535,13 @@
       icon.textContent = "▶";
     }
   }
-  
+
+  function onStrategyChange(strategyValue){
+    const gridParams = document.getElementById("gridParams");
+    if (!gridParams) return;
+    gridParams.style.display = (strategyValue === "grid") ? "block" : "none";
+  }
+
   function onMarketTypeChange(skipClearSymbol){
     const marketType = $("f_market_type") && $("f_market_type").value;
     CURRENT_MARKET_TYPE = marketType || "crypto";
@@ -813,6 +850,10 @@
     setVal("f_trailing_activation_pct", b.trailing_activation_pct, 0.02);
     setVal("f_trailing_distance_pct", b.trailing_distance_pct, 0.01);
     setVal("f_risk_profile", b.risk_profile, "balanced");
+    setVal("f_hard_sl_pct", (b.hard_sl_pct != null ? b.hard_sl_pct : 0) * 100, 0);
+    setVal("f_grid_lower", b.grid_lower, 0);
+    setVal("f_grid_upper", b.grid_upper, 0);
+    setVal("f_grid_levels", b.grid_levels, 10);
     setVal("f_trend_filter", b.trend_filter, 0);
     setVal("f_trend_sma", b.trend_sma, 200);
     setVal("f_max_spend", b.max_spend_quote, 0);
@@ -823,6 +864,12 @@
     onMarketTypeChange(true);
     setVal("f_symbol", b.symbol || "");
     setVal("f_symbol_search", b.symbol || "");
+
+    // Update grid params visibility based on current strategy
+    const gridParams = document.getElementById("gridParams");
+    if (gridParams) {
+      gridParams.style.display = (b.strategy_mode === "grid" || b.strategy === "grid") ? "block" : "none";
+    }
 
     const modal = $("modal");
     if (modal) modal.classList.remove("hidden");
@@ -886,6 +933,11 @@
       trailing_activation_pct: Number(_v("f_trailing_activation_pct", "0.02")),
       trailing_distance_pct: Number(_v("f_trailing_distance_pct", "0.01")),
       risk_profile: _v("f_risk_profile", "balanced"),
+      hard_sl_pct: Number(_v("f_hard_sl_pct", "0")) / 100,
+
+      grid_lower: Number(_v("f_grid_lower", "0")) || 0,
+      grid_upper: Number(_v("f_grid_upper", "0")) || 0,
+      grid_levels: Number(_v("f_grid_levels", "10")) || 10,
 
       trend_filter: Number(_v("f_trend_filter", "0")),
       trend_sma: Number(_v("f_trend_sma", "200")),

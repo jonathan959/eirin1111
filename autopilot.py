@@ -4,6 +4,7 @@ Autopilot: Set-and-forget automation with purposed-entry filtering.
 - WATCH candidates go to watchlist, not live bots
 - Close/demote when score drops
 - Enforces execution gate preflight before bot creation
+- Intelligence-driven with pattern recognition, anomaly detection, and ML signals
 """
 import json
 import logging
@@ -13,6 +14,241 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# =========================================================
+# Autopilot Engine: Intelligence-driven decision making
+# =========================================================
+
+class AutopilotEngine:
+    """Autonomous trading decision engine with pattern recognition, anomaly detection, and ML signals."""
+
+    def __init__(self):
+        self.last_scan_ts = 0.0
+        self._pattern_recognizer = None
+        self._anomaly_detector = None
+        self._ml_scorer = None
+        self._smart_entry = None
+        self._init_modules()
+
+    def _init_modules(self):
+        """Initialize intelligence modules with graceful fallbacks."""
+        try:
+            from pattern_recognition import PatternRecognizer
+            self._pattern_recognizer = PatternRecognizer()
+        except ImportError:
+            logger.debug("PatternRecognizer not available for autopilot")
+
+        try:
+            from anomaly_detector import AnomalyDetector
+            self._anomaly_detector = AnomalyDetector()
+        except ImportError:
+            logger.debug("AnomalyDetector not available for autopilot")
+
+        try:
+            from ml_signal_scorer import MLSignalScorer
+            self._ml_scorer = MLSignalScorer()
+        except ImportError:
+            logger.debug("MLSignalScorer not available for autopilot")
+
+        try:
+            from smart_entry import SmartEntryFilter
+            self._smart_entry = SmartEntryFilter()
+        except ImportError:
+            logger.debug("SmartEntryFilter not available for autopilot")
+
+    def evaluate_opportunity(self, symbol: str, candles_1h: list, candles_4h: list = None, candles_1d: list = None) -> dict:
+        """
+        Evaluate a symbol for trading opportunity using multiple intelligence signals.
+
+        Returns:
+            {
+                "symbol": str,
+                "conviction": float (0-1),
+                "action": "create_bot" | "skip" | "watch",
+                "signals": {
+                    "patterns": {...},
+                    "anomalies": {...},
+                    "ml_score": float or None,
+                    "smart_entry": bool or None,
+                },
+                "recommended_strategy": str,
+                "recommended_size_pct": float,
+                "reasons": [str],
+            }
+        """
+        result = {
+            "symbol": symbol,
+            "conviction": 0.0,
+            "action": "skip",
+            "signals": {},
+            "recommended_strategy": "dca",
+            "recommended_size_pct": 1.0,
+            "reasons": [],
+        }
+
+        conviction_scores = []
+        min_conviction = float(os.getenv("AUTOPILOT_MIN_CONVICTION", "0.7"))
+
+        # 1. Pattern Recognition
+        if self._pattern_recognizer and candles_1h:
+            try:
+                patterns = self._pattern_recognizer.get_pattern_signals(candles_1h) if hasattr(self._pattern_recognizer, 'get_pattern_signals') else {}
+                result["signals"]["patterns"] = patterns
+                bullish = patterns.get("bullish_count", 0)
+                bearish = patterns.get("bearish_count", 0)
+                bias = patterns.get("overall_bias", "neutral")
+
+                if bias == "bullish" and bullish > 0:
+                    pattern_score = min(0.3 + bullish * 0.15, 0.9)
+                    conviction_scores.append(("patterns", pattern_score))
+                    result["reasons"].append(f"{bullish} bullish pattern(s) detected")
+                    strongest = patterns.get("strongest_pattern")
+                    if strongest:
+                        result["reasons"].append(f"Strongest: {strongest.get('pattern', 'unknown')} ({strongest.get('confidence', 0):.0%})")
+                elif bias == "bearish":
+                    conviction_scores.append(("patterns", 0.2))
+                    result["reasons"].append(f"{bearish} bearish pattern(s) - caution")
+                else:
+                    conviction_scores.append(("patterns", 0.5))
+            except Exception as e:
+                logger.debug("Pattern analysis failed for %s: %s", symbol, e)
+
+        # 2. Anomaly Detection
+        if self._anomaly_detector and candles_1h:
+            try:
+                risk = self._anomaly_detector.get_risk_assessment(candles_1h) if hasattr(self._anomaly_detector, 'get_risk_assessment') else {}
+                result["signals"]["anomalies"] = risk
+                risk_level = risk.get("risk_level", "low")
+                size_mult = risk.get("position_size_multiplier", 1.0)
+                result["recommended_size_pct"] = size_mult
+
+                if risk.get("should_pause_trading"):
+                    conviction_scores.append(("anomalies", 0.0))
+                    result["reasons"].append("Critical anomalies - trading paused")
+                elif risk_level == "high":
+                    conviction_scores.append(("anomalies", 0.3))
+                    result["reasons"].append(f"High risk: {risk.get('anomaly_count', 0)} anomalies")
+                elif risk_level == "medium":
+                    conviction_scores.append(("anomalies", 0.6))
+                else:
+                    conviction_scores.append(("anomalies", 0.8))
+            except Exception as e:
+                logger.debug("Anomaly analysis failed for %s: %s", symbol, e)
+
+        # 3. ML Signal Score
+        if self._ml_scorer and candles_1h:
+            try:
+                proba = self._ml_scorer.predict(candles_1h)
+                result["signals"]["ml_score"] = proba
+                if proba is not None:
+                    conviction_scores.append(("ml", proba))
+                    if proba > 0.65:
+                        result["reasons"].append(f"ML model bullish ({proba:.0%} confidence)")
+                    elif proba < 0.4:
+                        result["reasons"].append(f"ML model bearish ({proba:.0%} confidence)")
+            except Exception as e:
+                logger.debug("ML scoring failed for %s: %s", symbol, e)
+
+        # 4. Smart Entry Filter
+        if self._smart_entry and candles_1h and candles_4h and candles_1d:
+            try:
+                should_enter, reason = self._smart_entry.should_enter(
+                    symbol=symbol,
+                    market_type="crypto",
+                    candles_1h=candles_1h,
+                    candles_4h=candles_4h,
+                    candles_1d=candles_1d,
+                ) if hasattr(self._smart_entry, 'should_enter') else (False, "not_available")
+                result["signals"]["smart_entry"] = should_enter
+                if should_enter:
+                    conviction_scores.append(("smart_entry", 0.85))
+                    result["reasons"].append("Smart entry filter: PASS")
+                else:
+                    conviction_scores.append(("smart_entry", 0.25))
+                    result["reasons"].append(f"Smart entry filter: BLOCKED ({reason})")
+            except Exception as e:
+                logger.debug("Smart entry check failed for %s: %s", symbol, e)
+
+        # Calculate weighted conviction
+        if conviction_scores:
+            weights = {"patterns": 0.25, "anomalies": 0.15, "ml": 0.30, "smart_entry": 0.30}
+            total_weight = sum(weights.get(name, 0.2) for name, _ in conviction_scores)
+            weighted_sum = sum(weights.get(name, 0.2) * score for name, score in conviction_scores)
+            result["conviction"] = weighted_sum / total_weight if total_weight > 0 else 0.0
+
+        # Determine action
+        conviction = result["conviction"]
+        if conviction >= min_conviction:
+            result["action"] = "create_bot"
+        elif conviction >= 0.5:
+            result["action"] = "watch"
+            result["reasons"].append("Moderate conviction - adding to watchlist")
+        else:
+            result["action"] = "skip"
+            if not result["reasons"]:
+                result["reasons"].append("Low conviction - skipping")
+
+        return result
+
+    def scan_portfolio_health(self, active_bots: List[dict]) -> List[dict]:
+        """
+        Scan active bots and recommend actions for underperformers.
+
+        Args:
+            active_bots: List of bot dicts with keys: bot_id, symbol, pnl_pct, strategy, started_at
+
+        Returns:
+            List of action recommendations: {"bot_id": int, "action": "stop"|"reduce"|"hold", "reason": str}
+        """
+        max_loss_pct = float(os.getenv("AUTOPILOT_MAX_LOSS_PCT", "5.0"))
+        recommendations = []
+
+        for bot in active_bots:
+            bot_id = bot.get("bot_id")
+            pnl_pct = bot.get("pnl_pct", 0)
+            symbol = bot.get("symbol", "")
+
+            # Auto-stop losers exceeding max loss
+            if pnl_pct < -max_loss_pct:
+                recommendations.append({
+                    "bot_id": bot_id,
+                    "action": "stop",
+                    "reason": f"P&L {pnl_pct:.1f}% exceeds max loss threshold ({-max_loss_pct:.1f}%)",
+                })
+                continue
+
+            # Check for deteriorating conditions
+            if pnl_pct < -2.0:
+                recommendations.append({
+                    "bot_id": bot_id,
+                    "action": "reduce",
+                    "reason": f"Negative P&L ({pnl_pct:.1f}%) - consider reducing position",
+                })
+            else:
+                recommendations.append({
+                    "bot_id": bot_id,
+                    "action": "hold",
+                    "reason": "Conditions acceptable",
+                })
+
+        return recommendations
+
+    def get_status(self) -> dict:
+        """Return autopilot engine status."""
+        return {
+            "enabled": is_autopilot_enabled(),
+            "min_conviction": float(os.getenv("AUTOPILOT_MIN_CONVICTION", "0.7")),
+            "max_active_bots": int(os.getenv("AUTOPILOT_MAX_BOTS", "10")),
+            "max_loss_pct": float(os.getenv("AUTOPILOT_MAX_LOSS_PCT", "5.0")),
+            "scan_interval_sec": int(os.getenv("AUTOPILOT_SCAN_FREQUENCY", "14400")),
+            "modules": {
+                "pattern_recognition": self._pattern_recognizer is not None,
+                "anomaly_detection": self._anomaly_detector is not None,
+                "ml_scorer": self._ml_scorer is not None,
+                "smart_entry": self._smart_entry is not None,
+            },
+            "last_scan_ts": self.last_scan_ts,
+        }
 
 AUTOPILOT_SCAN_INTERVAL_SEC = int(os.getenv("AUTOPILOT_SCAN_FREQUENCY", "14400"))  # 4 hours
 AUTOPILOT_MIN_SCORE = float(os.getenv("AUTOPILOT_MIN_SCORE", "80"))

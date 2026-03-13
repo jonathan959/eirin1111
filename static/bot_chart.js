@@ -597,4 +597,82 @@
   } else {
     init();
   }
+
+  // ── Pattern Recognition Overlay ──
+  window.loadPatternOverlay = async function loadPatternOverlay(symbol, timeframe) {
+    if (!chart || !candlesSeries) return;
+    try {
+      const resp = await fetch(`/api/patterns/${encodeURIComponent(symbol)}?timeframe=${timeframe || '1h'}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const patterns = data.patterns || [];
+
+      // Create markers for detected patterns
+      const markers = patterns.map(p => {
+        const isBullish = p.type === 'bullish';
+        return {
+          time: p.time || 0,
+          position: isBullish ? 'belowBar' : 'aboveBar',
+          color: isBullish ? '#22c55e' : '#ef4444',
+          shape: isBullish ? 'arrowUp' : 'arrowDown',
+          text: p.pattern + ' (' + Math.round((p.confidence || 0) * 100) + '%)',
+        };
+      }).filter(m => m.time > 0).sort((a, b) => a.time - b.time);
+
+      if (markers.length > 0 && typeof candlesSeries.setMarkers === 'function') {
+        candlesSeries.setMarkers(markers);
+      }
+
+      // Update pattern badge count
+      const badge = document.getElementById('pattern-count-badge');
+      if (badge) {
+        const bullish = patterns.filter(p => p.type === 'bullish').length;
+        const bearish = patterns.filter(p => p.type === 'bearish').length;
+        badge.textContent = `${bullish}↑ ${bearish}↓`;
+        badge.style.display = patterns.length > 0 ? 'inline-flex' : 'none';
+      }
+
+      return data;
+    } catch (e) {
+      console.warn('Pattern overlay load failed:', e);
+      return null;
+    }
+  };
+
+  // ── Anomaly Detection Overlay ──
+  window.loadAnomalyOverlay = async function loadAnomalyOverlay(symbol, timeframe) {
+    try {
+      const resp = await fetch(`/api/anomalies/${encodeURIComponent(symbol)}?timeframe=${timeframe || '1h'}`);
+      if (!resp.ok) return null;
+      const data = await resp.json();
+
+      // Update risk indicator
+      const riskEl = document.getElementById('anomaly-risk-level');
+      if (riskEl) {
+        const level = data.risk_level || 'low';
+        const colors = { low: '#22c55e', medium: '#eab308', high: '#f97316', critical: '#ef4444' };
+        riskEl.textContent = level.toUpperCase();
+        riskEl.style.color = colors[level] || '#94a3b8';
+      }
+
+      const countEl = document.getElementById('anomaly-count');
+      if (countEl) {
+        countEl.textContent = data.anomaly_count || 0;
+      }
+
+      return data;
+    } catch (e) {
+      console.warn('Anomaly overlay load failed:', e);
+      return null;
+    }
+  };
+
+  // ── Combined Intelligence Load ──
+  window.loadIntelligence = async function loadIntelligence(symbol, timeframe) {
+    const [patterns, anomalies] = await Promise.all([
+      window.loadPatternOverlay(symbol, timeframe),
+      window.loadAnomalyOverlay(symbol, timeframe),
+    ]);
+    return { patterns, anomalies };
+  };
 })();
