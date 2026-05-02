@@ -3733,29 +3733,37 @@ def add_order_event(
     reason: str,
     is_live: int = 0,
 ) -> None:
-    con = _conn()
-    con.execute(
-        """
-        INSERT INTO order_events(bot_id, ts, symbol, side, ord_type, price, amount, order_id, tag, status, reason, is_live)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(bot_id),
-            now_ts(),
-            str(symbol),
-            str(side),
-            str(ord_type),
-            float(price) if price is not None else None,
-            float(amount) if amount is not None else None,
-            str(order_id) if order_id else None,
-            str(tag) if tag else None,
-            str(status),
-            str(reason),
-            int(1 if is_live else 0),
-        ),
-    )
-    con.commit()
-    con.close()
+    """Append a row to order_events.
+
+    Migrated to write_txn(bot_id, ...) in Phase 1.2b step 3 — per-bot RLock
+    serialises against the same bot's deal/log writes; 5-retry backoff on
+    'database is locked'. order_events is a hot append-only table touched on
+    every order placement / fill / reject, so contention with cleanup_old_
+    order_events (Phase 1.2b step 8) was a known foot-gun.
+    """
+    def _do(con) -> None:
+        con.execute(
+            """
+            INSERT INTO order_events(bot_id, ts, symbol, side, ord_type, price, amount, order_id, tag, status, reason, is_live)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(bot_id),
+                now_ts(),
+                str(symbol),
+                str(side),
+                str(ord_type),
+                float(price) if price is not None else None,
+                float(amount) if amount is not None else None,
+                str(order_id) if order_id else None,
+                str(tag) if tag else None,
+                str(status),
+                str(reason),
+                int(1 if is_live else 0),
+            ),
+        )
+
+    write_txn(int(bot_id), _do, name="add_order_event")
 
 
 def save_perf_metrics(bot_id: int, strategy: str, payload: str) -> None:

@@ -353,6 +353,88 @@ def test_record_trade_feedback_nested_with_con(temp_db):
     assert ("ETH/USD", 0) in rows
 
 
+# ===========================================================================
+# 1.2b step 3: order_events / add_order_event
+# ===========================================================================
+
+def test_add_order_event_inserts_row(temp_db):
+    dbmod.add_order_event(
+        bot_id=51, symbol="BTC/USD", side="buy", ord_type="market",
+        price=100.0, amount=0.5, order_id="o-1", tag=None,
+        status="filled", reason="entry",
+    )
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        rows = fresh.execute(
+            "SELECT bot_id, symbol, side, status FROM order_events WHERE bot_id=?",
+            (51,),
+        ).fetchall()
+    finally:
+        fresh.close()
+    assert len(rows) == 1
+    assert dict(rows[0]) == {"bot_id": 51, "symbol": "BTC/USD", "side": "buy", "status": "filled"}
+
+
+def test_add_order_event_under_concurrent_load(temp_db):
+    """4 threads, 1 bot each, append order events for 1.5s. Plus a chunked
+    cleanup thread DELETEing old rows. Zero OperationalError must propagate."""
+    DURATION_SEC = 1.5
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    cnt_lock = threading.Lock()
+
+    def _producer(bot_id: int):
+        deadline = time.monotonic() + DURATION_SEC
+        i = 0
+        while time.monotonic() < deadline:
+            try:
+                dbmod.add_order_event(
+                    bot_id=bot_id, symbol="BTC/USD", side="buy", ord_type="market",
+                    price=100.0 + i, amount=0.01, order_id=f"o-{bot_id}-{i}",
+                    tag=None, status="ack", reason="t",
+                )
+                with cnt_lock:
+                    counts[bot_id] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((bot_id, repr(e)))
+                return
+            i += 1
+
+    def _cleanup():
+        deadline = time.monotonic() + DURATION_SEC
+        while time.monotonic() < deadline:
+            try:
+                cutoff = int(time.time())
+                def _del(con):
+                    cur = con.execute(
+                        "DELETE FROM order_events WHERE rowid IN "
+                        "(SELECT rowid FROM order_events WHERE ts < ? LIMIT 100)",
+                        (cutoff,),
+                    )
+                    return int(cur.rowcount or 0)
+                dbmod.write_txn(None, _del, name="cleanup_orders")
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append(("cleanup", repr(e)))
+                return
+            time.sleep(0.05)
+
+    threads = [threading.Thread(target=_producer, args=(b,)) for b in (1, 2, 3, 4)]
+    threads.append(threading.Thread(target=_cleanup))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive()
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for b, n in counts.items():
+        assert n > 0, f"bot {b} made no forward progress"
+
+
 def test_cancel_ghost_deal_serialises_with_open_deal_for_same_bot(temp_db):
     """For the SAME bot_id, cancel_ghost_deal and open_deal must serialise
     on the per-bot RLock (no interleaving)."""
