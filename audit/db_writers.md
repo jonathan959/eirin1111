@@ -284,3 +284,166 @@ Phase 1.1 deliverable: this document. **No code changes**; no behaviour changes.
 - **1.4:** Add WAL checkpoint thread (60s `wal_checkpoint(TRUNCATE)`).
 - **1.5:** Write `tests/test_db_locking.py::test_no_lock_under_load` (4 threads × 200 ops × 60s) — must pass before closing Phase 1.
 - **1.6:** Deploy + 10-min `journalctl` tail proving bot 1 is no longer in the locking loop.
+
+---
+
+## 8. Phase 1.2 migration ledger (added at end of Phase 1.3)
+
+This section is the **source-of-truth checklist** for the Phase 1.2a–1.2e migrations.
+Every writer enumerated in §3 and §4 is listed below with its MIGRATED status,
+the commit/phase it landed in, and the test that exercises it. New writers
+added after Phase 1 must follow the rules in
+`audit/write_txn_design.md` and append a row here.
+
+### 8.1 The chokepoint — `db.write_txn(bot_id, fn, *, name=None) -> T`
+
+Defined in `db.py` (Phase 1.2a). See `audit/write_txn_design.md` for the full
+contract. Summary:
+
+- `bot_id=None` → acquires `db._global_write_lock` (RLock).
+- `bot_id=int` → acquires `db.bot_db_lock(bot_id)` (RLock per bot).
+- Opens a fresh `_make_real_conn()`-equivalent connection (pragma-canonical).
+- Runs `fn(con)`; commits on success, rolls back on any exception.
+- Retries `OperationalError("database is locked")` with the schedule
+  `[50, 100, 250, 500, 1000] ms ±20% jitter`; **5 attempts total** before
+  raising `db.DBLockedError(sql, bot_id, attempts, elapsed_ms)`.
+- Nested calls are **forbidden**; entry guarded by a `threading.local` flag.
+  A nested call raises `RuntimeError`. Use the inner-conn-passthrough pattern
+  for cross-function transactions (e.g. `_record_recommendation_outcome(con, ...)`).
+- WAL checkpoint thread runs `PRAGMA wal_checkpoint(TRUNCATE)` every 60 s
+  (held for the duration of the global write lock).
+
+### 8.2 Bot-id-scoped writers (§3.1)
+
+| Function | Phase | Lock | Test | Status |
+| --- | --- | --- | --- | --- |
+| `add_log` | 1.2b/1 | per-bot | `test_add_log_under_concurrent_contention` | MIGRATED |
+| `add_order_event` | 1.2b/3 | per-bot | `test_add_order_event_under_load` | MIGRATED |
+| `open_deal` | 1.2b/2 | per-bot | `test_open_deal_routes_through_per_bot_lock` | MIGRATED |
+| `update_open_deal_entry` | 1.2b/2 | per-bot | `test_update_open_deal_entry_routes_through_per_bot_lock` | MIGRATED |
+| `close_deal` | 1.2b/2 | per-bot | `test_close_deal_atomic_with_recommendation_outcome` | MIGRATED |
+| `cancel_ghost_deal` | 1.2b/4 | per-bot | `test_cancel_ghost_deal_routes_through_per_bot_lock` | MIGRATED |
+| `manual_close_deal_and_journal` | 1.2c/2 | per-bot | `test_manual_close_deal_and_journal_atomic` | MIGRATED |
+| `record_trade_feedback` | 1.2b/2 | per-bot (resolved from deal) | covered via `close_deal` test | MIGRATED |
+| `add_regime_snapshot` | 1.2c/2 | per-bot | `test_add_regime_snapshot_uses_per_bot_lock` | MIGRATED |
+| `add_strategy_decision` | 1.2c/2 | per-bot | `test_add_strategy_decision_uses_per_bot_lock` | MIGRATED |
+| `add_strategy_trade` | 1.2c/2 | per-bot | `test_add_strategy_trade_uses_per_bot_lock` | MIGRATED |
+| `save_perf_metrics` | 1.2c/2 | per-bot | `test_save_perf_metrics_uses_per_bot_lock` | MIGRATED |
+| `update_bot` | 1.2c/2 | per-bot | `test_update_bot_routes_through_per_bot_lock` | MIGRATED |
+| `set_bot_enabled` | 1.2c/2 | per-bot | `test_set_bot_enabled_routes_through_per_bot_lock` | MIGRATED |
+| `set_bot_running` | 1.2c/2 | per-bot | `test_set_bot_running_routes_through_per_bot_lock` | MIGRATED |
+| `delete_bot` | 1.2c/2 | per-bot | `test_delete_bot_atomic_cascade` | MIGRATED |
+| `patch_bot_risk_after_create` | 1.2c/2 | per-bot | `test_patch_bot_risk_after_create` | MIGRATED |
+| `update_ml_prediction_outcome` | 1.2c/2 | global | `test_update_ml_prediction_outcome_global_lock` | MIGRATED |
+| `link_recommendation_to_bot` | 1.2c/2 | per-bot | `test_link_recommendation_to_bot_uses_per_bot_lock` | MIGRATED |
+
+### 8.3 Global / cross-bot writers (§3.2)
+
+| Function | Phase | Lock | Test | Status |
+| --- | --- | --- | --- | --- |
+| `set_setting` | 1.2c/3 | global | `test_set_setting_uses_write_txn_global` | MIGRATED |
+| `save_autopilot_config` | 1.2c/3 | global | `test_save_autopilot_config_uses_write_txn_global` | MIGRATED |
+| `update_bots_by_type` | 1.2c/3 | global | (covered by `test_global_writers_under_concurrent_load`) | MIGRATED |
+| `create_bot` | 1.2c/3 | global | `test_create_bot_routes_through_write_txn_global` | MIGRATED |
+| `add_autopilot_audit_log` | 1.2c/3 | global | (smoke via load test) | MIGRATED |
+| `log_data_quality` | 1.2c/3 | global | `test_log_data_quality_uses_write_txn_global` | MIGRATED |
+| `log_error` | 1.2c/3 | global or per-bot (`bot_id` if set) | `test_log_error_uses_per_bot_when_bot_id_set` | MIGRATED |
+| `log_audit` | 1.2c/3 | global | `test_log_audit_uses_write_txn_global` | MIGRATED |
+| `mark_explore_signals_pending` | 1.2b/5 | global | `test_explore_writers_route_through_write_txn` | MIGRATED |
+| `mark_explore_horizon_pending` | n/a (delegates) | global | (delegates) | MIGRATED |
+| `upsert_explore_feed_row` | 1.2b/5 | global | `test_explore_writers_route_through_write_txn` | MIGRATED |
+| `save_recommendation_snapshot` | 1.2b/5 | global | `test_explore_writers_route_through_write_txn` | MIGRATED |
+| `save_signal_outcome` | 1.2b/5 | global | `test_explore_writers_route_through_write_txn` | MIGRATED |
+| `update_explore_signal_outcome` | 1.2b/5 | global | `test_explore_writers_route_through_write_txn` | MIGRATED |
+| `save_explore_backtest_results` | 1.2c/3 | global | (smoke) | MIGRATED |
+| `delete_recommendations_for_blocklist` | 1.2b/8 | global (chunked) | `test_delete_recommendations_for_blocklist_chunked` | MIGRATED |
+| `cleanup_invalid_scores` | 1.2b/8 | global | (covered by load test) | MIGRATED |
+| `_record_recommendation_outcome` | 1.2b/2 | inner-conn passthrough | covered via `close_deal` test | MIGRATED (callee pattern) |
+| `save_backtest_run` | 1.2c/3 | global | (smoke) | MIGRATED |
+| `save_intraday_pattern` | 1.2c/3 | global | `test_save_intraday_pattern_routes_through_write_txn` | MIGRATED |
+| `save_ml_model_version` | 1.2c/3 | global | `test_save_ml_model_version_routes_through_write_txn` | MIGRATED |
+| `save_ml_prediction` | 1.2c/3 | global | (smoke; per-bot variant covered by `update_ml_prediction_outcome` test) | MIGRATED |
+| `add_intelligence_decision` | 1.2c/3 | per-bot | `test_add_intelligence_decision_uses_per_bot_lock` | MIGRATED |
+| `upsert_watchlist_entry` | 1.2c/3 | global | `test_watchlist_writers_route_through_write_txn` | MIGRATED |
+| `mark_watchlist_triggered` | 1.2c/3 | global | `test_watchlist_writers_route_through_write_txn` | MIGRATED |
+| `remove_watchlist_entry` | 1.2c/3 | global | `test_watchlist_writers_route_through_write_txn` | MIGRATED |
+| `cleanup_old_watchlist` | 1.2b/8 | global (chunked UPDATE) | covered by chunked-cleanup load tests | MIGRATED |
+| `cleanup_old_portfolio_snapshots` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `cleanup_old_recommendation_snapshots` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `cleanup_old_signal_audits` | 1.2b/8 | global (chunked) | `test_cleanup_old_signal_audits_chunked` | MIGRATED |
+| `cleanup_old_bot_logs` | 1.2b/8 | global (chunked) | `test_cleanup_old_bot_logs_under_concurrent_insert_load` | MIGRATED |
+| `cleanup_old_strategy_decisions` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `cleanup_old_explore_signal_outcomes` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `cleanup_old_order_events` | 1.2b/8 | global (chunked) | `test_cleanup_old_order_events_chunked_under_load` | MIGRATED |
+| `cleanup_old_regime_snapshots` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `cleanup_old_trade_feedback` | 1.2b/8 | global (chunked) | (load test) | MIGRATED |
+| `db_vacuum` | 1.2c/3 | global (special: VACUUM cannot run inside a txn — manually acquires `_global_write_lock` and uses `open_migration_conn()`) | `test_db_vacuum_does_not_use_write_txn_but_holds_global_lock` | MIGRATED (special-case) |
+| `db_analyze` | 1.2c/3 | global | `test_db_analyze_routes_through_write_txn_global` | MIGRATED |
+| `save_dividend_event` | 1.2c/3 | global | `test_save_dividend_event_uses_write_txn_global` | MIGRATED |
+| `save_market_event` | 1.2c/3 | global | `test_save_market_event_uses_write_txn_global` | MIGRATED |
+| `upsert_trade_journal` | 1.2c/3 | per-bot (resolved from deal) | `test_upsert_trade_journal_routes_through_write_txn` | MIGRATED |
+| `save_scoring_calibration_log` | 1.2c/3 | global | (smoke) | MIGRATED |
+| `init_db` / `_ensure_column` / `_migrate_explore_signals_to_v2` | n/a | n/a | run at boot, single-threaded; not migrated to `write_txn` (would deadlock the bootstrap path) | INTENTIONALLY UNMIGRATED — single-threaded boot path |
+
+### 8.4 Out-of-`db.py` writers (§4)
+
+| Module | Function(s) | Phase | Routing | Status |
+| --- | --- | --- | --- | --- |
+| `worker_api.py` | `_screener_outcomes_loop` (background) | 1.2c/1 | `db.write_txn(None, ...)` for inserts; network I/O moved outside the txn; loop health surfaced via `_BACKGROUND_LOOP_HEALTH` to `/health/full` | MIGRATED |
+| `worker_api.py` | `_portfolio_loop` (background) | 1.2c/1 | `db.write_txn(None, ...)` for inserts; failures surface as `degraded` to `/health/full` | MIGRATED |
+| `notification_manager.py` | `insert_notification`, `mark_notification_read`, `notify_trade_executed`, `notify_take_profit`, `notify_stop_loss`, `notify_bot_error`, `notify_drawdown_alert`, `notify_daily_summary` | 1.2b/6 | `_insert_notification_row` helper through `write_txn(None, ...)`; `_send_external` runs **after** the txn commits so Discord/Telegram latency cannot hold the lock | MIGRATED |
+| `execution_quality_tracker.py` | `record_execution` | 1.2b/7 | `write_txn(int(bot_id), ...)`; `logger.exception` on failure | MIGRATED |
+| `tax_optimizer.py` | `save_tax_harvest_suggestion` | 1.2b/7 | `write_txn(None, ...)` | MIGRATED |
+| `sector_rotation.py` | `record_sector_performance` | 1.2b/7 | `write_txn(None, ...)` | MIGRATED |
+| `ml_signal_scorer.py` | `_log_version_to_db` | 1.2d | calls `db.save_ml_model_version` (which is itself migrated, 1.2c/3); `logger.exception` on failure | MIGRATED (silent no-op fixed) |
+| `autopilot.py` | (no direct writes — calls `db.upsert_watchlist_entry` etc.) | n/a | covered transitively | n/a — no direct writes |
+| `scripts/migrate_auto_restart.py` | one-shot ALTER + UPDATE | 1.2a + 1.3 | `db.open_migration_conn()` (drops bespoke pragma drift) | MIGRATED |
+| `one_server_v2.py` | `_conn()` (read-only) | 1.2e | delegates to `db._conn()` (canonical pragmas) | MIGRATED |
+| `check_db.py`, `check_db_schema.py`, `check_schema.py`, `check_bots.py`, `check_bots_count.py`, `enable_bot.py`, `audit_system.py` | local dev/diagnostic CLIs | n/a | not run in production; out of scope for Phase 1. Will route through `db.open_migration_conn()` opportunistically | NOT MIGRATED — local dev tools only |
+
+### 8.5 Out-of-scope finds (§6) — status
+
+- **`worker_api.py:5444` — `auto_restart` regression** → tracked in
+  [`audit/issues/phase-2-5-auto-restart-regression.md`](issues/phase-2-5-auto-restart-regression.md).
+  Lands in Phase 2.5. **NOT FIXED in Phase 1** — outside DB-locking blast radius.
+- **`worker_api.py:5459` — `hard_sl_pct` defaults to 0.0** → tracked in
+  [`audit/issues/phase-3-2-hard-sl-pct-default.md`](issues/phase-3-2-hard-sl-pct-default.md).
+  Lands in Phase 3.2. **NOT FIXED in Phase 1**.
+- **Silent `except: pass` everywhere** → fixed for the modules touched in
+  Phase 1.2 (`worker_api._screener_outcomes_loop`, `worker_api._portfolio_loop`,
+  `notification_manager.*`, `execution_quality_tracker.record_execution`,
+  `tax_optimizer.save_tax_harvest_suggestion`, `sector_rotation.record_sector_performance`,
+  `ml_signal_scorer._log_version_to_db`). Remaining silent excepts in non-DB
+  paths are tracked for Phase 2.
+- **`ml_signal_scorer.py:_log_version_to_db` calls non-existent `db.get_db()`** →
+  fixed in Phase 1.2d. Source-level grep regression in
+  `tests/test_writer_migrations.py::test_ml_signal_scorer_no_inline_db_get_db_import`.
+- **`one_server_v2.py:94` raw connection** → fixed in Phase 1.2e. Source-level
+  grep regression in `tests/test_writer_migrations.py::test_one_server_v2_no_raw_sqlite_connect`.
+
+### 8.6 New rules for future writers
+
+1. **MUST** call `db.write_txn(bot_id, fn, *, name=...)`. No raw `_conn()` for
+   writes. No raw `sqlite3.connect()` anywhere.
+2. **MUST NOT** nest `write_txn` calls. If you need a multi-step transaction
+   that spans helpers, make the helper accept an injected `con` and call it
+   from inside one outer `write_txn`. Pattern reference:
+   `db._record_recommendation_outcome(con, ...)`.
+3. **MUST** pass `bot_id` when the row's lifecycle is owned by a single bot
+   runner. Pass `None` for global tables (settings, audits, watchlists, etc.).
+4. **MUST NOT** swallow `OperationalError` or `DBLockedError` silently.
+   `write_txn` already retries; if it raises after the retry budget, the
+   caller logs with `logger.exception` and surfaces a typed failure
+   (return False / set state flag / raise upstream).
+5. **MUST** put network I/O (Discord, Telegram, exchange calls) **after**
+   `write_txn` commits. Holding the global write lock during a remote call
+   re-creates the original "database is locked" symptom under load.
+6. **For mass DELETEs** — use `db.chunked_delete(table, where, params, ...)`.
+   Single-shot DELETEs against hot tables (bot_logs, order_events, ...) are
+   forbidden. Chunked variants run 500 rows per `write_txn` and `time.sleep(0.05)`
+   between batches to yield the writer slot.
+7. **For one-shot CLI / migration scripts** — use `db.open_migration_conn()`,
+   never raw `sqlite3.connect`. See `scripts/migrations/README.md` for the
+   full checklist.
+8. **Update this ledger** when adding a writer. The grep on `write_txn(`
+   in `db.py` plus the count of MIGRATED rows here must stay 1:1.
