@@ -567,6 +567,93 @@ def test_db_retry_helper_was_removed():
         "_db_retry should be deleted in Phase 1.2b step 5; new code uses write_txn"
 
 
+# ===========================================================================
+# 1.2b step 6: notification_manager (8 writers — insert/mark + 5 notify_* + 1 daily)
+# ===========================================================================
+
+def test_notification_writers(temp_db, monkeypatch):
+    import notification_manager as nm
+
+    # Stub network fanout — these tests cover ONLY the DB write path; the
+    # Discord/Telegram side-effects are tested elsewhere.
+    monkeypatch.setattr(nm, "send_discord_notification", lambda *a, **k: True, raising=True)
+    monkeypatch.setattr(nm, "send_telegram_notification", lambda *a, **k: True, raising=True)
+    # Stub get_setting so external fanout is short-circuited (and hits no env).
+    import db as _db
+    monkeypatch.setattr(_db, "get_setting", lambda *a, **k: "", raising=False)
+
+    nid = nm.insert_notification("test", "Title", "Hello", bot_id=11)
+    assert nid > 0
+
+    assert nm.notify_trade_executed("bot1", "BTC/USD", "buy", 0.5, 100.0)
+    assert nm.notify_take_profit("bot1", "BTC/USD", 5.0, 0.05)
+    assert nm.notify_stop_loss("bot1", "BTC/USD", -3.0, -0.03)
+    assert nm.notify_bot_error("bot1", "boom")
+    assert nm.notify_drawdown_alert(-0.1)
+    assert nm.notify_daily_summary(1.5, 3, 1, "X", "Y")
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        types = sorted(t for (t,) in fresh.execute("SELECT type FROM notifications").fetchall())
+    finally:
+        fresh.close()
+    assert types == sorted([
+        "test", "trade_executed", "take_profit", "stop_loss",
+        "bot_error", "drawdown_alert", "daily_summary",
+    ])
+
+    # mark_notification_read smoke
+    assert nm.mark_notification_read(nid) is True
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        flag = fresh.execute("SELECT read FROM notifications WHERE id=?", (nid,)).fetchone()[0]
+    finally:
+        fresh.close()
+    assert int(flag) == 1
+
+
+def test_notification_writers_under_concurrent_load(temp_db, monkeypatch):
+    """Hammer notify_trade_executed from 4 threads. Pre-migration the DB
+    INSERT had no retry; under add_log/order_event contention this would
+    OperationalError. Asserts zero leaks now."""
+    import notification_manager as nm
+    monkeypatch.setattr(nm, "send_discord_notification", lambda *a, **k: True, raising=True)
+    monkeypatch.setattr(nm, "send_telegram_notification", lambda *a, **k: True, raising=True)
+    import db as _db
+    monkeypatch.setattr(_db, "get_setting", lambda *a, **k: "", raising=False)
+
+    DURATION_SEC = 1.5
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    cnt_lock = threading.Lock()
+
+    def _worker(label: int):
+        deadline = time.monotonic() + DURATION_SEC
+        i = 0
+        while time.monotonic() < deadline:
+            try:
+                nm.notify_trade_executed(f"bot{label}", "BTC/USD", "buy", 0.01 * i, 100.0 + i)
+                with cnt_lock:
+                    counts[label] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((label, repr(e)))
+                return
+            i += 1
+
+    threads = [threading.Thread(target=_worker, args=(b,)) for b in (1, 2, 3, 4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive()
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for b, n in counts.items():
+        assert n > 0
+
+
 def test_explore_writers_under_concurrent_load(temp_db):
     """4 threads each calling a mix of save_signal_outcome /
     upsert_explore_feed_row / mark_explore_signals_pending for 1.5s; assert

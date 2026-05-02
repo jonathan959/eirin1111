@@ -188,30 +188,58 @@ def send_telegram_notification(
 # =========================================================
 # Notification Storage & Retrieval
 # =========================================================
+def _insert_notification_row(
+    notification_type: str,
+    title: str,
+    message: str,
+    bot_id: Optional[int] = None,
+    timestamp: Optional[int] = None,
+) -> int:
+    """Internal helper: INSERT a notification row through write_txn(None, ...).
+
+    Returns the new row id, or -1 on failure (failure is logged; never raises).
+    All notify_* and insert_notification helpers route here, so retry/locking
+    semantics are consistent.
+    """
+    from db import write_txn, now_ts
+    holder: Dict[str, int] = {}
+    ts = int(timestamp) if timestamp is not None else now_ts()
+
+    def _do(con) -> None:
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
+            VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (ts, str(notification_type), str(title), str(message),
+             int(bot_id) if bot_id is not None else None),
+        )
+        holder["id"] = int(cur.lastrowid)
+
+    try:
+        write_txn(None, _do, name="insert_notification")
+        return holder.get("id", -1)
+    except Exception:
+        logger.exception(
+            "insert_notification failed (type=%s title=%s)", notification_type, title
+        )
+        return -1
+
+
 def insert_notification(
     notification_type: str,
     title: str,
     message: str,
     bot_id: Optional[int] = None,
 ) -> int:
-    """Insert notification into database. Returns notification_id."""
-    try:
-        from db import _conn, now_ts
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, ?, 0)
-            """,
-            (now_ts(), notification_type, title, message, bot_id),
-        )
-        con.commit()
-        result = con.execute("SELECT last_insert_rowid() as id").fetchone()
-        con.close()
-        return result["id"] if result else -1
-    except Exception as e:
-        logger.debug("Failed to insert notification: %s", e)
-        return -1
+    """Insert notification into database. Returns notification_id, or -1 on failure.
+
+    Phase 1.2b step 6: routes through write_txn(None, ...). Errors are logged
+    via logger.exception (no silent ``except: pass``) but still swallowed —
+    notification failures must not abort the calling trading flow.
+    """
+    return _insert_notification_row(notification_type, title, message, bot_id)
 
 
 def get_notifications(limit: int = 50, unread_only: bool = False) -> List[Dict[str, Any]]:
@@ -237,16 +265,21 @@ def get_notifications(limit: int = 50, unread_only: bool = False) -> List[Dict[s
 
 
 def mark_notification_read(notification_id: int) -> bool:
-    """Mark a notification as read."""
+    """Mark a notification as read.
+
+    Phase 1.2b step 6: write_txn(None, ...). Returns False on failure (logged
+    via logger.exception). Caller decides whether to surface to the user.
+    """
+    from db import write_txn
+
+    def _do(con) -> None:
+        con.execute("UPDATE notifications SET read = 1 WHERE id = ?", (int(notification_id),))
+
     try:
-        from db import _conn
-        con = _conn()
-        con.execute("UPDATE notifications SET read = 1 WHERE id = ?", (notification_id,))
-        con.commit()
-        con.close()
+        write_txn(None, _do, name="mark_notification_read")
         return True
-    except Exception as e:
-        logger.debug("Failed to mark notification read: %s", e)
+    except Exception:
+        logger.exception("mark_notification_read failed (id=%s)", notification_id)
         return False
 
 
@@ -266,6 +299,38 @@ def get_unread_count() -> int:
 # =========================================================
 # Notification Event Functions
 # =========================================================
+def _send_external(title: str, message: str, color: int) -> None:
+    """Best-effort fanout to Discord + Telegram. Run AFTER the DB write so
+    network I/O never holds the write lock. Errors are logged but do not
+    propagate to the caller."""
+    try:
+        from db import get_setting
+    except Exception:
+        logger.exception("notification_manager: db.get_setting import failed")
+        return
+    try:
+        webhook_url = get_setting("discord_webhook_url", "").strip()
+    except Exception:
+        webhook_url = ""
+        logger.exception("notification_manager: get_setting(discord_webhook_url) failed")
+    if webhook_url:
+        try:
+            send_discord_notification(webhook_url, title, message, color=color)
+        except Exception:
+            logger.exception("notification_manager: discord fanout failed")
+    try:
+        bot_token = get_setting("telegram_bot_token", "").strip()
+        chat_id = get_setting("telegram_chat_id", "").strip()
+    except Exception:
+        bot_token = chat_id = ""
+        logger.exception("notification_manager: get_setting(telegram_*) failed")
+    if bot_token and chat_id:
+        try:
+            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
+        except Exception:
+            logger.exception("notification_manager: telegram fanout failed")
+
+
 def notify_trade_executed(
     bot_name: str,
     symbol: str,
@@ -274,45 +339,16 @@ def notify_trade_executed(
     price: float,
 ) -> bool:
     """Notify when a trade is executed."""
-    try:
-        from db import get_setting, _conn
+    title = f"Trade Executed: {symbol}"
+    message = f"**{bot_name}** {side.upper()} {amount} @ {price:.4f}"
 
-        title = f"Trade Executed: {symbol}"
-        message = f"**{bot_name}** {side.upper()} {amount} @ {price:.4f}"
-
-        # Store in DB
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "trade_executed", title, message),
-        )
-        con.commit()
-        con.close()
-
-        # Send to Discord if configured
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            color = 0x089981 if side.lower() == "buy" else 0xf23645
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=color,
-            )
-
-        # Send to Telegram if configured
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_trade_executed failed: %s", e)
+    new_id = _insert_notification_row("trade_executed", title, message)
+    if new_id < 0:
         return False
+
+    color = 0x089981 if side.lower() == "buy" else 0xf23645
+    _send_external(title, message, color)
+    return True
 
 
 def notify_take_profit(
@@ -322,41 +358,15 @@ def notify_take_profit(
     profit_pct: float,
 ) -> bool:
     """Notify when take profit is hit."""
-    try:
-        from db import get_setting, _conn
+    title = f"Take Profit: {symbol}"
+    message = f"**{bot_name}** closed profitably: +{profit_amount:.2f} ({profit_pct:.2%})"
 
-        title = f"Take Profit: {symbol}"
-        message = f"**{bot_name}** closed profitably: +{profit_amount:.2f} ({profit_pct:.2%})"
-
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "take_profit", title, message),
-        )
-        con.commit()
-        con.close()
-
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=0x00ff00,  # Green for profit
-            )
-
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_take_profit failed: %s", e)
+    new_id = _insert_notification_row("take_profit", title, message)
+    if new_id < 0:
         return False
+
+    _send_external(title, message, 0x00ff00)
+    return True
 
 
 def notify_stop_loss(
@@ -366,119 +376,41 @@ def notify_stop_loss(
     loss_pct: float,
 ) -> bool:
     """Notify when stop loss is hit."""
-    try:
-        from db import get_setting, _conn
+    title = f"Stop Loss: {symbol}"
+    message = f"**{bot_name}** hit stop loss: {loss_amount:.2f} ({loss_pct:.2%})"
 
-        title = f"Stop Loss: {symbol}"
-        message = f"**{bot_name}** hit stop loss: {loss_amount:.2f} ({loss_pct:.2%})"
-
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "stop_loss", title, message),
-        )
-        con.commit()
-        con.close()
-
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=0xff0000,  # Red for loss
-            )
-
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_stop_loss failed: %s", e)
+    new_id = _insert_notification_row("stop_loss", title, message)
+    if new_id < 0:
         return False
+
+    _send_external(title, message, 0xff0000)
+    return True
 
 
 def notify_bot_error(bot_name: str, error_message: str) -> bool:
     """Notify when a bot encounters an error."""
-    try:
-        from db import get_setting, _conn
+    title = f"Bot Error: {bot_name}"
+    message = f"Error: {error_message[:200]}"
 
-        title = f"Bot Error: {bot_name}"
-        message = f"Error: {error_message[:200]}"
-
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "bot_error", title, message),
-        )
-        con.commit()
-        con.close()
-
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=0xff0000,  # Red for error
-            )
-
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_bot_error failed: %s", e)
+    new_id = _insert_notification_row("bot_error", title, message)
+    if new_id < 0:
         return False
+
+    _send_external(title, message, 0xff0000)
+    return True
 
 
 def notify_drawdown_alert(portfolio_pnl_pct: float) -> bool:
     """Notify when portfolio drawdown exceeds threshold."""
-    try:
-        from db import get_setting, _conn
+    title = "Drawdown Alert"
+    message = f"Portfolio drawdown: {portfolio_pnl_pct:.2%}"
 
-        title = "Drawdown Alert"
-        message = f"Portfolio drawdown: {portfolio_pnl_pct:.2%}"
-
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "drawdown_alert", title, message),
-        )
-        con.commit()
-        con.close()
-
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=0xffa500,  # Orange for warning
-            )
-
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_drawdown_alert failed: %s", e)
+    new_id = _insert_notification_row("drawdown_alert", title, message)
+    if new_id < 0:
         return False
+
+    _send_external(title, message, 0xffa500)
+    return True
 
 
 def notify_daily_summary(
@@ -489,41 +421,18 @@ def notify_daily_summary(
     worst_trade: str,
 ) -> bool:
     """Notify with daily trading summary."""
-    try:
-        from db import get_setting, _conn
+    title = "Daily Summary"
+    total_trades = win_count + loss_count
+    win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
+    message = (
+        f"Trades: {total_trades} | Wins: {win_count} ({win_rate:.0f}%) | "
+        f"P&L: {total_pnl:.2f}\nBest: {best_trade} | Worst: {worst_trade}"
+    )
 
-        title = "Daily Summary"
-        total_trades = win_count + loss_count
-        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
-        message = f"Trades: {total_trades} | Wins: {win_count} ({win_rate:.0f}%) | P&L: {total_pnl:.2f}\nBest: {best_trade} | Worst: {worst_trade}"
-
-        con = _conn()
-        con.execute(
-            """
-            INSERT INTO notifications(timestamp, type, title, message, bot_id, read)
-            VALUES (?, ?, ?, ?, NULL, 0)
-            """,
-            (int(time.time()), "daily_summary", title, message),
-        )
-        con.commit()
-        con.close()
-
-        webhook_url = get_setting("discord_webhook_url", "").strip()
-        if webhook_url:
-            color = 0x00ff00 if total_pnl >= 0 else 0xff0000
-            send_discord_notification(
-                webhook_url,
-                title,
-                message,
-                color=color,
-            )
-
-        bot_token = get_setting("telegram_bot_token", "").strip()
-        chat_id = get_setting("telegram_chat_id", "").strip()
-        if bot_token and chat_id:
-            send_telegram_notification(bot_token, chat_id, f"{title}\n{message}")
-
-        return True
-    except Exception as e:
-        logger.debug("notify_daily_summary failed: %s", e)
+    new_id = _insert_notification_row("daily_summary", title, message)
+    if new_id < 0:
         return False
+
+    color = 0x00ff00 if total_pnl >= 0 else 0xff0000
+    _send_external(title, message, color)
+    return True
