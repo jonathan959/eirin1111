@@ -2,12 +2,14 @@
 
 import os
 import socket
+import sqlite3
 import time
 import threading
 import re
 import json
 import logging
 import gc
+import hashlib
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +41,100 @@ except Exception as e:
     logger.warning(f"Could not register signal handlers: {e}")
 
 # =========================================================
+# Memory monitoring for scan stability
+# =========================================================
+def _memory_usage_mb() -> float:
+    """Return current process RSS in MB (prefers psutil for Windows + Linux accuracy)."""
+    try:
+        import psutil
+        return float(psutil.Process().memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux: KB; macOS: bytes — heuristic
+        if ru > 10**9:
+            return float(ru) / (1024.0 * 1024.0)
+        return float(ru) / 1024.0
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+# Baseline RSS for this app (TensorFlow + scans) is often 600–1200MB. A single "400MB" ceiling
+# aborts every scan and leaves medium/long never run + 502s when the worker is wedged.
+# Soft = pause + GC only; Hard = abort scan (OOM protection).
+_SCAN_MEMORY_SOFT_MB = float(os.getenv("SCAN_MEMORY_SOFT_MB", "1600"))
+_SCAN_MEMORY_HARD_MB = float(os.getenv("SCAN_MEMORY_HARD_MB", "3200"))
+# Legacy SCAN_MEMORY_LIMIT_MB → hard limit only if value is sane (old "400" deploys would abort every scan)
+if os.getenv("SCAN_MEMORY_LIMIT_MB", "").strip():
+    try:
+        _lim = float(os.getenv("SCAN_MEMORY_LIMIT_MB", ""))
+        if _lim >= 800:
+            _SCAN_MEMORY_HARD_MB = _lim
+    except ValueError:
+        pass
+
+_SCAN_CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".scan_checkpoint.json")
+# Single scan slot: manual Rescan endpoint shares this to prevent UI-triggered duplicates.
+_RECO_SCAN_SEM = threading.Semaphore(1)
+# True while any multi-step scan thread (_scan_async) is running — stays True between horizons.
+_RECO_SCAN_ACTIVE = False
+_RECO_SCAN_ACTIVE_LOCK = threading.Lock()
+# Per-horizon scan locks — allow all 3 horizons to run in parallel without blocking each other.
+_HORIZON_SCANNING: Dict[str, bool] = {"short": False, "medium": False, "long": False}
+_HORIZON_SCAN_LOCKS: Dict[str, threading.Lock] = {
+    "short": threading.Lock(), "medium": threading.Lock(), "long": threading.Lock(),
+}
+# One-shot threads that are expected to exit: exclude from watchdog restart + report as "completed".
+_ONE_SHOT_THREADS = frozenset({"autostart", "bots_summary_prewarm", "explore_startup_scan", "startup_backtest"})
+
+
+def _scan_checkpoint_read() -> Dict[str, Any]:
+    try:
+        import json
+        if os.path.isfile(_SCAN_CHECKPOINT_PATH):
+            with open(_SCAN_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _scan_checkpoint_write(horizon: str, fingerprint: str, next_batch_start: int) -> None:
+    try:
+        import json
+        with open(_SCAN_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "horizon": horizon,
+                    "fingerprint": fingerprint,
+                    "next_batch_start": int(next_batch_start),
+                    "ts": int(time.time()),
+                },
+                f,
+            )
+    except Exception:
+        pass
+
+
+def _scan_checkpoint_clear_for_horizon(horizon: str) -> None:
+    try:
+        ck = _scan_checkpoint_read()
+        if ck.get("horizon") == horizon and os.path.isfile(_SCAN_CHECKPOINT_PATH):
+            os.remove(_SCAN_CHECKPOINT_PATH)
+    except Exception:
+        pass
+
+# =========================================================
 # Env loader: MUST RUN BEFORE importing KrakenClient/BotManager
 # =========================================================
 from env_utils import load_env, get_last_load_result
@@ -53,6 +149,7 @@ from db import (
     update_bots_by_type,
     add_log,
     create_bot,
+    patch_bot_risk_after_create,
     update_bot,
     delete_bot,
     get_bot,
@@ -73,12 +170,23 @@ from db import (
     list_strategy_decisions,
     add_order_event,
     save_recommendation_snapshot,
+    mark_explore_signals_pending,
+    upsert_explore_feed_row,
+    list_explore_feed,
+    list_explore_rejected,
+    get_latest_explore_backtest,
+    save_explore_backtest_results,
     list_recommendations,
     count_recommendations_by_horizon,
+    count_closed_deals,
     get_recommendation,
     link_recommendation_to_bot,
     get_recommendation_performance_stats,
     delete_recommendations_for_blocklist,
+    save_signal_outcome,
+    update_explore_signal_outcome,
+    list_explore_outcomes_pending_old,
+    get_strategy_win_rates,
     set_setting,
     get_setting,
     get_strategy_leaderboard,
@@ -86,6 +194,12 @@ from db import (
     upsert_trade_journal,
     list_trade_journals_for_deals,
     get_intelligence_decisions,
+    find_stale_ghost_deals,
+    cancel_ghost_deal,
+    explore_signals_max_updated_ts,
+    list_signal_accuracy_baselines,
+    list_portfolio_equity_curve,
+    get_latest_regime_for_symbols,
 )
 
 
@@ -93,6 +207,489 @@ from kraken_client import KrakenClient
 from alpaca_client import AlpacaClient
 from bot_manager import BotManager, ALLOW_LIVE_TRADING
 from alpaca_adapter import AlpacaAdapter
+from explore_scorer import signal_age_penalty, price_confirmation_score
+from explore_rank import (
+    apply_smart_rank as _explore_apply_smart_rank,
+    bt_lookup as _explore_bt_lookup,
+    row_detail_json as _explore_row_detail_json,
+)
+
+
+_STRATEGY_PERF_CACHE: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
+_EXPLORE_OUTCOMES_LAST_TS: float = 0.0
+
+
+def _explore_signal_status_from_snap(snap: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Forced explore_signals row when evaluate_signal rejects or EXPLORE_V2_GATE is set.
+    Returns ("", "") when evaluate_explore should decide buy/watch/rejected.
+    """
+    metrics = snap.get("metrics") or {}
+    risk_flags = snap.get("risk_flags") or []
+    if str(metrics.get("_evaluate_signal") or "") == "reject":
+        return "rejected", str(metrics.get("_explore_reject_reason") or "evaluate_signal_reject")
+    if any(str(f).startswith("EXPLORE_V2_GATE:") for f in risk_flags):
+        return "rejected", "explore_v2_gate"
+    return "", ""
+
+
+def _reco_rows_as_explore_feed_rows(
+    horizon: str,
+    market_type: str,
+    statuses: List[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Fallback: shape recommendations_snapshots rows like explore_signals for the Explore feed."""
+    raw = list_recommendations(horizon, limit=min(500, max(int(limit), 100)))
+    if not raw:
+        return []
+    want_crypto = market_type == "crypto"
+    want_stocks = market_type == "stocks"
+    out: List[Dict[str, Any]] = []
+    for s in raw:
+        sym = str(s.get("symbol") or "")
+        if not sym:
+            continue
+        try:
+            metrics = json.loads(s.get("metrics_json") or "{}")
+        except Exception:
+            metrics = {}
+        mt = (metrics.get("market_type") or "").strip().lower()
+        if mt == "stock":
+            mt = "stocks"
+        if not mt:
+            mt = "crypto" if "/" in sym else "stocks"
+        if want_crypto and mt != "crypto":
+            continue
+        if want_stocks and mt != "stocks":
+            continue
+        sc = float(s.get("score") or 0)
+        st = "buy" if sc >= 70 else "watch"
+        if st not in statuses:
+            continue
+        rs: List[Any] = []
+        try:
+            rs = json.loads(s.get("reasons_json") or "[]")
+        except Exception:
+            rs = []
+        reason0 = str(rs[0]) if rs else ""
+        out.append(
+            {
+                "symbol": sym,
+                "status": st,
+                "conviction_score": sc,
+                "reason": reason0,
+                "strategy": str(
+                    metrics.get("detected_strategy") or metrics.get("recommended_strategy") or ""
+                ),
+                "signal_ts": int(s.get("created_ts") or 0),
+                "updated_ts": int(s.get("created_ts") or 0),
+                "market_type": "crypto" if mt == "crypto" else "stocks",
+                "price": metrics.get("price"),
+                "change_24h": metrics.get("change_24h"),
+                "detail_json": str(s.get("metrics_json") or "{}"),
+                "rejection_reason": "",
+            }
+        )
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _explore_feed_as_recommendation_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Shape explore_signals rows like list_recommendations for /api/recommendations fallback."""
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        sym = str(r.get("symbol") or "")
+        if not sym:
+            continue
+        try:
+            detail = json.loads(r.get("detail_json") or "{}")
+        except Exception:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        metrics = {
+            **detail,
+            "market_type": r.get("market_type") or ("crypto" if "/" in sym else "stocks"),
+            "price": r.get("price"),
+            "change_24h": r.get("change_24h"),
+            "data_source": "explore_signals",
+        }
+        out.append(
+            {
+                "symbol": sym,
+                "score": float(r.get("conviction_score") or 0),
+                "metrics_json": json.dumps(metrics),
+                "reasons_json": json.dumps([str(r.get("reason") or "")]),
+                "risk_flags_json": "[]",
+                "regime_json": json.dumps({}),
+                "score_breakdown_json": "{}",
+                "created_ts": int(r.get("updated_ts") or 0),
+                "metrics": metrics,
+            }
+        )
+    return out
+
+
+def _explore_strict_buy_enabled() -> bool:
+    return os.getenv("EXPLORE_STRICT_BUY", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _explore_strict_buy_demote_reason(
+    snap: Dict[str, Any],
+    metrics: Dict[str, Any],
+    is_crypto: bool,
+) -> str:
+    """
+    When evaluate_explore says 'buy' but real-money / execution hygiene is weak,
+    demote to 'watch' with a short machine reason (also stored in detail_json).
+    """
+    if not snap.get("eligible", True):
+        return "scanner_not_eligible"
+    flags = [str(f) for f in (snap.get("risk_flags") or [])]
+    bad_exact = {"DATA_ERROR", "DATA_INVALID", "ROUTING_ERROR", "NO_CRYPTO_PROVIDER"}
+    for f in flags:
+        if f in bad_exact:
+            return f"risk_flag:{f}"
+        if f.startswith("EXPLORE_V2_GATE:"):
+            return f"risk_flag:{f[:56]}"
+
+    max_ed = int(os.getenv("EXPLORE_STRICT_EARNINGS_DAYS", "3"))
+    ed = metrics.get("earnings_days")
+    if not is_crypto and max_ed >= 0 and isinstance(ed, (int, float)) and 0 <= float(ed) <= float(max_ed):
+        return f"earnings_within_{max_ed}d"
+
+    if is_crypto:
+        try:
+            max_sp = float(os.getenv("EXPLORE_STRICT_MAX_SPREAD_PCT", "0.012"))
+        except (TypeError, ValueError):
+            max_sp = 0.012
+        spr = metrics.get("spread_pct")
+        try:
+            spf = float(spr) if spr is not None else None
+        except (TypeError, ValueError):
+            spf = None
+        if spf is not None and spf > max_sp:
+            return f"wide_spread_{spf*100:.2f}pct_gt_{max_sp*100:.2f}"
+
+        volq = metrics.get("volume_24h_quote")
+        try:
+            vq = float(volq) if volq is not None else None
+        except (TypeError, ValueError):
+            vq = None
+        if vq is not None and vq > 0:
+            try:
+                min_v = float(os.getenv("EXPLORE_STRICT_MIN_CRYPTO_QUOTE_VOL", str(RECO_MIN_VOLUME_24H)))
+            except Exception:
+                min_v = float(RECO_MIN_VOLUME_24H)
+            if vq < min_v:
+                return "low_crypto_liquidity"
+
+    return ""
+
+
+def _merge_evaluate_signal_into_snap(snap: Dict[str, Any], horizon: str, btc_ctx: Dict[str, Any]) -> None:
+    """Run explore_signals.evaluate_signal and merge strategy fields into snap['metrics'] for DB + API."""
+    _ = horizon
+    try:
+        from explore_signals import evaluate_signal
+
+        metrics = dict(snap.get("metrics") or {})
+        sym = str(snap.get("symbol") or "")
+        is_crypto = (metrics.get("market_type") or "").lower() == "crypto" or "/" in sym
+        candles = list(snap.get("_candles_1d") or [])
+        price = metrics.get("price")
+        try:
+            price_f = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            price_f = 0.0
+        try:
+            vol = float(metrics.get("volume_24h_quote") or metrics.get("volume_24h") or 0.0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        fg = int(_FEAR_GREED_CACHE.get("value") or 50)
+        try:
+            existing = float(metrics.get("composite_score") or snap.get("score") or 0.0)
+        except (TypeError, ValueError):
+            existing = 0.0
+        ev = evaluate_signal(
+            sym,
+            "crypto" if is_crypto else "stock",
+            price_f,
+            candles,
+            dict(metrics),
+            vol,
+            fg,
+            dict(btc_ctx or {}),
+            existing,
+            metrics,
+        )
+        metrics["_evaluate_signal"] = ev.get("signal")
+        metrics["_explore_reject_reason"] = ev.get("rejection_reason")
+        if ev.get("detected_strategy"):
+            metrics["detected_strategy"] = ev.get("detected_strategy")
+        metrics["strategy_reason"] = ev.get("strategy_reason") or ""
+        snap["metrics"] = metrics
+    except Exception as e:
+        logger.debug("_merge_evaluate_signal_into_snap %s: %s", snap.get("symbol"), e)
+
+
+def _get_cached_strategy_win_rates(horizon: str, lookback_days: int = 90) -> Dict[str, Any]:
+    key = (horizon, int(lookback_days))
+    now = time.time()
+    hit = _STRATEGY_PERF_CACHE.get(key)
+    if hit and (now - hit[0]) < 600:
+        return hit[1]
+    data = get_strategy_win_rates(horizon, lookback_days=lookback_days)
+    _STRATEGY_PERF_CACHE[key] = (now, data)
+    return data
+
+
+def _candle_ts_sec(c: List[float]) -> int:
+    try:
+        return int(float(c[0]))
+    except Exception:
+        return 0
+
+
+def _weekly_ohlcv_from_daily(daily: List[List[float]], max_weeks: int = 200) -> List[List[float]]:
+    """Synthesize weekly OHLCV from daily rows when native '1w' candles are missing (Kraken/CCXT edge cases)."""
+    if not daily or len(daily) < 7:
+        return []
+    from datetime import datetime, timezone
+
+    weekly: Dict[int, List[float]] = {}
+    for row in daily:
+        if len(row) < 6:
+            continue
+        try:
+            ts_ms = int(float(row[0]))
+            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            y, w, _ = dt.isocalendar()
+            wk_key = int(y) * 100 + int(w)
+            o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
+        except Exception:
+            continue
+        if wk_key not in weekly:
+            weekly[wk_key] = [float(ts_ms), o, h, l, c, v]
+        else:
+            agg = weekly[wk_key]
+            agg[2] = max(agg[2], h)
+            agg[3] = min(agg[3], l)
+            agg[4] = c
+            agg[5] += v
+    keys = sorted(weekly.keys())
+    return [weekly[k] for k in keys[-max_weeks:]]
+
+
+def _forward_prices_from_candles(
+    candles: List[List[float]],
+    signal_ts: int,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if not candles or not signal_ts:
+        return None, None, None
+    idx = None
+    for i, c in enumerate(candles):
+        if _candle_ts_sec(c) >= signal_ts:
+            idx = i
+            break
+    if idx is None:
+        return None, None, None
+
+    def _cls(off: int) -> Optional[float]:
+        j = idx + off
+        if j < len(candles):
+            try:
+                return float(candles[j][4])
+            except Exception:
+                return None
+        return None
+
+    return _cls(5), _cls(10), _cls(20)
+
+
+def _fetch_1d_for_explore_outcome(sym: str) -> List[List[float]]:
+    if "/" in sym:
+        if not kc:
+            return []
+        try:
+            return kc.fetch_ohlcv(sym, timeframe="1d", limit=400)
+        except Exception:
+            return []
+    ac = alpaca_live or alpaca_paper
+    if not ac:
+        return []
+    try:
+        return ac.get_ohlcv(sym, timeframe="1d", limit=400)
+    except Exception:
+        return []
+
+
+def _run_explore_outcomes_update_batch() -> None:
+    """Every ~4h from recommendations thread: fill 5d/10d/20d closes for pending explore outcomes."""
+    global _EXPLORE_OUTCOMES_LAST_TS
+    now = time.time()
+    if now - _EXPLORE_OUTCOMES_LAST_TS < 4 * 3600:
+        return
+    _EXPLORE_OUTCOMES_LAST_TS = now
+    rows = list_explore_outcomes_pending_old(min_age_sec=5 * 86400, limit=200)
+    if not rows:
+        return
+    updated = 0
+    for row in rows:
+        try:
+            sym = str(row.get("symbol") or "")
+            if not sym:
+                continue
+            candles = _fetch_1d_for_explore_outcome(sym)
+            p5, p10, p20 = _forward_prices_from_candles(candles, int(row.get("signal_ts") or 0))
+            if p5 is None and p10 is None and p20 is None:
+                continue
+            update_explore_signal_outcome(int(row["id"]), price_5d=p5, price_10d=p10, price_20d=p20)
+            updated += 1
+        except Exception as e:
+            logger.debug("explore outcome row %s: %s", row.get("id"), e)
+    if updated:
+        logger.info("Explore outcomes: updated %d pending rows (forward prices)", updated)
+
+
+def _persist_explore_feed_from_snap(
+    symbol: str,
+    horizon: str,
+    snap: Dict[str, Any],
+    candles_1d: List[List[float]],
+    btc_ctx: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Final Explore write: conviction strategies + UPSERT explore_signals (buy/watch/rejected)."""
+    try:
+        from explore_signals import STRATEGY_LABELS, evaluate_explore, infer_rejection_code
+
+        metrics = snap.get("metrics") or {}
+        is_crypto = (metrics.get("market_type") or "").lower() == "crypto" or "/" in str(symbol)
+        ev = evaluate_explore(
+            str(symbol),
+            list(candles_1d or []),
+            is_crypto=is_crypto,
+            horizon=horizon,
+            market_breadth=dict(metrics),
+            btc_context=dict(btc_ctx or {}),
+        )
+        forced_st, forced_reason = _explore_signal_status_from_snap(snap)
+        _bear_strategies = {"relative_strength_bear", "oversold_extreme_fear", "volume_capitulation", "oversold_bounce"}
+        _ev_strategy = str(ev.get("strategy") or "")
+        _ev_has_bear_match = _ev_strategy in _bear_strategies and ev.get("status") != "rejected"
+        if forced_st and not _ev_has_bear_match:
+            row_status = forced_st
+            row_reason = forced_reason
+            row_conv = 0.0
+        elif forced_st and _ev_has_bear_match:
+            row_status = str(ev.get("status") or "watch")
+            row_reason = str(ev.get("reason") or "")
+            row_conv = float(ev.get("conviction") or 0)
+            if row_status == "buy":
+                row_status = "watch"
+                row_reason += " | Gate bypassed for bear strategy (demoted to watch)"
+        else:
+            row_status = str(ev.get("status") or "rejected")
+            row_reason = str(ev.get("reason") or "")
+            row_conv = float(ev.get("conviction") or 0)
+
+        strict_demote = ""
+        if row_status == "buy" and not forced_st and _explore_strict_buy_enabled():
+            strict_demote = _explore_strict_buy_demote_reason(snap, metrics, is_crypto)
+            if strict_demote:
+                row_status = "watch"
+                row_reason = (row_reason + " | " if row_reason else "") + "Strict buy gate: " + strict_demote
+
+        price = metrics.get("price")
+        try:
+            price_f = float(price) if price is not None and float(price) > 0 else None
+        except (TypeError, ValueError):
+            price_f = None
+        chg = metrics.get("change_24h")
+        try:
+            chg_f = float(chg) if chg is not None else None
+        except (TypeError, ValueError):
+            chg_f = None
+        # Prefer chart-pattern name (evaluate_explore) over hybrid scanner label (evaluate_signal).
+        # detect_strategy() often falls through to "Trend Follow" for most names — that hid real patterns.
+        _pat_key = str(ev.get("strategy") or "").strip()
+        _pattern_label = STRATEGY_LABELS.get(_pat_key, _pat_key) if _pat_key else ""
+        strat_human = (
+            _pattern_label
+            or str(metrics.get("detected_strategy") or "").strip()
+            or _pat_key
+        )
+        detail = dict(ev.get("detail") or {})
+        if strict_demote:
+            detail["strict_buy_demotion"] = strict_demote
+        # Persist vol_24h so the feed can render the volume column
+        _vol = metrics.get("vol_24h") or metrics.get("volume_24h") or metrics.get("volume")
+        if _vol and not detail.get("vol_24h"):
+            try:
+                detail["vol_24h"] = float(_vol)
+            except (TypeError, ValueError):
+                pass
+        detail["evaluate_signal"] = {
+            "signal": metrics.get("_evaluate_signal"),
+            "detected_strategy": metrics.get("detected_strategy"),
+            "strategy_reason": metrics.get("strategy_reason"),
+        }
+        # Volume vs 20d average for Explore table (× multiplier column)
+        try:
+            from explore_signals import volume_avg_and_ratio_from_candles
+
+            _facts = detail.get("facts") if isinstance(detail.get("facts"), dict) else {}
+            _vr_fact = _facts.get("volume_ratio")
+            if _vr_fact is None:
+                _vr_fact = _facts.get("volume_mult")
+            if _vr_fact is not None:
+                try:
+                    detail["volume_ratio"] = round(float(_vr_fact), 4)
+                except (TypeError, ValueError):
+                    pass
+            _vr_c, _avg_c = volume_avg_and_ratio_from_candles(list(candles_1d or []))
+            if detail.get("volume_ratio") is None and _vr_c is not None:
+                detail["volume_ratio"] = round(float(_vr_c), 4)
+            if _avg_c is not None and float(_avg_c) > 0:
+                detail["avg_volume_20d"] = float(_avg_c)
+        except Exception:
+            pass
+        _rej_code = infer_rejection_code(row_reason) if row_status == "rejected" else None
+        upsert_explore_feed_row(
+            str(symbol),
+            horizon,
+            row_status,
+            row_conv,
+            row_reason,
+            strat_human[:128] if strat_human else str(ev.get("strategy") or ""),
+            int(ev.get("signal_ts") or 0),
+            json.dumps(detail),
+            price_f,
+            chg_f,
+            "crypto" if is_crypto else "stocks",
+            rejection_reason=_rej_code,
+        )
+        if row_status == "buy" and price_f:
+            try:
+                cs = metrics.get("composite_score")
+                cs_f = float(cs) if cs is not None else None
+            except (TypeError, ValueError):
+                cs_f = None
+            cg = metrics.get("conviction_grade")
+            save_signal_outcome(
+                str(symbol),
+                str(horizon),
+                str(strat_human or metrics.get("detected_strategy") or "Trend Follow")[:200],
+                int(ev.get("signal_ts") or now_ts()),
+                float(price_f),
+                cs_f,
+                str(cg)[:8] if cg else None,
+            )
+    except Exception as e:
+        logger.warning("persist explore feed failed for %s: %s", symbol, e)
+
 
 USE_UNIFIED_ALPACA = os.getenv("USE_UNIFIED_ALPACA", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 try:
@@ -110,6 +707,7 @@ from strategies import (
     ema_series,
     rsi,
     adx,
+    macd,
     _atr,
     rolling_return,
     max_drawdown,
@@ -195,8 +793,8 @@ RECO_SYMBOLS = [
     s.strip() for s in os.getenv(
         "RECO_SYMBOLS",
         ",".join([
-            # Top tier
-            "XBT/USD","ETH/USD","SOL/USD","XRP/USD","ADA/USD","DOGE/USD","AVAX/USD","LINK/USD",
+            # Top tier (ccxt Kraken uses BTC/USD, not XBT/USD)
+            "BTC/USD","ETH/USD","SOL/USD","XRP/USD","ADA/USD","DOGE/USD","AVAX/USD","LINK/USD",
             "LTC/USD","BCH/USD","DOT/USD","ATOM/USD","XLM/USD","ETC/USD","UNI/USD","AAVE/USD",
             "MATIC/USD","ALGO/USD","TRX/USD","EOS/USD","ICP/USD","FTM/USD","SAND/USD","MANA/USD",
             "GRT/USD","APE/USD","FIL/USD","NEAR/USD","XTZ/USD","HBAR/USD","EGLD/USD","FLOW/USD",
@@ -239,9 +837,13 @@ if _ALPACA_KEYS_PRESENT:
         "BA", "F", "GM", "XOM", "CVX",
     ])
 RECO_MAX_SYMBOLS = int(os.getenv("RECO_MAX_SYMBOLS", "600"))
-RECO_SHORT_EVERY_SEC = int(os.getenv("RECO_SHORT_EVERY_SEC", "900"))  # 15m
-RECO_MEDIUM_EVERY_SEC = int(os.getenv("RECO_MEDIUM_EVERY_SEC", "1800"))  # 30m
-RECO_LONG_EVERY_SEC = int(os.getenv("RECO_LONG_EVERY_SEC", "3600"))   # 60m
+# Per-scan crypto cap (stocks fill the rest up to RECO_MAX_SYMBOLS). Was hardcoded 50 → mostly stock signals.
+RECO_SCAN_CRYPTO_CAP = int(os.getenv("RECO_SCAN_CRYPTO_CAP", "140"))
+RECO_SHORT_EVERY_SEC = int(os.getenv("RECO_SHORT_EVERY_SEC", "1800"))   # 30m
+RECO_MEDIUM_EVERY_SEC = int(os.getenv("RECO_MEDIUM_EVERY_SEC", "3600")) # 60m
+RECO_LONG_EVERY_SEC = int(os.getenv("RECO_LONG_EVERY_SEC", "7200"))    # 2hr
+# OHLCV cache TTL used during scans — long enough for medium/long to reuse short's fetched data.
+_SCAN_OHLCV_TTL = int(os.getenv("SCAN_OHLCV_TTL", "7200"))  # 2hr
 RECO_SHORT_MIN_DAYS = int(os.getenv("RECO_SHORT_MIN_DAYS", "90"))
 RECO_MEDIUM_MIN_DAYS = int(os.getenv("RECO_MEDIUM_MIN_DAYS", "135"))
 RECO_LONG_MIN_DAYS = int(os.getenv("RECO_LONG_MIN_DAYS", "180"))
@@ -250,10 +852,37 @@ RECO_CRYPTO_TOP_30_ONLY = os.getenv("RECO_CRYPTO_TOP_30_ONLY", "0").strip().lowe
 RECO_MAX_SPREAD_PCT = float(os.getenv("RECO_MAX_SPREAD_PCT", "0.004"))
 RECO_MAX_ATR_PCT_SHORT = float(os.getenv("RECO_MAX_ATR_PCT_SHORT", "0.06"))
 RECO_ATR_PCT_MODERATE = float(os.getenv("RECO_ATR_PCT_MODERATE", "0.035"))
-_RECO_STATE: Dict[str, Dict[str, Any]] = {"short": {}, "medium": {}, "long": {}}
+_RECO_STATE_DEFAULT = {"last_run_ts": 0, "error": "", "scanned": 0, "eligible": 0, "total": 0, "scanning": False}
+_RECO_STATE: Dict[str, Dict[str, Any]] = {
+    "short": dict(_RECO_STATE_DEFAULT),
+    "medium": dict(_RECO_STATE_DEFAULT),
+    "long": dict(_RECO_STATE_DEFAULT),
+}
+
+# /api/bots/summary TTL cache — avoids N serial snapshot() calls per poll
+_BOTS_SUMMARY_CACHE: Dict[str, Any] = {"result": None, "ts": 0.0}
+_BOTS_SUMMARY_TTL = 15  # seconds
+
+# /api/prices response cache — keyed by sorted symbols string, 20s TTL
+_PRICES_CACHE: Dict[str, Dict[str, Any]] = {}
+_PRICES_CACHE_TTL = 20  # seconds
+
+# TTL caches for other frequently-polled endpoints (reduces CPU from 130%+ at idle)
+_PORTFOLIO_CACHE: Dict[str, Any] = {"result": None, "ts": 0.0}
+_PORTFOLIO_CACHE_TTL = 20  # seconds
+_HEALTH_CACHE: Dict[str, Any] = {"result": None, "ts": 0.0}
+_HEALTH_CACHE_TTL = 30  # seconds
+_NOTIF_UNREAD_CACHE: Dict[str, Any] = {"result": None, "ts": 0.0}
+_NOTIF_UNREAD_CACHE_TTL = 30  # seconds
+_SCAN_PROGRESS_CACHE: Dict[str, Any] = {"result": None, "ts": 0.0}
+_SCAN_PROGRESS_CACHE_TTL = 15  # seconds — always invalidated when a scan state changes
+
+# Fear & Greed Index cache
+_FEAR_GREED_CACHE: Dict[str, Any] = {"value": 50, "label": "Neutral", "ts": 0, "error": None}
+_FEAR_GREED_TTL = 4 * 3600  # 4 hours
 _RECO_OHLCV_CACHE: Dict[str, Dict[str, Any]] = {}
-_OHLCV_CACHE_MAX_ENTRIES = int(os.getenv("OHLCV_CACHE_MAX_ENTRIES", "2000"))
-_OHLCV_CACHE_EVICT_AGE_SEC = 3600
+_OHLCV_CACHE_MAX_ENTRIES = int(os.getenv("OHLCV_CACHE_MAX_ENTRIES", "500"))
+_OHLCV_CACHE_EVICT_AGE_SEC = 1800  # 30 min, was 60
 _SCAN_PROGRESS: Dict[str, Any] = {
     "current_symbol": "",
     "current_horizon": "",
@@ -263,8 +892,27 @@ _SCAN_PROGRESS: Dict[str, Any] = {
     "scan_history": [],
 }
 _SCAN_HISTORY_MAX = 10
-SCAN_PARALLEL_WORKERS = int(os.getenv("SCAN_PARALLEL_WORKERS", "8"))
+# Parallel recommendation scans: I/O-bound (Alpaca/Kraken/Yahoo) — use >1 worker per vCPU.
+_CPU_FOR_SCAN = int(os.cpu_count() or 4)
+_SCAN_PARALLEL_DEFAULT = 3  # Hard cap — server has limited CPU
+SCAN_PARALLEL_WORKERS = min(
+    3,  # Hard cap at 3 — server has limited RAM/CPU
+    int(os.getenv("SCAN_PARALLEL_WORKERS", "3"))
+)
+# Submitted futures per batch = workers * mult (fewer batches → less throttle sleep overhead).
+SCAN_BATCH_SIZE_MULT = max(2, int(os.getenv("SCAN_BATCH_SIZE_MULT", "2")))
+# Inter-batch pause (rate-limit protection). Much lower than legacy 1–2s; spikes when Kraken/Alpaca 429.
+SCAN_BATCH_SLEEP_STOCK_SEC = float(os.getenv("SCAN_BATCH_SLEEP_STOCK_SEC", "0.2"))
+SCAN_BATCH_SLEEP_CRYPTO_SEC = float(os.getenv("SCAN_BATCH_SLEEP_CRYPTO_SEC", "0.06"))
+SCAN_BATCH_SLEEP_RL_MID_SEC = float(os.getenv("SCAN_BATCH_SLEEP_RL_MID_SEC", "3.0"))
+SCAN_BATCH_SLEEP_RL_HIGH_SEC = float(os.getenv("SCAN_BATCH_SLEEP_RL_HIGH_SEC", "10.0"))
 _SCAN_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+# Defensive assets — bought even in bear/risk-off markets (tend to RISE when stocks/crypto fall)
+DEFENSIVE_ASSETS = {
+    "GLD", "SLV", "TLT", "XLU", "XLP", "XLV",
+    "BND", "VNQ", "IYR", "AGG",
+}
 
 # Exclude fiat FX pairs from crypto universe (e.g., AUD/USD, EUR/USD)
 FIAT_BASES = {
@@ -272,6 +920,10 @@ FIAT_BASES = {
     "CNY", "HKD", "SGD", "SEK", "NOK", "MXN", "BRL", "ZAR", "TRY", "INR",
     "KRW", "PLN", "CZK", "DKK",
 }
+
+# Data freshness tracking
+_kraken_last_candle_ts: Optional[float] = None
+_alpaca_last_candle_ts: Optional[float] = None
 
 # Stablecoins and pegged assets - never appear as buy picks (no price upside)
 STABLECOINS = {"DAI", "BUSD", "TUSD", "USDP", "FRAX", "GUSD", "USDD", "LUSD", "sUSD", "CUSD"}
@@ -285,6 +937,7 @@ _TOP_30_BASES_RAW = [
     "MANA", "AXS", "THETA", "EOS", "AAVE", "MKR", "SNX", "COMP", "YFI", "SUSHI",
     "NEAR", "APT", "ARB", "OP", "IMX", "GRT", "FTM", "CRV", "LDO", "RPL",
     "RUNE", "INJ", "TIA", "SEI", "SUI", "RENDER", "FET", "OCEAN", "AGIX", "TAO",
+    "AKT", "CHZ", "KAS", "ENA", "BLUR", "PYTH",
 ]
 TOP_30_CRYPTO = [f"{b}/USD" for b in _TOP_30_BASES_RAW]
 # Include BTC as alias for XBT (e.g. BTC/USD from other exchanges)
@@ -308,9 +961,9 @@ def _crypto_base_from_symbol(sym: str) -> str:
 # Min liquidity filters for picks (env overridable)
 RECO_MIN_MARKET_CAP = float(os.getenv("RECO_MIN_MARKET_CAP", "50000000"))   # $50M
 RECO_MIN_VOLUME_24H = float(os.getenv("RECO_MIN_VOLUME_24H", "100000"))    # $100K
-RECO_MIN_SCORE_SHORT = float(os.getenv("RECO_MIN_SCORE_SHORT", "45"))
-RECO_MIN_SCORE_MEDIUM = float(os.getenv("RECO_MIN_SCORE_MEDIUM", "40"))
-RECO_MIN_SCORE_LONG = float(os.getenv("RECO_MIN_SCORE_LONG", "42"))
+RECO_MIN_SCORE_SHORT = float(os.getenv("RECO_MIN_SCORE_SHORT", "62"))
+RECO_MIN_SCORE_MEDIUM = float(os.getenv("RECO_MIN_SCORE_MEDIUM", "58"))
+RECO_MIN_SCORE_LONG = float(os.getenv("RECO_MIN_SCORE_LONG", "60"))
 
 # Crypto bases never recommended (not on Kraken spot or problematic)
 # STABLE: L1 token with long downtrend, poor profit potential; stablecoin-like names
@@ -323,6 +976,11 @@ if os.getenv("BLOCK_MEME_COINS", "0").strip().lower() in ("1", "true", "yes") an
     _meme_block = {"SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BRETT", "POPCAT", "TURBO", "WOJAK", "BOME"}
 CRYPTO_BLOCKLIST: set = _default_blocklist | _meme_block | {x.strip().upper() for x in _env_blocklist.split(",") if x.strip()}
 
+INVALID_KRAKEN_BASES = frozenset({
+    "HYPE", "SKY", "JUP", "WIF", "VIRTUAL", "PENGU",
+    "ICNT", "BOME", "PEOPLE", "LUNC",
+})
+
 # Optional API protection (recommended for real money)
 # If set, all /api/* routes require header: X-API-Key: <token>
 WORKER_API_TOKEN = os.getenv("WORKER_API_TOKEN", "").strip()
@@ -333,7 +991,7 @@ RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 _RATE_LIMIT_STORE: Dict[str, List[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
 
-RECO_SCAN_MAX_PER_RUN = int(os.getenv("RECO_SCAN_MAX_PER_RUN", "600"))
+RECO_SCAN_MAX_PER_RUN = int(os.getenv("RECO_SCAN_MAX_PER_RUN", "400"))
 RECO_SCAN_ERROR_LIMIT = int(os.getenv("RECO_SCAN_ERROR_LIMIT", "15"))
 RECO_SCAN_SYMBOL_SLEEP_SEC = float(os.getenv("RECO_SCAN_SYMBOL_SLEEP_SEC", "0.02"))
 
@@ -346,19 +1004,22 @@ def _reco_buy_threshold_stocks() -> float:
     v = os.getenv("RECO_BUY_THRESHOLD_STOCKS", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 55.0, "balanced": 45.0, "aggressive": 35.0}.get(RECO_PROFILE, 45.0)
+    # Balanced at 65: produces more high-quality opportunities while regime gate + RSI gate
+    # still filter out low-conviction signals. Conservative keeps 72 for strict risk control.
+    return {"conservative": 72.0, "balanced": 65.0, "aggressive": 55.0}.get(RECO_PROFILE, 65.0)
 
 def _reco_buy_threshold_crypto() -> float:
     v = os.getenv("RECO_BUY_THRESHOLD_CRYPTO", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 35.0, "balanced": 25.0, "aggressive": 18.0}.get(RECO_PROFILE, 25.0)
+    # Balanced at 65: crypto signals align with stocks for consistent "All Assets" view.
+    return {"conservative": 70.0, "balanced": 65.0, "aggressive": 55.0}.get(RECO_PROFILE, 65.0)
 
 def _reco_watch_threshold() -> float:
     v = os.getenv("RECO_WATCH_THRESHOLD", "").strip()
     if v and v.replace(".", "").replace("-", "").isdigit():
         return float(v)
-    return {"conservative": 35.0, "balanced": 20.0, "aggressive": 15.0}.get(RECO_PROFILE, 20.0)
+    return {"conservative": 52.0, "balanced": 48.0, "aggressive": 40.0}.get(RECO_PROFILE, 48.0)
 
 # Legacy names for code that still references them
 RECO_BUY_THRESHOLD_CRYPTO = _reco_buy_threshold_crypto()
@@ -390,18 +1051,332 @@ def _start_background_thread(name: str, target) -> None:
     logger.info("started background thread: %s", name)
 
 
+def _fetch_fear_greed() -> Dict[str, Any]:
+    """Fetch Crypto Fear & Greed Index. Returns {value, label, ts}."""
+    global _FEAR_GREED_CACHE
+    now = time.time()
+    if now - _FEAR_GREED_CACHE.get("ts", 0) < _FEAR_GREED_TTL and _FEAR_GREED_CACHE.get("value") is not None:
+        return _FEAR_GREED_CACHE
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://api.alternative.me/fng/?limit=1", headers={"User-Agent": "EirinBot/2.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("data"):
+            entry = data["data"][0]
+            val = int(entry.get("value", 50))
+            label = str(entry.get("value_classification", "Neutral"))
+            _FEAR_GREED_CACHE = {"value": val, "label": label, "ts": now, "error": None}
+            logger.info("Fear & Greed updated: %d (%s)", val, label)
+    except Exception as e:
+        logger.warning("Fear & Greed fetch failed: %s — using cached/default", e)
+        _FEAR_GREED_CACHE["error"] = str(e)[:100]
+    return _FEAR_GREED_CACHE
+
+
+def _fear_greed_score_adjustment() -> float:
+    """Return score adjustment based on Fear & Greed Index."""
+    fg = _FEAR_GREED_CACHE.get("value", 50)
+    if fg <= 25:
+        return 4.0
+    elif fg <= 45:
+        return 2.0
+    elif fg <= 55:
+        return 0.0
+    elif fg <= 75:
+        return -3.0
+    else:
+        return -6.0
+
+
+# News Sentiment Cache
+_NEWS_CACHE: Dict[str, Dict[str, Any]] = {}
+_NEWS_CACHE_TTL = 7200  # 2 hours
+
+# Consecutive buy signal tracking: {symbol: {"count": int, "last_scan_ts": float}}
+_CONSECUTIVE_BUY_TRACKER: Dict[str, Dict[str, Any]] = {}
+
+# Sector momentum cache: updated after each stock scan
+_SECTOR_MOMENTUM: Dict[str, Dict[str, Any]] = {}
+# {sector: {"avg_return_5d": float, "stocks_count": int, "rank": int, "tier": "top"|"middle"|"bottom"}}
+
+
+def _update_sector_momentum(items: list) -> None:
+    """Recalculate sector momentum from scanned stock items."""
+    global _SECTOR_MOMENTUM
+    sector_returns: Dict[str, list] = {}
+    for item in items:
+        if item.get("market_type") != "stocks":
+            continue
+        sector = item.get("sector") or STOCK_SECTORS.get(str(item.get("symbol", "")).replace("/USD", "").upper(), "")
+        if not sector or sector == "ETF":
+            continue
+        chg = item.get("change_24h")
+        if chg is not None:
+            sector_returns.setdefault(sector, []).append(float(chg))
+    if len(sector_returns) < 4:
+        return
+    sector_avgs = {s: sum(r) / len(r) for s, r in sector_returns.items() if r}
+    ranked = sorted(sector_avgs.items(), key=lambda x: -x[1])
+    new_cache = {}
+    for i, (sector, avg_ret) in enumerate(ranked):
+        if i < 2:
+            tier = "top"
+        elif i >= len(ranked) - 2:
+            tier = "bottom"
+        else:
+            tier = "middle"
+        new_cache[sector] = {
+            "avg_return_5d": round(avg_ret, 2),
+            "stocks_count": len(sector_returns[sector]),
+            "rank": i + 1,
+            "total_sectors": len(ranked),
+            "tier": tier,
+        }
+    _SECTOR_MOMENTUM = new_cache
+    logger.info("Sector momentum updated: %d sectors — top: %s, bottom: %s",
+                len(new_cache),
+                [s for s, d in new_cache.items() if d["tier"] == "top"],
+                [s for s, d in new_cache.items() if d["tier"] == "bottom"])
+
+STOCK_SECTORS = {
+    "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology", "AMZN": "Technology",
+    "TSLA": "Consumer Cyclical", "NVDA": "Technology", "META": "Technology", "NFLX": "Communication",
+    "AMD": "Technology", "INTC": "Technology", "QCOM": "Technology", "CRM": "Technology",
+    "ADBE": "Technology", "AVGO": "Technology", "TXN": "Technology", "PLTR": "Technology",
+    "ROKU": "Technology", "SHOP": "Technology", "PYPL": "Financial", "SQ": "Financial",
+    "JPM": "Financial", "BAC": "Financial", "V": "Financial", "MA": "Financial",
+    "WFC": "Financial", "GS": "Financial", "MS": "Financial", "BLK": "Financial", "C": "Financial", "AXP": "Financial",
+    "COIN": "Financial", "MSTR": "Technology", "MARA": "Technology", "RIOT": "Technology",
+    "HOOD": "Financial", "SOFI": "Financial", "AFRM": "Financial", "UPST": "Financial",
+    "CLSK": "Technology", "HUT": "Technology", "BITF": "Technology",
+    "JNJ": "Healthcare", "PFE": "Healthcare", "MRK": "Healthcare", "UNH": "Healthcare",
+    "ABBV": "Healthcare", "LLY": "Healthcare", "PG": "Consumer Defensive",
+    "DIS": "Communication", "KO": "Consumer Defensive", "PEP": "Consumer Defensive",
+    "WMT": "Consumer Defensive", "TGT": "Consumer Cyclical", "COST": "Consumer Defensive",
+    "HD": "Consumer Cyclical", "LOW": "Consumer Cyclical", "MCD": "Consumer Cyclical",
+    "UBER": "Technology", "LYFT": "Technology", "DKNG": "Consumer Cyclical",
+    "BA": "Industrials", "F": "Consumer Cyclical", "GM": "Consumer Cyclical",
+    "XOM": "Energy", "CVX": "Energy", "T": "Communication", "VZ": "Communication",
+    "GME": "Consumer Cyclical", "AMC": "Communication", "CVNA": "Consumer Cyclical",
+    "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF", "DIA": "ETF",
+    "XLK": "ETF", "XLF": "ETF", "XLE": "ETF", "XLV": "ETF", "XLY": "ETF",
+    "XLP": "ETF", "XLI": "ETF", "GLD": "ETF", "SLV": "ETF",
+    "TQQQ": "ETF", "SQQQ": "ETF", "SOXL": "ETF", "ARKK": "ETF",
+}
+
+_NEGATIVE_STRONG = {"hack", "exploit", "crash", "ban", "fraud", "sec", "lawsuit", "bankrupt", "rug", "scam", "indictment"}
+_NEGATIVE_MILD = {"bearish", "decline", "sell-off", "concern", "warning", "downgrade", "dumping", "plunge"}
+_POSITIVE = {"partnership", "adoption", "etf", "upgrade", "launch", "bullish", "all-time high", "ath", "rally", "breakthrough"}
+
+
+def _fetch_news_sentiment(symbol: str) -> Dict[str, Any]:
+    """Fetch news sentiment for a symbol using CryptoCompare (free, no key needed)."""
+    cache_key = symbol.upper()
+    cached = _NEWS_CACHE.get(cache_key)
+    if cached and (time.time() - cached.get("ts", 0)) < _NEWS_CACHE_TTL:
+        return cached
+    result = {"sentiment": "Neutral", "score_adj": 0, "headlines": 0, "ts": time.time()}
+    try:
+        base = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+        if base == "XBT":
+            base = "BTC"
+        import urllib.request
+        url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories={base}"
+        req = urllib.request.Request(url, headers={"User-Agent": "EirinBot/3.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+        articles = (data.get("Data") or [])[:5]
+        result["headlines"] = len(articles)
+        adj = 0
+        for article in articles:
+            title = (article.get("title") or "").lower()
+            body = (article.get("body") or "")[:200].lower()
+            text = title + " " + body
+            for kw in _NEGATIVE_STRONG:
+                if kw in text:
+                    adj -= 8
+                    break
+            for kw in _NEGATIVE_MILD:
+                if kw in text:
+                    adj -= 3
+                    break
+            for kw in _POSITIVE:
+                if kw in text:
+                    adj += 3
+                    break
+        adj = max(-16, min(6, adj))
+        if adj <= -6:
+            result["sentiment"] = "Negative"
+        elif adj >= 3:
+            result["sentiment"] = "Positive"
+        else:
+            result["sentiment"] = "Neutral"
+        result["score_adj"] = adj
+    except Exception as e:
+        logger.debug("News sentiment fetch failed for %s: %s", symbol, e)
+    _NEWS_CACHE[cache_key] = result
+    return result
+
+
+def _fear_greed_loop() -> None:
+    """Background loop: fetch Fear & Greed every 4 hours."""
+    time.sleep(10)
+    _fetch_fear_greed()
+    while True:
+        try:
+            time.sleep(_FEAR_GREED_TTL)
+            _fetch_fear_greed()
+        except Exception as e:
+            logger.warning("fear_greed_loop error: %s", e)
+            time.sleep(300)
+
+
+def _performance_outcomes_loop() -> None:
+    """Background task: check open signal outcomes every 6 hours."""
+    time.sleep(60)
+    while True:
+        try:
+            from db import get_open_signal_outcomes, update_signal_outcome
+            signals = get_open_signal_outcomes(limit=200)
+            now = time.time()
+            checked = 0
+            wins_24 = 0
+            wins_72 = 0
+            losses_24 = 0
+            losses_72 = 0
+            for sig in signals:
+                age_h = (now - (sig.get("created_ts") or 0)) / 3600.0
+                if age_h < 24:
+                    continue
+                sym = sig.get("symbol") or ""
+                entry_p = sig.get("entry_price")
+                if not entry_p:
+                    try:
+                        m = json.loads(sig.get("metrics_json") or "{}")
+                        entry_p = float(m.get("price") or 0)
+                    except Exception:
+                        entry_p = 0
+                    if entry_p and entry_p > 0:
+                        update_signal_outcome(sig["id"], entry_price=entry_p)
+                if not entry_p or entry_p <= 0:
+                    update_signal_outcome(sig["id"], outcome_checked=2)
+                    continue
+                current_price = None
+                try:
+                    if kc and "/" in sym and "USD" in sym:
+                        current_price = kc.fetch_ticker_last(sym)
+                    elif (alpaca_paper or alpaca_live):
+                        ac = alpaca_paper or alpaca_live
+                        ticker = sym.replace("/USD", "").replace("/", "")
+                        current_price = float(ac.get_last_trade(ticker).price)
+                except Exception:
+                    pass
+                if not current_price or current_price <= 0:
+                    continue
+                up = current_price > entry_p
+                update_fields = {}
+                if age_h >= 24 and sig.get("outcome_24h") is None:
+                    update_fields["price_24h"] = current_price
+                    update_fields["outcome_24h"] = "WIN" if up else "LOSS"
+                    if up:
+                        wins_24 += 1
+                    else:
+                        losses_24 += 1
+                if age_h >= 72 and sig.get("outcome_72h") is None:
+                    update_fields["price_72h"] = current_price
+                    update_fields["outcome_72h"] = "WIN" if up else "LOSS"
+                    update_fields["outcome_checked"] = 2
+                    if up:
+                        wins_72 += 1
+                    else:
+                        losses_72 += 1
+                elif age_h >= 72:
+                    update_fields["outcome_checked"] = 2
+                elif age_h >= 24 and sig.get("outcome_24h") is not None:
+                    update_fields["outcome_checked"] = 1
+                if update_fields:
+                    update_signal_outcome(sig["id"], **update_fields)
+                    checked += 1
+            if checked > 0:
+                logger.info("Performance tracker: checked %d signals, 24h W/L %d/%d, 72h W/L %d/%d", checked, wins_24, losses_24, wins_72, losses_72)
+        except Exception as e:
+            logger.warning("performance_outcomes_loop error: %s", e)
+        time.sleep(6 * 3600)
+
+
+_THREAD_RESTART_COUNTS: Dict[str, int] = {}
+_THREAD_LAST_ALIVE: Dict[str, float] = {}
+
+# ---------------------------------------------------------------------------
+# Background-loop health (Phase 1.2c)
+# ---------------------------------------------------------------------------
+# Per-loop health state surfaced in /health/full. Loops call
+# _loop_health_ok(name)  on every successful iteration and
+# _loop_health_err(name, exc)  on every iteration that raises. The watchdog
+# stays in worker_api.py; this just gives the loop body a way to tell the
+# operator that something is wrong without going silent.
+#
+# Schema: { name: { "last_ok_ts": float, "last_err_ts": float,
+#                   "last_err": str, "consecutive_failures": int } }
+_BACKGROUND_LOOP_HEALTH: Dict[str, Dict[str, Any]] = {}
+_loop_health_lock = threading.Lock()
+
+
+def _loop_health_ok(name: str) -> None:
+    """Mark a background loop iteration as successful (resets failure streak)."""
+    now = time.time()
+    with _loop_health_lock:
+        st = _BACKGROUND_LOOP_HEALTH.setdefault(name, {})
+        st["last_ok_ts"] = now
+        st["consecutive_failures"] = 0
+
+
+def _loop_health_err(name: str, exc: BaseException) -> None:
+    """Record a background loop iteration failure with the truncated repr."""
+    now = time.time()
+    err_repr = f"{type(exc).__name__}: {exc}"[:240]
+    with _loop_health_lock:
+        st = _BACKGROUND_LOOP_HEALTH.setdefault(name, {})
+        st["last_err_ts"] = now
+        st["last_err"] = err_repr
+        st["consecutive_failures"] = int(st.get("consecutive_failures", 0)) + 1
+
+
 def _thread_watchdog_loop() -> None:
-    """Periodically check background threads and restart any that have crashed."""
+    """Periodically check background threads, restart crashed ones, track failures."""
     while True:
         time.sleep(60)
         try:
+            now = time.time()
             for name, info in list(_background_threads.items()):
                 t = info.get("thread")
-                if t and not t.is_alive():
-                    logger.warning("thread_watchdog: %s is dead, restarting", name)
+                if t and t.is_alive():
+                    _THREAD_LAST_ALIVE[name] = now
+                elif t and not t.is_alive():
+                    # One-shot threads exit normally — skip restart
+                    if name in _ONE_SHOT_THREADS:
+                        continue
+                    _THREAD_RESTART_COUNTS[name] = _THREAD_RESTART_COUNTS.get(name, 0) + 1
+                    count = _THREAD_RESTART_COUNTS[name]
+                    if count >= 5:
+                        logger.error("WATCHDOG: %s has crashed %d times — persistent failure", name, count)
+                    else:
+                        logger.warning("WATCHDOG: %s is dead (restart #%d), restarting", name, count)
                     with _thread_start_lock:
                         _thread_started[name] = False
                     _start_background_thread(name, info["target"])
+
+                # Check for stalled threads (alive but not producing output)
+                last_alive = _THREAD_LAST_ALIVE.get(name, info.get("started_at", now))
+                stale_sec = now - last_alive
+                expected_intervals = {
+                    "recommendations": 1800, "autopilot": 14400, "screener_outcomes": 3600,
+                    "portfolio": 120, "health_watchdog": 120, "fear_greed": _FEAR_GREED_TTL,
+                }
+                expected = expected_intervals.get(name, 300)
+                if stale_sec > expected * 2.5 and t and t.is_alive():
+                    logger.warning("WATCHDOG: %s has not reported activity in %.0fs (expected every %ds)", name, stale_sec, expected)
         except Exception:
             logger.exception("thread_watchdog_loop: iteration failed")
 
@@ -476,7 +1451,7 @@ def _require_api_key(
             from urllib.parse import urlparse
             ref_host = urlparse(referer or "").netloc.split(":")[0] if referer else ""
             req_host = (host_header or "").split(":")[0].strip()
-            allowed = os.getenv("API_ALLOWED_HOSTS", "localhost,127.0.0.1,::1")
+            allowed = os.getenv("API_ALLOWED_HOSTS", "localhost,127.0.0.1,::1,3.148.6.246")
             allowed_set = {h.strip().lower() for h in allowed.split(",") if h.strip()}
             for h in (ref_host, req_host):
                 if h and h.lower() in allowed_set:
@@ -571,6 +1546,9 @@ async def api_create_bot(request: Request):
         "market_type": market_type_val,
         "alpaca_mode": str(payload.get("alpaca_mode") or "paper"),
     }
+    for _k in ("stop_loss_pct", "max_hold_hours"):
+        if _k in payload:
+            data[_k] = payload[_k]
     _sanitize_bot_numbers(data)
     try:
         from bot_config_validator import validate_bot_config
@@ -582,6 +1560,17 @@ async def api_create_bot(request: Request):
         validation_issues = []
     try:
         bot_id = create_bot(data)
+        sl_a = data.get("stop_loss_pct")
+        mh_a = data.get("max_hold_hours")
+        if sl_a is not None or mh_a is not None:
+            try:
+                patch_bot_risk_after_create(
+                    int(bot_id),
+                    stop_loss_pct=float(sl_a) if sl_a is not None else None,
+                    max_hold_hours=int(mh_a) if mh_a is not None else None,
+                )
+            except Exception as _risk_patch_e:
+                logger.warning("patch_bot_risk_after_create failed bot_id=%s: %s", bot_id, _risk_patch_e)
         bot = get_bot(int(bot_id))
         resp: Dict[str, Any] = {"ok": True, "bot": bot}
         if validation_issues:
@@ -595,6 +1584,37 @@ async def api_create_bot(request: Request):
 def api_bots():
     try:
         bots = list_bots()
+        if bm is not None:
+            for b in bots:
+                bot_id = int(b.get("id") or 0)
+                try:
+                    snap = bm.snapshot(bot_id)
+                    if snap:
+                        is_running = bool(snap.get("running"))
+                        has_pos = float(snap.get("base_pos") or 0) > 0
+                        risk = snap.get("risk_state")
+                        if risk:
+                            state_label = f"RISK_{risk}"
+                        elif has_pos:
+                            state_label = "MANAGING_POSITION"
+                        elif is_running:
+                            state_label = "WAITING_FOR_SIGNAL"
+                        else:
+                            state_label = "STOPPED"
+                        b["state"] = state_label
+                        b["last_event"] = snap.get("last_event")
+                        b["last_tick_ts"] = snap.get("last_tick_ts")
+                        b["unrealized_pnl_pct"] = snap.get("unrealized_pnl_pct")
+                        b["decision_action"] = snap.get("decision_action")
+                    else:
+                        b["state"] = "STOPPED" if not int(b.get("enabled", 0)) else "UNKNOWN"
+                except Exception:
+                    b["state"] = "UNKNOWN"
+                try:
+                    od = latest_open_deal(bot_id)
+                    b["open_deal"] = od
+                except Exception:
+                    b["open_deal"] = None
         return _json({
             "ok": True,
             "bots": bots,
@@ -628,8 +1648,42 @@ async def api_bots_stream():
     )
 
 
+def _scheduled_db_cleanup() -> None:
+    """
+    DB maintenance: prune high-growth tables every 6 hours.
+    Runs immediately on startup (no initial sleep).
+    """
+    while True:
+        try:
+            from db import db_maintenance_cleanup
+            results = db_maintenance_cleanup()
+            total = sum(v for v in results.values() if isinstance(v, int) and v > 0)
+            if total > 0:
+                logger.info("[DB_CLEANUP] Pruned %d rows: %s", total, results)
+        except Exception as e:
+            logger.warning("[DB_CLEANUP] Failed: %s", e)
+        time.sleep(21600)  # Every 6 hours
+
+
+def _prewarm_bots_summary() -> None:
+    """Pre-warm /api/bots/summary cache 5 s after startup so the first browser request is instant."""
+    time.sleep(5)
+    try:
+        bots = list_bots()
+        running = sum(1 for b in bots if int(b.get("last_running", 0)) == 1)
+        result = {"ok": True, "total": len(bots), "running": running, "paused": bool(_pause_state())}
+        _BOTS_SUMMARY_CACHE["result"] = result
+        _BOTS_SUMMARY_CACHE["ts"] = time.time()
+        logger.info("bots_summary pre-warm: %d total, %d running", len(bots), running)
+    except Exception as e:
+        logger.warning("bots_summary pre-warm failed: %s", e)
+
+
 @app.get("/api/bots/summary")
 def api_bots_summary():
+    now = time.time()
+    if _BOTS_SUMMARY_CACHE["result"] is not None and now - _BOTS_SUMMARY_CACHE["ts"] < _BOTS_SUMMARY_TTL:
+        return _json(_BOTS_SUMMARY_CACHE["result"])
     try:
         bots = list_bots()
     except Exception as e:
@@ -638,15 +1692,21 @@ def api_bots_summary():
     total = len(bots)
     running = 0
     if bm is not None:
-        for b in bots:
+        # Acquire with timeout so a contended lock during cold-start never stalls the response
+        _lock_acquired = bm._lock.acquire(timeout=1.5)
+        if _lock_acquired:
             try:
-                snap = bm.snapshot(int(b.get("id")))
-                if snap.get("running"):
-                    running += 1
-            except Exception:
-                logger.exception("api_bots_summary: snapshot failed bot_id=%s", b.get("id"))
+                running = sum(1 for r in bm._bots.values() if getattr(r.state, "running", False))
+            finally:
+                bm._lock.release()
+        else:
+            # Lock busy (startup race) — fall back to last_running flag persisted in DB
+            running = sum(1 for b in bots if int(b.get("last_running", 0)) == 1)
     paused = bool(_pause_state())
-    return _json({"ok": True, "total": total, "running": running, "paused": paused})
+    result = {"ok": True, "total": total, "running": running, "paused": paused}
+    _BOTS_SUMMARY_CACHE["result"] = result
+    _BOTS_SUMMARY_CACHE["ts"] = now
+    return _json(result)
 
 
 @app.get("/api/bots/export")
@@ -725,7 +1785,17 @@ def _sanitize_bot_numbers(data: Dict[str, Any]) -> None:
         except (TypeError, ValueError):
             data[key] = default
             return
-        data[key] = max(lo, min(hi, v))
+        data[key] = round(max(lo, min(hi, v)), 8)
+
+    _round_keys = ("base_quote", "safety_quote", "max_spend_quote", "vol_gap_mult",
+                    "tp_vol_mult", "regime_switch_threshold", "max_total_exposure_pct",
+                    "per_symbol_exposure_pct", "min_free_cash_pct", "hard_sl_pct")
+    for k in _round_keys:
+        if k in data:
+            try:
+                data[k] = round(float(data[k]), 8)
+            except (TypeError, ValueError):
+                pass
 
     clamp("first_dev", 0.001, 0.5, 0.015)
     clamp("step_mult", 1.0, 10.0, 1.2)
@@ -749,6 +1819,13 @@ def _sanitize_bot_numbers(data: Dict[str, Any]) -> None:
             data["poll_seconds"] = max(5, min(300, v))
         except (TypeError, ValueError):
             data["poll_seconds"] = 10
+    clamp("stop_loss_pct", 0.01, 0.50, 0.08)
+    if "max_hold_hours" in data:
+        try:
+            v = int(float(data["max_hold_hours"]))
+            data["max_hold_hours"] = max(0, min(2160, v))
+        except (TypeError, ValueError):
+            data["max_hold_hours"] = 0
 
 
 def _kraken_ready() -> bool:
@@ -820,7 +1897,8 @@ def _normalize_symbol(user_symbol: str) -> str:
     Accepts:
       btcusd, BTCUSD, BTC-USD, BTC/USD, xbtusd, XBTUSD, etc.
     Produces:
-      XBT/USD, ETH/USD, etc.
+      BTC/USD, ETH/USD, etc. (ccxt Kraken now uses BTC not XBT)
+    Note: XBT/USD input is left as XBT/USD and _resolve_symbol() handles the BTC↔XBT swap.
     """
     s = (user_symbol or "").strip().upper().replace(" ", "")
     s = s.replace("-", "/")
@@ -829,8 +1907,7 @@ def _normalize_symbol(user_symbol: str) -> str:
     parts = s.split("/", 1)
     base = parts[0] if len(parts) > 0 else ""
     quote = parts[1] if len(parts) > 1 else ""
-    if base == "BTC":
-        base = "XBT"
+    # Do NOT convert BTC->XBT here; _resolve_symbol handles market resolution
     return f"{base}/{quote}" if base and quote else s
 
 
@@ -886,9 +1963,9 @@ def _validate_crypto_symbol(symbol: str) -> tuple:
         if alt in mk:
             return alt, None
     # Build suggestions from popular Kraken USD pairs
-    popular = ["XBT/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD", "DOT/USD"]
+    popular = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD", "DOT/USD"]
     avail = [k for k in mk if str(mk.get(k, {}).get("quote", "")).upper() == "USD"][:8]
-    suggestions = [p for p in popular if p in mk] or (avail[:5] if avail else ["XBT/USD", "ETH/USD"])
+    suggestions = [p for p in popular if p in mk] or (avail[:5] if avail else ["BTC/USD", "ETH/USD"])
     return None, f"Symbol not found on Kraken: {s}. Try: {', '.join(suggestions)}"
 
 
@@ -1040,6 +2117,26 @@ def _ticker_cached(symbol: str, ttl_sec: int = 30) -> Optional[Dict[str, Any]]:
 
 _TICKERS_BATCH_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
 
+# One SPY / BTC daily series per scan wave — avoids hundreds of identical Alpaca/Kraken calls.
+_BENCHMARK_1D_CACHE: Dict[str, Any] = {}
+
+
+def _benchmark_ohlcv_cached(cache_key: str, ttl_sec: float, fetch_fn) -> List[List[float]]:
+    """Fetch benchmark OHLCV once per TTL (shared across all symbols in a scan)."""
+    now = time.time()
+    with _globals_lock:
+        ent = _BENCHMARK_1D_CACHE.get(cache_key)
+        if ent and (now - float(ent.get("ts", 0.0))) < ttl_sec:
+            return list(ent.get("rows") or [])
+    rows: List[List[float]] = []
+    try:
+        rows = fetch_fn() or []
+    except Exception:
+        rows = []
+    with _globals_lock:
+        _BENCHMARK_1D_CACHE[cache_key] = {"ts": now, "rows": rows}
+    return rows
+
 
 def _tickers_batch_cached(ttl_sec: int = 15) -> Dict[str, Dict[str, Any]]:
     """Fetch all Kraken tickers once, cache briefly. Use for batch price lookups (Explore)."""
@@ -1050,7 +2147,14 @@ def _tickers_batch_cached(ttl_sec: int = 15) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     try:
         if _kraken_ready() and kc:
-            raw = kc.ex.fetch_tickers()
+            try:
+                raw = kc.ex.fetch_tickers()
+            except Exception as _ft_err:
+                if "safeMarket" in str(_ft_err) or "disambiguate" in str(_ft_err):
+                    logger.warning("_tickers_batch_cached: safeMarket error (ccxt), trying individual pairs: %s", _ft_err)
+                    raw = {}
+                else:
+                    raise
             for sym, t in (raw or {}).items():
                 if not isinstance(t, dict):
                     continue
@@ -1060,7 +2164,7 @@ def _tickers_batch_cached(ttl_sec: int = 15) -> Dict[str, Dict[str, Any]]:
                 _TICKERS_BATCH_CACHE["ts"] = now
                 _TICKERS_BATCH_CACHE["data"] = out
     except Exception as e:
-        logger.exception("_tickers_batch_cached: fetch failed")
+        logger.warning("_tickers_batch_cached: fetch failed: %s", e)
     return out
 
 
@@ -1078,6 +2182,25 @@ def _slope(values: List[float], n: int = 20) -> Optional[float]:
 
 _OHLCV_FETCH_LOCKS: Dict[str, threading.Lock] = {}
 _OHLCV_FETCH_LOCKS_LOCK = threading.Lock()
+
+
+def _scan_ohlcv_get(symbol: str, timeframe: str, limit: int) -> Optional[List]:
+    """Return cached OHLCV if still within the 2hr scan TTL, else None."""
+    key = f"{symbol}|{timeframe}|{limit}"
+    with _globals_lock:
+        cached = _RECO_OHLCV_CACHE.get(key)
+    if cached and (time.time() - float(cached.get("ts", 0))) < _SCAN_OHLCV_TTL:
+        return cached.get("data") or []
+    return None
+
+
+def _scan_ohlcv_put(symbol: str, timeframe: str, limit: int, data: list) -> None:
+    """Write fetched candles to _RECO_OHLCV_CACHE so medium/long horizons reuse them."""
+    if not data:
+        return
+    key = f"{symbol}|{timeframe}|{limit}"
+    with _globals_lock:
+        _RECO_OHLCV_CACHE[key] = {"ts": time.time(), "data": data}
 
 
 def _ohlcv_cached(symbol: str, timeframe: str, limit: int, ttl_sec: int) -> List[List[float]]:
@@ -1142,7 +2265,11 @@ def _safe_spread_pct(symbol: str) -> Optional[float]:
 
 
 def _btc_context() -> Dict[str, Any]:
-    ctx = {"risk_off": False, "labels": {}, "scores": {}}
+    ctx = {"risk_off": False, "labels": {}, "scores": {}, "return_30d": -0.20, "fear_greed": 50}
+    try:
+        ctx["fear_greed"] = int(_FEAR_GREED_CACHE.get("value") or 50)
+    except Exception:
+        pass
     try:
         sym = _resolve_symbol("XBT/USD")
         c4h = _ohlcv_cached(sym, "4h", 200, 300)
@@ -1151,13 +2278,22 @@ def _btc_context() -> Dict[str, Any]:
         r1d = detect_regime(c1d)
         ctx["labels"] = {"4h": r4h.regime, "1d": r1d.regime}
         ctx["scores"] = {"4h": r4h.scores or {}, "1d": r1d.scores or {}}
+        ctx["regime"] = r1d.regime
+        ctx["regime_label"] = r1d.regime
         down = max((r1d.scores or {}).get("downtrend_score", 0.0), (r4h.scores or {}).get("downtrend_score", 0.0))
         hv = max((r1d.scores or {}).get("high_vol_score", 0.0), (r4h.scores or {}).get("high_vol_score", 0.0))
-        # Only trigger risk-off for genuinely severe conditions
         if (down >= 0.8 and hv >= 0.5) or r1d.regime in ("HIGH_VOL_RISK",):
             ctx["risk_off"] = True
         ctx["btc_down"] = down
         ctx["btc_hv"] = hv
+        if c1d and len(c1d) >= 31:
+            btc_now = float(c1d[-1][4])
+            btc_30d_ago = float(c1d[-31][4])
+            if btc_30d_ago > 0:
+                ctx["return_30d"] = (btc_now - btc_30d_ago) / btc_30d_ago
+        ctx["fear_greed_value"] = int(_FEAR_GREED_CACHE.get("value") or 50)
+        if c1d and len(c1d) >= 21:
+            ctx["closes"] = [float(row[4]) for row in c1d[-60:] if len(row) >= 5]
     except Exception:
         pass
     return ctx
@@ -1201,6 +2337,8 @@ def _prefilter_crypto_symbol(symbol: str) -> Tuple[bool, str]:
         return False, "stablecoin"
     if base in FIAT_BASES:
         return False, "fiat_pair"
+    if base in INVALID_KRAKEN_BASES:
+        return False, "not_on_kraken"
     if not _PREFILTER_CRYPTO_VOLUME:
         return True, ""
     if not _kraken_ready():
@@ -1253,27 +2391,70 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
     Scan a symbol using the Intelligence Layer.
     Routes to appropriate provider based on symbol type (stock → Alpaca, crypto → Kraken).
     """
+    global _kraken_last_candle_ts, _alpaca_last_candle_ts
     market_type = classify_symbol(symbol)
-    
+    spread_pct: Optional[float] = None
+
     # Route based on symbol type
     if market_type == "stock":
         # Stock path - Alpaca preferred; Yahoo Finance fallback when Alpaca not configured (minimal mode)
         client = alpaca_live if alpaca_live else alpaca_paper
-        # Fetch stock data: phase2_data_fetcher uses Alpaca first, Yahoo fallback when Alpaca returns no data
-        # When Alpaca is None, fetch_recent_candles still works via Yahoo for stocks
         try:
-            from phase2_data_fetcher import fetch_recent_candles
-            candles_1h = fetch_recent_candles(symbol, "1h", 300)
-            candles_4h = fetch_recent_candles(symbol, "4h", 300)
-            candles_1d = fetch_recent_candles(symbol, "1d", 500)
-            candles_1w = fetch_recent_candles(symbol, "1w", 300)
+            import yfinance as yf
+            def _yf_candles(sym: str, interval: str, period: str) -> list:
+                try:
+                    t = yf.Ticker(sym)
+                    hist = t.history(period=period, interval=interval)
+                    if hist is None or hist.empty:
+                        return []
+                    out = []
+                    for ts, row in hist.iterrows():
+                        try:
+                            out.append([
+                                int(ts.timestamp()),
+                                float(row["Open"]), float(row["High"]),
+                                float(row["Low"]), float(row["Close"]),
+                                float(row["Volume"]),
+                            ])
+                        except Exception:
+                            continue
+                    return out
+                except Exception:
+                    return []
+
+            candles_1h = _scan_ohlcv_get(symbol, "1h", 300) or \
+                         _yf_candles(symbol, "1h", "60d")
+            if candles_1h: _scan_ohlcv_put(symbol, "1h", 300, candles_1h)
+
+            candles_4h = _scan_ohlcv_get(symbol, "4h", 300) or \
+                         _yf_candles(symbol, "4h", "180d")
+            if candles_4h: _scan_ohlcv_put(symbol, "4h", 300, candles_4h)
+
+            candles_1d = _scan_ohlcv_get(symbol, "1d", 500) or \
+                         _yf_candles(symbol, "1d", "2y")
+            if candles_1d: _scan_ohlcv_put(symbol, "1d", 500, candles_1d)
+
+            candles_1w = _scan_ohlcv_get(symbol, "1w", 300) or \
+                         _yf_candles(symbol, "1wk", "5y")
+            if candles_1w: _scan_ohlcv_put(symbol, "1w", 300, candles_1w)
+
+            if candles_1h or candles_1d:
+                _alpaca_last_candle_ts = time.time()
+                try:
+                    from health_monitor import update_candle_ts
+                    update_candle_ts("alpaca", time.time())
+                except Exception:
+                    pass
+
+            if not candles_1w or len(candles_1w) < 8:
+                candles_1w = _weekly_ohlcv_from_daily(candles_1d or [], max_weeks=120)
             if not candles_1d or len(candles_1d) < 20:
                 return {
                     "symbol": symbol,
                     "score": 0.0,
                     "eligible": False,
                     "data_ok": False,
-                    "reasons": ["Insufficient candle data (Yahoo/Alpaca)"],
+                    "reasons": ["Insufficient candle data (Yahoo Finance)"],
                     "risk_flags": ["DATA_ERROR"],
                     "metrics": {"market_type": "stocks"},
                     "regime": {}
@@ -1333,6 +2514,16 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                 stock_market_breadth["dividend_yield_pct"] = yld
             except Exception:
                 pass
+            # Compute change_24h for stocks from daily candles (Alpaca has no percentage field)
+            stock_change_24h: Optional[float] = None
+            if candles_1d and len(candles_1d) >= 2:
+                try:
+                    _prev_close = float(candles_1d[-2][4])  # index 4 = close
+                    _curr_close = float(price if price > 0 else candles_1d[-1][4])
+                    if _prev_close > 0 and _curr_close > 0:
+                        stock_change_24h = round((_curr_close - _prev_close) / _prev_close * 100.0, 3)
+                except Exception:
+                    pass
             try:
                 from stock_profile import get_stock_profile, passes_market_cap_filter, is_recent_ipo
                 p = get_stock_profile(symbol)
@@ -1381,19 +2572,43 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
         sym = _resolve_symbol(symbol)
         market_breadth = {}
         crypto_volume_24h: Optional[float] = None
-        
+        crypto_change_24h: Optional[float] = None
+
         # Fetch crypto data from Kraken (guardrails will catch any misrouted stocks)
         try:
-            candles_4h = _ohlcv_cached(sym, "4h", 300, 300)
-            candles_1d = _ohlcv_cached(sym, "1d", 500, 900)
-            candles_1w = _ohlcv_cached(sym, "1w", 300, 1800)
-            candles_1h = _ohlcv_cached(sym, "1h", 300, 300)
-            
+            # Use 2hr scan TTL so medium/long horizons reuse data fetched by short scan
+            candles_4h = _ohlcv_cached(sym, "4h", 300, _SCAN_OHLCV_TTL)
+            candles_1d = _ohlcv_cached(sym, "1d", 500, _SCAN_OHLCV_TTL)
+            candles_1w = _ohlcv_cached(sym, "1w", 300, _SCAN_OHLCV_TTL)
+            candles_1h = _ohlcv_cached(sym, "1h", 300, _SCAN_OHLCV_TTL)
+            if candles_1h or candles_1d:
+                _kraken_last_candle_ts = time.time()
+                try:
+                    from health_monitor import update_candle_ts
+                    update_candle_ts("kraken", time.time())
+                except Exception:
+                    pass
+            if not candles_1w or len(candles_1w) < 8:
+                candles_1w = _weekly_ohlcv_from_daily(candles_1d or [], max_weeks=120)
+                if candles_1w:
+                    logger.debug("Using synthesized weekly candles for %s (%d bars)", sym, len(candles_1w))
+
             price = _safe_last_price(sym) or 0.0
             spread_pct = _safe_spread_pct(sym)
             try:
-                t = kc.ex.fetch_ticker(sym) if kc else {}
-                crypto_volume_24h = float(t.get("quoteVolume") or t.get("volume") or 0)
+                tb_map = _tickers_batch_cached(ttl_sec=15)
+                ti = tb_map.get(sym) if tb_map else None
+                if ti is not None and (ti.get("quoteVolume") is not None or ti.get("last") is not None):
+                    crypto_volume_24h = float(ti.get("quoteVolume") or ti.get("volume") or 0)
+                    _pct = ti.get("percentage")
+                    if _pct is not None:
+                        crypto_change_24h = float(_pct)
+                else:
+                    t = kc.ex.fetch_ticker(sym) if kc else {}
+                    crypto_volume_24h = float(t.get("quoteVolume") or t.get("volume") or 0)
+                    _pct = t.get("percentage")
+                    if _pct is not None:
+                        crypto_change_24h = float(_pct)
             except Exception:
                 pass
         except ValueError as e:
@@ -1462,6 +2677,8 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
     if "metrics" in recommendation and isinstance(recommendation["metrics"], dict):
         recommendation["metrics"]["market_type"] = "stocks" if market_type == "stock" else "crypto"
         if market_type == "crypto":
+            if crypto_change_24h is not None:
+                recommendation["metrics"]["change_24h"] = crypto_change_24h
             if crypto_volume_24h is not None:
                 recommendation["metrics"]["volume_24h_quote"] = crypto_volume_24h
                 if crypto_volume_24h < RECO_MIN_VOLUME_24H:
@@ -1470,6 +2687,12 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                         f"Low volume: ${crypto_volume_24h/1e6:.1f}M < ${RECO_MIN_VOLUME_24H/1e6:.0f}M min"
                     )
         if market_type == "stock" and market_breadth:
+            # Inject stock change_24h computed from daily candles (Alpaca has no percentage ticker field)
+            try:
+                if stock_change_24h is not None:
+                    recommendation["metrics"]["change_24h"] = stock_change_24h
+            except Exception:
+                pass
             mc = market_breadth.get("market_cap")
             if mc is None and market_breadth.get("market_cap_b"):
                 mc = float(market_breadth["market_cap_b"]) * 1e9
@@ -1503,17 +2726,27 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
         candles_1d = context.candles_1d if hasattr(context, "candles_1d") else []
         benchmark_candles = None
         if len(candles_1d or []) >= 30:
+            _bench_ttl = float(os.getenv("SCAN_BENCHMARK_CACHE_TTL_SEC", "120"))
             if market_type == "stock" and (alpaca_live or alpaca_paper):
-                client = alpaca_live or alpaca_paper
-                try:
-                    benchmark_candles = client.get_ohlcv("SPY", "1d", 200)
-                except Exception:
-                    pass
+                _client = alpaca_live or alpaca_paper
+
+                def _fetch_spy():
+                    try:
+                        return _client.get_ohlcv("SPY", "1d", 200)
+                    except Exception:
+                        return []
+
+                benchmark_candles = _benchmark_ohlcv_cached("SPY_1d_200", _bench_ttl, _fetch_spy)
             elif market_type == "crypto" and _kraken_ready():
-                try:
-                    benchmark_candles = _ohlcv_cached("XBT/USD", "1d", 200, 300)
-                except Exception:
-                    pass
+                _btc_sym = _resolve_symbol("BTC/USD")
+
+                def _fetch_btc():
+                    try:
+                        return _ohlcv_cached(_btc_sym, "1d", 200, 300)
+                    except Exception:
+                        return []
+
+                benchmark_candles = _benchmark_ohlcv_cached(f"BTC_1d_200_{_btc_sym}", _bench_ttl, _fetch_btc)
             sector = (context.market_breadth or {}).get("sector") if hasattr(context, "market_breadth") else None
             enriched = enrich_recommendation_with_benchmark(
                 symbol, price, candles_1d=candles_1d, benchmark_candles=benchmark_candles, sector=sector
@@ -1563,7 +2796,20 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                 recommendation["reasons"] = (recommendation.get("reasons") or []) + extra_reasons
     except ImportError:
         pass
-    
+
+    # Explore chart-pattern feed is written separately in _persist_explore_feed_from_snap (DB UPSERT).
+
+    try:
+        recommendation["_candles_1d"] = [list(x) for x in (candles_1d or [])]
+    except Exception:
+        recommendation["_candles_1d"] = []
+
+    try:
+        if spread_pct is not None:
+            recommendation.setdefault("metrics", {})["spread_pct"] = float(spread_pct)
+    except Exception:
+        pass
+
     return recommendation
 
 
@@ -1606,7 +2852,7 @@ _UNIVERSE_CACHE = {"ts": 0, "symbols": []}
 UNIVERSE_TTL = 600  # 10 minutes
 
 # Momentum-based universe filtering (stocks)
-_MOMENTUM_FILTER_ENABLED = os.getenv("RECO_MOMENTUM_FILTER", "1").strip().lower() in (
+_MOMENTUM_FILTER_ENABLED = os.getenv("RECO_MOMENTUM_FILTER", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -1623,74 +2869,73 @@ def _reco_symbols(quote: str = "USD") -> List[str]:
             return list(_UNIVERSE_CACHE["symbols"])
 
     symbols = set()
-    mk = _markets() if _kraken_ready() else {}
 
-    # 1. Fallback / Configured Symbols (crypto: only if on Kraken)
-    for s in RECO_SYMBOLS:
-        if "/" in s and mk:
-            base = (s.split("/")[0] or "").upper()
-            if base in CRYPTO_BLOCKLIST:
-                continue
-            resolved, err = _validate_crypto_symbol(s)
-            if resolved:
-                symbols.add(resolved)
-        elif "/" not in s:
-            symbols.add(s)
-
-    # 2. Crypto via Kraken – whole market: all /USD pairs with meaningful volume
-    _min_crypto_volume = float(os.getenv("RECO_CRYPTO_MIN_VOLUME", "5000"))
-    _max_crypto = int(os.getenv("RECO_CRYPTO_TOP_N", "350"))
+    # Use the new dynamic universe builder for large, comprehensive universe
     try:
-        if kc and _kraken_ready():
-            tickers = kc.ex.fetch_tickers()
-            sorted_tickers = sorted(
-                [
-                    (s, float(t.get("quoteVolume") or 0))
-                    for s, t in tickers.items()
-                    if "/USD" in s
-                    and float(t.get("quoteVolume") or 0) >= _min_crypto_volume
-                    and (s.split("/")[0] or "").upper() not in FIAT_BASES
-                ],
-                key=lambda x: x[1],
-                reverse=True
-            )
-            for s, _ in sorted_tickers[:_max_crypto]:
+        from universe_builder import get_equity_universe, get_crypto_universe
+        equity_universe = get_equity_universe()
+        crypto_universe = get_crypto_universe()
+        for s in equity_universe:
+            symbols.add(s)
+        for s in crypto_universe:
+            symbols.add(s)
+        logger.info("[UNIVERSE] Dynamic universe: %d equities + %d crypto = %d total",
+                    len(equity_universe), len(crypto_universe), len(symbols))
+    except Exception as _ub_err:
+        logger.warning("[UNIVERSE] Dynamic universe builder failed (%s), falling back to legacy", _ub_err)
+        # Legacy fallback: use the old approach
+        mk = _markets() if _kraken_ready() else {}
+        for s in RECO_SYMBOLS:
+            if "/" in s and mk:
                 base = (s.split("/")[0] or "").upper()
-                if base not in CRYPTO_BLOCKLIST:
-                    symbols.add(s)
-    except Exception as e:
-        logger.error(f"Error fetching crypto universe: {e}")
+                if base in CRYPTO_BLOCKLIST:
+                    continue
+                resolved, err = _validate_crypto_symbol(s)
+                if resolved:
+                    symbols.add(resolved)
+            elif "/" not in s:
+                symbols.add(s)
 
-    # 3. Stocks: expanded universe (S&P 500 + NASDAQ 100 + major ETFs) + Alpaca movers
-    try:
-        from stock_universe import get_expanded_stock_universe
-        expanded = get_expanded_stock_universe()
-        for s in expanded:
-            symbols.add(s)
-        logger.info("[RECO_DEBUG] _reco_symbols: added %d from expanded stock universe (S&P500+NASDAQ100+ETFs)", len(expanded))
-    except Exception as e:
-        logger.warning("[RECO_DEBUG] stock_universe import failed: %s; using legacy bluechips only", e)
-    try:
-        client = alpaca_live if alpaca_live else alpaca_paper
-        if client:
-            actives = client.get_top_movers()
-            for item in actives.get("hot", []):
-                symbols.add(item["symbol"])
-            for item in actives.get("gainers", []):
-                symbols.add(item["symbol"])
-            for item in actives.get("losers", []):
-                symbols.add(item["symbol"])
-            try:
-                assets = client.get_active_assets()
-                for a in (assets or [])[:200]:
+        try:
+            if kc and _kraken_ready():
+                tickers = {}
+                try:
+                    tickers = kc.ex.fetch_tickers()
+                except Exception:
+                    pass
+                _min_crypto_volume = float(os.getenv("RECO_CRYPTO_MIN_VOLUME", "500000"))
+                _max_crypto = int(os.getenv("RECO_CRYPTO_TOP_N", "50"))
+                if tickers:
+                    sorted_tickers = sorted(
+                        [(s, float(t.get("quoteVolume") or 0))
+                         for s, t in tickers.items()
+                         if "/USD" in s and float(t.get("quoteVolume") or 0) >= _min_crypto_volume
+                         and (s.split("/")[0] or "").upper() not in FIAT_BASES],
+                        key=lambda x: x[1], reverse=True
+                    )
+                    for s, _ in sorted_tickers[:_max_crypto]:
+                        base = (s.split("/")[0] or "").upper()
+                        if base not in CRYPTO_BLOCKLIST:
+                            symbols.add(s)
+        except Exception as e:
+            logger.error("Error fetching crypto universe: %s", e)
+
+        try:
+            from stock_universe import get_expanded_stock_universe
+            for s in get_expanded_stock_universe():
+                symbols.add(s)
+        except Exception as e:
+            logger.warning("stock_universe import failed: %s", e)
+
+        try:
+            client = alpaca_live if alpaca_live else alpaca_paper
+            if client:
+                for a in (client.get_active_assets() or [])[:200]:
                     sym = (a.get("symbol") or "").strip()
-                    if sym and "." not in sym and a.get("tradable"):
+                    if sym and "." not in sym and "$" not in sym and "-" not in sym and len(sym) <= 5:
                         symbols.add(sym)
-            except Exception:
-                logger.exception("_reco_symbols: get_active_assets failed")
-            logger.info("[RECO_DEBUG] _reco_symbols: added movers/actives from Alpaca; total stocks now %d", len([s for s in symbols if "/" not in s and len(s) < 6]))
-    except Exception as e:
-        logger.error(f"Error fetching stock universe: {e}")
+        except Exception:
+            pass
 
     # Filter out fiat FX pairs and blocked crypto bases
     filtered = []
@@ -1829,6 +3074,11 @@ def _scan_one_symbol(sym: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[st
     """
     result = {"symbol": sym, "status": "skipped", "snap": None, "error": None}
     try:
+        from stock_universe import JUNK_TICKERS
+        _sym_upper = sym.upper().split("/")[0] if "/" in sym else sym.upper()
+        if _sym_upper in JUNK_TICKERS:
+            result["status"] = "junk_ticker"
+            return result
         if "/" in sym:
             base = (sym.split("/")[0] or "").upper()
             if base in CRYPTO_BLOCKLIST:
@@ -1866,6 +3116,31 @@ def _scan_one_symbol(sym: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[st
         buy_thresh = _reco_buy_threshold_stocks() if is_stock else _reco_buy_threshold_crypto()
         derived_signal = "buy" if snap_score >= buy_thresh else ("watch" if snap_score >= _reco_watch_threshold() else "wait")
         metrics["signal"] = derived_signal
+
+        # Collect human-readable rejection reasons with specific indicator values
+        rejection_reasons = []
+        try:
+            _rsi14 = metrics.get("rsi_14") or metrics.get("rsi")
+            if _rsi14 is not None and float(_rsi14) > 70:
+                rejection_reasons.append(f"RSI too high: {float(_rsi14):.0f}")
+            if _rsi14 is not None and float(_rsi14) < 20:
+                rejection_reasons.append(f"RSI extremely low: {float(_rsi14):.0f} (capitulation risk)")
+            _pct_200 = metrics.get("pct_above_200")
+            if _pct_200 is not None and float(_pct_200) < -10:
+                rejection_reasons.append(f"Below 200MA by {abs(float(_pct_200)):.0f}%")
+            _vol_ratio = metrics.get("volume_ratio")
+            if _vol_ratio is not None and float(_vol_ratio) < 0.5:
+                rejection_reasons.append(f"Low volume: {float(_vol_ratio):.1f}x average")
+            if snap_score < buy_thresh and snap_score >= _reco_watch_threshold():
+                rejection_reasons.append(f"Score {snap_score:.0f} below buy threshold {buy_thresh}")
+            elif snap_score < _reco_watch_threshold():
+                rejection_reasons.append(f"Score {snap_score:.0f} too low (watch={_reco_watch_threshold()}, buy={buy_thresh})")
+            _rej = metrics.get("_explore_reject_reason")
+            if _rej:
+                rejection_reasons.append(str(_rej).replace("_", " "))
+        except Exception:
+            pass
+        metrics["rejection_reasons"] = rejection_reasons
         snap["metrics"] = metrics
 
         result["snap"] = snap
@@ -1873,27 +3148,37 @@ def _scan_one_symbol(sym: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[st
         result["eligible"] = snap_eligible
         result["signal"] = derived_signal
         result["score"] = snap_score
+        result["rejection_reasons"] = rejection_reasons
     except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)[:200]
+        err_str = str(e).lower()
+        # 429/rate-limit and "no data" errors are expected transient failures — count as skip,
+        # not error, so they don't trigger the RECO_SCAN_ERROR_LIMIT abort.
+        if "429" in err_str or "too many request" in err_str or "rate limit" in err_str:
+            result["status"] = "rate_limited"
+            result["error"] = str(e)[:200]
+        elif "no data" in err_str or "insufficient data" in err_str or "not found" in err_str:
+            result["status"] = "no_data"
+        else:
+            result["status"] = "error"
+            result["error"] = str(e)[:200]
     return result
 
 
 def _build_symbols_to_scan(horizon: str) -> List[str]:
     """Build the filtered, prioritized symbol list for a scan pass."""
     symbols = _reco_symbols(quote="USD")
-    logger.info("[RECO_DEBUG] _reco_symbols returned %d symbols (crypto=%d stocks=%d)",
+    logger.warning("[SCAN] _reco_symbols returned %d symbols (crypto=%d stocks=%d)",
         len(symbols),
         len([s for s in symbols if "/" in s]),
         len([s for s in symbols if "/" not in s and len(s) < 6]))
     symbols = _apply_momentum_filter_to_universe(symbols)
-    logger.info("[RECO_DEBUG] after momentum filter: %d symbols", len(symbols))
+    logger.warning("[SCAN] after momentum filter: %d symbols", len(symbols))
     symbols = _apply_crypto_momentum_filter(symbols)
-    logger.info("[RECO_DEBUG] after crypto momentum filter: %d symbols for %s horizon", len(symbols), horizon)
+    logger.warning("[SCAN] after crypto momentum filter: %d symbols for %s horizon", len(symbols), horizon)
 
     crypto_symbols = [s for s in symbols if ("/" in s or len(s) > 6) and (s.split("/")[0] or "").upper() not in CRYPTO_BLOCKLIST]
     stock_symbols = [s for s in symbols if len(s) < 6 and "/" not in s]
-    logger.info("[RECO_DEBUG] split: crypto_symbols=%d stock_symbols=%d", len(crypto_symbols), len(stock_symbols))
+    logger.warning("[SCAN] split: crypto=%d stocks=%d", len(crypto_symbols), len(stock_symbols))
 
     if RECO_CRYPTO_TOP_30_ONLY:
         crypto_selected = [s for s in crypto_symbols if _crypto_base_from_symbol(s) in TOP_30_CRYPTO_BASES]
@@ -1902,26 +3187,75 @@ def _build_symbols_to_scan(horizon: str) -> List[str]:
             logger.info("RECO_CRYPTO_TOP_30_ONLY: blocked %d, kept %d", len(blocked), len(crypto_selected))
     else:
         priority_crypto = [
-            "XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ETC/USD", "ADA/USD",
-            "DOGE/USD", "LTC/USD", "BCH/USD", "DOT/USD", "AVAX/USD", "LINK/USD",
-            "UNI/USD", "MATIC/USD", "ATOM/USD", "NEAR/USD", "APT/USD", "ARB/USD",
+            "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD",
+            "TAO/USD", "FET/USD", "AKT/USD", "OCEAN/USD",
+            "KAS/USD", "CHZ/USD", "ENA/USD",
+            "ADA/USD", "DOGE/USD", "LTC/USD", "AVAX/USD",
+            "LINK/USD", "DOT/USD", "ATOM/USD", "NEAR/USD",
+            "APT/USD", "ARB/USD", "MATIC/USD", "UNI/USD",
+            "INJ/USD", "RUNE/USD", "TIA/USD",
         ]
         crypto_set = set(crypto_symbols)
         crypto_selected = [pc for pc in priority_crypto if pc in crypto_set]
         crypto_selected += [s for s in crypto_symbols if s not in set(priority_crypto)]
 
-    priority_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "SPY", "QQQ"]
+    try:
+        from stock_universe import get_sp500_tickers, get_nasdaq100_tickers, get_major_etfs
+        _priority_tickers = get_major_etfs() + get_nasdaq100_tickers() + get_sp500_tickers()
+    except Exception:
+        _priority_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "SPY", "QQQ"]
     stock_set = set(stock_symbols)
-    stock_selected = [ps for ps in priority_stocks if ps in stock_set]
-    stock_selected += [s for s in stock_symbols if s not in set(priority_stocks)]
+    _prio_set = set()
+    stock_selected = []
+    for ps in _priority_tickers:
+        ps = ps.strip().upper()
+        if ps in stock_set and ps not in _prio_set:
+            stock_selected.append(ps)
+            _prio_set.add(ps)
+    stock_selected += [s for s in stock_symbols if s not in _prio_set]
 
     n_max = min(RECO_MAX_SYMBOLS, 600)
-    n_crypto = min(350, len(crypto_selected))
-    n_stocks = min(n_max - n_crypto, len(stock_selected))
+    n_crypto = min(max(40, RECO_SCAN_CRYPTO_CAP), len(crypto_selected))
+    n_stocks = min(max(1, n_max - n_crypto), len(stock_selected))
     symbols_to_scan = crypto_selected[:n_crypto] + stock_selected[:n_stocks]
     symbols_to_scan = [
         s for s in symbols_to_scan if not ("/" in s and (s.split("/")[0] or "").upper() in FIAT_BASES)
     ]
+    logger.warning("[SCAN] Final list: %d symbols. First 15 stocks: %s",
+                   len(symbols_to_scan), [s for s in stock_selected[:15]])
+
+    # Guarantee refresh of active BUY/WATCH signals that age out of the universe.
+    # Symbols discovered via movers/actives may drop off the dynamic list after one scan.
+    # Re-include stocks and crypto from recommendations_latest with score >= 65.
+    try:
+        from db import list_recommendations
+        _stale_rows = list_recommendations(horizon, limit=200)
+        _scan_set = set(symbols_to_scan)
+        _stale_added = []
+        for _row in _stale_rows:
+            _sym = str(_row.get("symbol") or "")
+            if not _sym or _sym in _scan_set:
+                continue
+            if float(_row.get("score") or 0) < 65:
+                continue
+            _is_crypto = "/" in _sym
+            if _is_crypto:
+                _base = (_sym.split("/")[0] or "").upper()
+                if _base in CRYPTO_BLOCKLIST or _base in FIAT_BASES:
+                    continue
+            else:
+                if len(_sym) >= 6:
+                    continue
+                if "$" in _sym or "." in _sym or "-" in _sym:
+                    continue
+            symbols_to_scan.append(_sym)
+            _scan_set.add(_sym)
+            _stale_added.append(_sym)
+        if _stale_added:
+            logger.info("[SCAN] Re-added %d stale high-score symbols to universe: %s", len(_stale_added), _stale_added[:15])
+    except Exception as _stale_err:
+        logger.warning("[SCAN] Failed to add stale BUY symbols: %s", _stale_err)
+
     if RECO_SCAN_MAX_PER_RUN > 0:
         symbols_to_scan = symbols_to_scan[: min(len(symbols_to_scan), RECO_SCAN_MAX_PER_RUN)]
 
@@ -1946,7 +3280,7 @@ def _build_symbols_to_scan(horizon: str) -> List[str]:
                 continue
         filtered.append(sym)
     prefilter_dur = time.time() - prefilter_start
-    logger.info("[SCAN] Pre-filter: %d -> %d symbols in %.1fs (skipped crypto=%d stocks=%d reasons=%s)",
+    logger.warning("[SCAN] Pre-filter: %d -> %d symbols in %.1fs (skipped crypto=%d stocks=%d reasons=%s)",
         len(symbols_to_scan), len(filtered), prefilter_dur,
         prefilter_skipped["crypto"], prefilter_skipped["stock"],
         dict(list(prefilter_reasons.items())[:5]))
@@ -1954,9 +3288,9 @@ def _build_symbols_to_scan(horizon: str) -> List[str]:
     return filtered
 
 
-def _scan_recommendations(horizon: str) -> None:
-    global _last_reco_short_ts, _last_reco_medium_ts, _last_reco_long_ts
-    logger.info("[RECO_DEBUG] _scan_recommendations ENTRY horizon=%s Kraken=%s Alpaca=%s",
+def _scan_recommendations_impl(horizon: str) -> None:
+    global _last_reco_short_ts, _last_reco_medium_ts, _last_reco_long_ts, _kraken_last_candle_ts, _alpaca_last_candle_ts
+    logger.warning("[SCAN-DEBUG] _scan_recommendations_impl ENTRY horizon=%s Kraken=%s Alpaca=%s",
         horizon, _kraken_ready(), bool(alpaca_live or alpaca_paper))
     has_clients = _kraken_ready() or (alpaca_live or alpaca_paper)
     if not has_clients:
@@ -1965,10 +3299,22 @@ def _scan_recommendations(horizon: str) -> None:
             stock_count = len([s for s in syms if "/" not in s and len(s) < 6])
             if stock_count == 0:
                 logger.warning("[RECO_DEBUG] SCAN SKIPPED: No trading clients and no stock symbols.")
+                with _globals_lock:
+                    _RECO_STATE[horizon] = {
+                        "last_run_ts": now_ts(), "error": "No clients",
+                        "btc_ctx": {}, "scanned": 0, "eligible": 0, "total": 0, "scanning": False,
+                        "started_at": time.time(),
+                    }
                 return
             logger.info("[RECO_DEBUG] No Kraken/Alpaca - scanning %d stocks via Yahoo Finance fallback", stock_count)
         except Exception as e:
             logger.warning("[RECO_DEBUG] SCAN SKIPPED: No clients and symbol check failed: %s", e)
+            with _globals_lock:
+                _RECO_STATE[horizon] = {
+                    "last_run_ts": now_ts(), "error": str(e)[:120],
+                    "btc_ctx": {}, "scanned": 0, "eligible": 0, "total": 0, "scanning": False,
+                    "started_at": time.time(),
+                }
             return
 
     now = now_ts()
@@ -1977,29 +3323,84 @@ def _scan_recommendations(horizon: str) -> None:
     scanned = 0
     eligible = 0
     total_to_scan = 0
+    _scan_started_at = time.time()
+    symbols_to_scan: List[str] = []
     try:
         symbols_to_scan = _build_symbols_to_scan(horizon)
-
-        if len(symbols_to_scan) == 0:
-            logger.warning("No symbols to scan for recommendations")
-            with _globals_lock:
-                _RECO_STATE[horizon] = {
-                    "last_run_ts": now, "error": "No symbols available",
-                    "btc_ctx": btc_ctx, "scanned": 0, "eligible": 0,
-                }
-                if horizon == "short": _last_reco_short_ts = time.time()
-                elif horizon == "medium": _last_reco_medium_ts = time.time()
-                else: _last_reco_long_ts = time.time()
-            return
-
-        total_to_scan = len(symbols_to_scan)
-        logger.info("[SCAN] %s horizon: scanning %d symbols with %d parallel workers",
-            horizon, total_to_scan, SCAN_PARALLEL_WORKERS)
-
+    except Exception as build_err:
+        logger.error("%s scan: _build_symbols_to_scan failed: %s", horizon, build_err, exc_info=True)
         with _globals_lock:
             _RECO_STATE[horizon] = {
-                "last_run_ts": 0, "error": "", "btc_ctx": btc_ctx,
+                "last_run_ts": now, "error": f"{type(build_err).__name__}: {build_err}"[:200],
+                "btc_ctx": btc_ctx, "scanned": 0, "eligible": 0, "total": 0, "scanning": False,
+                "started_at": _scan_started_at,
+            }
+            if horizon == "short":
+                _last_reco_short_ts = time.time()
+            elif horizon == "medium":
+                _last_reco_medium_ts = time.time()
+            else:
+                _last_reco_long_ts = time.time()
+        return
+
+    if len(symbols_to_scan) == 0:
+        logger.warning("No symbols to scan for recommendations (horizon=%s)", horizon)
+        with _globals_lock:
+            _RECO_STATE[horizon] = {
+                "last_run_ts": now, "error": "No symbols available",
+                "btc_ctx": btc_ctx, "scanned": 0, "eligible": 0, "total": 0, "scanning": False,
+                "started_at": _scan_started_at,
+            }
+            if horizon == "short":
+                _last_reco_short_ts = time.time()
+            elif horizon == "medium":
+                _last_reco_medium_ts = time.time()
+            else:
+                _last_reco_long_ts = time.time()
+        return
+
+    _full_syms = list(symbols_to_scan)
+    total_to_scan = len(_full_syms)
+    _fp = hashlib.sha256(",".join(_full_syms).encode("utf-8")).hexdigest()[:24]
+    _resume_at = 0
+    try:
+        _ck = _scan_checkpoint_read()
+        if _ck.get("horizon") == horizon and _ck.get("fingerprint") == _fp:
+            _resume_at = int(_ck.get("next_batch_start", 0))
+            if _resume_at >= total_to_scan:
+                _resume_at = 0
+            elif _resume_at > 0:
+                logger.warning(
+                    "[SCAN] Resuming %s from symbol index %d / %d (checkpoint)",
+                    horizon, _resume_at, total_to_scan,
+                )
+    except Exception:
+        pass
+
+    logger.info("Starting %s scan with %d symbols", horizon, total_to_scan)
+    _raw_bs = max(SCAN_PARALLEL_WORKERS * 2, SCAN_PARALLEL_WORKERS * SCAN_BATCH_SIZE_MULT)
+    batch_size = max(4, _raw_bs // 2)
+    logger.warning(
+        "[SCAN-DEBUG] starting %s horizon scan, total symbols: %d | workers=%d batch_size=%d resume_from=%d",
+        horizon, total_to_scan, SCAN_PARALLEL_WORKERS, batch_size, _resume_at,
+    )
+
+    try:
+
+        with _globals_lock:
+            _BENCHMARK_1D_CACHE.clear()
+
+        try:
+            mark_explore_signals_pending(horizon, now_ts())
+        except Exception as _pend_e:
+            logger.warning("mark_explore_signals_pending failed: %s", _pend_e)
+
+        with _globals_lock:
+            _prev_run_ts = (_RECO_STATE.get(horizon) or {}).get("last_run_ts", 0)
+            _RECO_STATE[horizon] = {
+                "last_run_ts": _prev_run_ts or now, "error": "", "btc_ctx": btc_ctx,
                 "scanned": 0, "eligible": 0, "total": total_to_scan, "scanning": True,
+                "started_at": _scan_started_at,
             }
 
         error_count = 0
@@ -2013,16 +3414,56 @@ def _scan_recommendations(horizon: str) -> None:
             _SCAN_PROGRESS["buy_signals_found"] = 0
 
         executor = _get_scan_executor()
-        batch_size = SCAN_PARALLEL_WORKERS * 2
-        for batch_start in range(0, len(symbols_to_scan), batch_size):
+        _batch_num = 0
+        _rate_limited_count = 0
+        for batch_start in range(_resume_at, total_to_scan, batch_size):
             if error_count >= RECO_SCAN_ERROR_LIMIT:
                 error = f"Stopped after {error_count} errors (rate-limit protection)"
                 logger.error(error)
                 break
 
-            batch = symbols_to_scan[batch_start:batch_start + batch_size]
+            batch = _full_syms[batch_start:batch_start + batch_size]
+            _batch_num += 1
             with _globals_lock:
-                _SCAN_PROGRESS["current_symbol"] = f"batch {batch_start//batch_size + 1} ({len(batch)} symbols)"
+                _SCAN_PROGRESS["current_symbol"] = f"batch {_batch_num} ({len(batch)} symbols)"
+
+            gc.collect()
+            mem_mb = _memory_usage_mb()
+            if mem_mb > _SCAN_MEMORY_HARD_MB:
+                error = (
+                    f"Memory pressure abort: {mem_mb:.0f}MB > {_SCAN_MEMORY_HARD_MB:.0f}MB hard limit "
+                    f"(raise SCAN_MEMORY_HARD_MB if this is a false positive)"
+                )
+                logger.error("[SCAN] %s", error)
+                break
+            if mem_mb > _SCAN_MEMORY_SOFT_MB:
+                logger.warning(
+                    "[SCAN] Memory soft pressure: %.0f MB > %.0f MB — pausing 10s for GC (no abort).",
+                    mem_mb, _SCAN_MEMORY_SOFT_MB,
+                )
+                gc.collect()
+                time.sleep(10)
+                gc.collect()
+
+            # Warm Kraken ticker map once per batch (reduces per-symbol fetch_ticker pressure).
+            if any("/" in s for s in batch):
+                try:
+                    _tickers_batch_cached(ttl_sec=20)
+                except Exception:
+                    pass
+
+            if _batch_num > 1:
+                _has_stocks = any("/" not in s for s in batch)
+                if _rate_limited_count > 5:
+                    _sleep_s = SCAN_BATCH_SLEEP_RL_HIGH_SEC
+                elif _rate_limited_count > 2:
+                    _sleep_s = SCAN_BATCH_SLEEP_RL_MID_SEC
+                elif _has_stocks:
+                    _sleep_s = SCAN_BATCH_SLEEP_STOCK_SEC
+                else:
+                    _sleep_s = SCAN_BATCH_SLEEP_CRYPTO_SEC
+                if _sleep_s > 0:
+                    time.sleep(_sleep_s)
 
             futures = {
                 executor.submit(_scan_one_symbol, sym, horizon, btc_ctx): sym
@@ -2032,7 +3473,7 @@ def _scan_recommendations(horizon: str) -> None:
             for future in as_completed(futures):
                 sym = futures[future]
                 try:
-                    result = future.result(timeout=60)
+                    result = future.result(timeout=90)
                 except Exception as e:
                     error_count += 1
                     logger.warning("Scan future error %s: %s", sym, e)
@@ -2043,7 +3484,11 @@ def _scan_recommendations(horizon: str) -> None:
                     continue
 
                 status = result.get("status", "unknown")
-                if status == "error":
+                if status == "rate_limited":
+                    _rate_limited_count += 1
+                    skip_counts[status] = skip_counts.get(status, 0) + 1
+                    continue
+                elif status == "error":
                     error_count += 1
                     logger.warning("Error scanning %s: %s", sym, result.get("error"))
                     with _globals_lock:
@@ -2063,16 +3508,37 @@ def _scan_recommendations(horizon: str) -> None:
                     buy_signals += 1
                 if result.get("eligible"):
                     eligible += 1
-                save_recommendation_snapshot(
+                # Ensure change_24h is in metrics for explore_scorer at serve time
+                metrics = dict(snap.get("metrics") or {})
+                if snap.get("change_24h") is not None:
+                    metrics["change_24h"] = snap["change_24h"]
+                # Persist top-level recommendation fields into metrics_json so they
+                # survive in the DB and are available at API serve time for ranking.
+                for _persist_key in ("entry_quality", "rsi_value", "volume_ratio",
+                                     "confidence_band", "volume_anomaly"):
+                    _val = snap.get(_persist_key)
+                    if _val is not None:
+                        metrics[_persist_key] = _val
+                snap["metrics"] = metrics
+                _merge_evaluate_signal_into_snap(snap, horizon, btc_ctx)
+                metrics = dict(snap.get("metrics") or {})
+                _candles_1d = snap.get("_candles_1d") or []
+                _snap_id = save_recommendation_snapshot(
                     symbol=snap["symbol"],
                     horizon=horizon,
                     score=float(snap.get("score") or 0.0),
                     regime_json=json.dumps(snap.get("regime") or {}),
-                    metrics_json=json.dumps(snap.get("metrics") or {}),
+                    metrics_json=json.dumps(metrics),
                     reasons_json=json.dumps(snap.get("reasons") or []),
                     risk_flags_json=json.dumps(snap.get("risk_flags") or []),
                     score_breakdown_json=snap.get("score_breakdown_json") or json.dumps(snap.get("score_breakdown") or {}),
+                    composite_score=None,
+                    confidence_score=None,
+                    conviction_grade=None,
+                    factor_scores_json="",
+                    signal_flags_json="",
                 )
+                _persist_explore_feed_from_snap(snap["symbol"], horizon, snap, _candles_1d, btc_ctx)
                 scanned += 1
                 with _globals_lock:
                     s = _RECO_STATE.get(horizon) or {}
@@ -2081,12 +3547,30 @@ def _scan_recommendations(horizon: str) -> None:
                     _RECO_STATE[horizon] = s
                     _SCAN_PROGRESS["buy_signals_found"] = buy_signals
 
+            _scan_checkpoint_write(horizon, _fp, min(batch_start + batch_size, total_to_scan))
+            time.sleep(0.5)
+
+        if not error:
+            _scan_checkpoint_clear_for_horizon(horizon)
+
         scan_dur = time.time() - scan_start
         avg_per_sym = scan_dur / max(scanned, 1)
         logger.info("[SCAN] %s complete: %d/%d scanned, %d eligible, %d buy signals, "
             "%d errors in %.1fs (%.2fs/symbol). Skip reasons: %s",
             horizon, scanned, total_to_scan, eligible, buy_signals,
             error_count, scan_dur, avg_per_sym, skip_counts)
+
+        global _kraken_last_candle_ts, _alpaca_last_candle_ts
+        _now_ts = time.time()
+        try:
+            if scanned > 0:
+                _kraken_last_candle_ts = _now_ts
+                _alpaca_last_candle_ts = _now_ts
+                logger.info("Updated _kraken_last_candle_ts = %s (scanned=%d)", _now_ts, scanned)
+            else:
+                logger.warning("Scan completed with 0 scanned — candle ts NOT updated")
+        except Exception as _te:
+            logger.warning("Failed to update candle ts: %s", _te)
         if total_to_scan - scanned - error_count - sum(skip_counts.values()) > 5:
             logger.warning("[SCAN] %s: %d symbols unaccounted for (total=%d scanned=%d errors=%d skipped=%d)",
                 horizon, total_to_scan - scanned - error_count - sum(skip_counts.values()),
@@ -2116,7 +3600,7 @@ def _scan_recommendations(horizon: str) -> None:
 
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
-        logger.error(f"Scan failed: {error}", exc_info=True)
+        logger.error("%s scan failed: %s", horizon, error, exc_info=True)
 
     scan_end = time.time()
     with _globals_lock:
@@ -2124,7 +3608,9 @@ def _scan_recommendations(horizon: str) -> None:
             "last_run_ts": now, "error": error, "btc_ctx": btc_ctx,
             "scanned": scanned, "eligible": eligible,
             "total": total_to_scan, "scanning": False,
+            "started_at": _scan_started_at,
         }
+        _RECO_RESULT_CACHE.clear()  # Force fresh scoring on next Explore load
         if horizon == "short": _last_reco_short_ts = time.time()
         elif horizon == "medium": _last_reco_medium_ts = time.time()
         else: _last_reco_long_ts = time.time()
@@ -2142,16 +3628,230 @@ def _scan_recommendations(horizon: str) -> None:
         })
         _SCAN_PROGRESS["scan_history"] = history[-_SCAN_HISTORY_MAX:]
 
+    # Auto-trigger backtest after every completed scan:
+    #   - always on first scan (no stored result)
+    #   - daily refresh when stored result is >24h old
+    if not error:
+        try:
+            existing = get_latest_explore_backtest(horizon)
+            _needs_bt = (
+                not existing
+                or (time.time() - float(existing.get("computed_ts", 0))) > 86400
+            )
+            if _needs_bt:
+                _bt_thread_name = f"auto_backtest_{horizon}"
+                # Don't stack: only start if no backtest thread already running for this horizon
+                _bt_running = any(
+                    t.name == _bt_thread_name
+                    for t in threading.enumerate()
+                    if t.is_alive()
+                )
+                if not _bt_running:
+                    threading.Thread(
+                        target=_run_missing_backtests,
+                        kwargs={"horizons": (horizon,), "force": True},
+                        daemon=True,
+                        name=_bt_thread_name,
+                    ).start()
+                    logger.info("[BACKTEST] Auto-triggered %s backtest (first=%s, stale=%s)",
+                        horizon, not existing,
+                        bool(existing and (time.time() - float(existing.get("computed_ts", 0))) > 86400))
+        except Exception as _bt_trigger_err:
+            logger.warning("auto_backtest trigger failed: %s", _bt_trigger_err)
 
-def _scan_all_horizons(horizons: List[str]) -> None:
+    # Periodic DB cleanup: delete old recommendation snapshots (older than 7 days)
+    # to keep the DB from growing unbounded. Only run once per day.
+    try:
+        _now_cleanup = time.time()
+        _last_cleanup = _RECO_STATE.get("_last_snapshot_cleanup_ts", 0)
+        if _now_cleanup - _last_cleanup > 86400:
+            from db import cleanup_old_recommendation_snapshots
+            _deleted = cleanup_old_recommendation_snapshots(keep_days=7)
+            if _deleted > 0:
+                logger.info("Cleaned up %d old recommendation snapshots (>7 days)", _deleted)
+            with _globals_lock:
+                _RECO_STATE["_last_snapshot_cleanup_ts"] = _now_cleanup
+    except Exception as _cleanup_err:
+        logger.warning("recommendation snapshot cleanup failed: %s", _cleanup_err)
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _scan_recommendations(horizon: str) -> None:
+    """Single-horizon scan. Uses per-horizon lock so horizons run in parallel."""
+    with _HORIZON_SCAN_LOCKS[horizon]:
+        if _HORIZON_SCANNING.get(horizon):
+            logger.warning("[SCAN] Skipped %s: already scanning", horizon)
+            return
+        _HORIZON_SCANNING[horizon] = True
+    try:
+        _scan_recommendations_impl(horizon)
+        if horizon == "short":
+            try:
+                _warm_explore_feed_cache()
+            except Exception as _wfc_err:
+                logger.warning("explore feed cache warm after scan failed: %s", _wfc_err)
+    except Exception as e:
+        logger.error("[SCAN] %s scan failed: %s", horizon, e, exc_info=True)
+    finally:
+        _HORIZON_SCANNING[horizon] = False
+
+
+def _fire_horizon_scan(horizon: str) -> bool:
     """
-    Scan horizons sequentially to avoid Kraken rate limit storms.
-    Running short+medium+long in parallel would cause 24+ concurrent API calls
-    (3 horizons x 8 workers), triggering 429s and failed fetches.
-    Sequential execution keeps concurrency at 8 per horizon.
+    Fire a scan for one horizon in a background thread.
+    Returns True if a thread was started, False if already scanning.
     """
+    with _HORIZON_SCAN_LOCKS[horizon]:
+        if _HORIZON_SCANNING.get(horizon):
+            logger.debug("[SCAN] %s already scanning — skip fire", horizon)
+            return False
+        _HORIZON_SCANNING[horizon] = True
+
+    def _run():
+        try:
+            while True:
+                try:
+                    _scan_recommendations_impl(horizon)
+                    break
+                except Exception as e:
+                    logger.error(
+                        "Scan worker [%s] crashed: %s. Restarting in 30s.",
+                        horizon,
+                        e,
+                        exc_info=True,
+                    )
+                    time.sleep(30)
+            if horizon == "short":
+                try:
+                    _warm_explore_feed_cache()
+                except Exception as _wfc_err:
+                    logger.warning("explore feed cache warm after scan failed: %s", _wfc_err)
+        except Exception as e:
+            logger.error("[SCAN] %s horizon thread failed: %s", horizon, e, exc_info=True)
+        finally:
+            _HORIZON_SCANNING[horizon] = False
+
+    threading.Thread(target=_run, daemon=True, name=f"scan_{horizon}").start()
+    logger.info("[SCAN] Fired parallel scan thread for %s horizon", horizon)
+    return True
+
+
+def _scan_all_horizons(horizons: List[str]) -> set:
+    """
+    Fire each horizon in its own background thread (parallel, not sequential).
+    Returns the set of horizons where a thread was successfully started.
+    """
+    fired: set = set()
     for h in horizons:
-        _scan_recommendations(h)
+        if _fire_horizon_scan(h):
+            fired.add(h)
+    return fired
+
+
+def _backtest_fetch_candles(sym: str) -> list:
+    """Shared OHLCV fetcher for explore backtests (yfinance for stocks, Kraken for crypto)."""
+    try:
+        if "/" not in sym:
+            try:
+                import yfinance as yf
+                hist = yf.Ticker(sym).history(period="1y", interval="1d")
+                if hist is not None and not hist.empty:
+                    return [[int(ts.timestamp()), float(r["Open"]), float(r["High"]),
+                             float(r["Low"]), float(r["Close"]), float(r["Volume"])]
+                            for ts, r in hist.iterrows()]
+            except Exception:
+                pass
+            return []
+        else:
+            if kc is None:
+                return []
+            now_ms = int(time.time() * 1000)
+            return list(kc.fetch_ohlcv_range(sym, "1d", now_ms - 365 * 86400 * 1000, now_ms) or [])
+    except Exception:
+        return []
+
+
+def _run_missing_backtests(horizons: tuple = ("short", "medium", "long"),
+                           force: bool = False) -> None:
+    """Run explore backtest for specified horizons.
+    force=False (default): skip horizons that already have a stored result.
+    force=True: always refresh (used after a fresh scan).
+    """
+    try:
+        from explore_backtest import default_universe_symbols, run_explore_backtest
+        stocks, crypto = default_universe_symbols()
+    except Exception as e:
+        logger.warning("[BACKTEST] import failed, skipping: %s", e)
+        return
+    for h in horizons:
+        try:
+            if not force and get_latest_explore_backtest(h):
+                continue  # already have a result; skip unless forced
+            logger.info("[BACKTEST] Running %s horizon backtest (force=%s)", h, force)
+            res = run_explore_backtest(fetch_candles=_backtest_fetch_candles,
+                                       stock_symbols=stocks, crypto_symbols=crypto, horizon=h)
+            save_explore_backtest_results(h, res)
+            logger.info("[BACKTEST] %s horizon backtest saved (win_rate=%.1f%%)",
+                        h, float(res.get("win_rate_90d") or 0) * 100)
+        except Exception as _e:
+            logger.warning("[BACKTEST] %s horizon failed: %s", h, _e)
+
+
+def _warm_explore_feed_cache() -> None:
+    """Pre-populate _EXPLORE_FEED_CACHE with lightweight explore_signals data."""
+    items = _get_explore_feed_items(horizon="short", limit=80, signal_filter="all", market_type="all")
+    now_i = int(time.time())
+    _ef_response = {
+        "ok": True,
+        "status": "ready",
+        "reason": "ok",
+        "message": "Explore feed (cached at startup)",
+        "horizon": "short",
+        "items": items,
+        "count": len(items),
+        "has_more": False,
+        "last_scan_ts": now_i,
+        "scan_age_sec": 0,
+        "last_scan_by_horizon": {},
+        "explore_rejected": [],
+        "cache_ts": now_i,
+        "explore_smart_rank": False,
+        "explore_disclaimer": "",
+        "market_conditions": {},
+    }
+    _ef_cache_key = "short|all|all|0"
+    _EXPLORE_FEED_CACHE[_ef_cache_key] = (time.time(), _ef_response)
+    logger.info("explore feed cache warmed: %d items", len(items))
+
+
+def _explore_startup_sequential_scan() -> None:
+    """After boot, fire all 3 horizons in parallel so all populate without user action."""
+    time.sleep(22.0)
+    try:
+        _warm_explore_feed_cache()
+    except Exception as e:
+        logger.warning("explore feed cache warm failed: %s", e)
+    logger.warning("[SCAN-DEBUG] startup scan: firing short + medium + long in parallel")
+    try:
+        n = delete_recommendations_for_blocklist(list(CRYPTO_BLOCKLIST))
+        if n > 0:
+            logger.warning("Purged %d blocklisted recommendation(s) before startup scan", n)
+    except Exception:
+        pass
+    for h in ("short", "medium", "long"):
+        _fire_horizon_scan(h)
+    # Backtest for all horizons — force refresh to include new strategies
+    _start_background_thread(
+        "startup_backtest",
+        lambda: _run_missing_backtests(
+            horizons=("short", "medium", "long"),
+            force=True  # force refresh to include new strategies
+        )
+    )
 
 
 _BACKOFF_BASE = 1.0
@@ -2191,66 +3891,58 @@ def _retry_with_backoff(func, max_retries: int = 3, base_delay: float = 0.5):
 
 
 def _recommendations_loop() -> None:
+    """
+    Scheduler loop: check every 30s whether any horizon is due, fire parallel scan threads.
+    Startup scan already populates all 3 horizons; this loop keeps them fresh on schedule.
+    Sleeps 30s between checks (was 5s) to reduce idle CPU from ~130% to baseline.
+    """
     logger.info("[RECO_DEBUG] _recommendations_loop STARTED")
     last_short = 0
     last_medium = 0
     last_long = 0
+    _last_outcomes_ts = 0.0
+    _last_evict_ts = 0.0
     fail_count = 0
-    backoff = _BACKOFF_BASE
-    medium_bootstrapped = False
-    loop_iter = 0
     while True:
         try:
-            loop_iter += 1
             now = int(time.time())
-            due_short = now - last_short >= RECO_SHORT_EVERY_SEC
-            due_medium = now - last_medium >= RECO_MEDIUM_EVERY_SEC
-            due_long = now - last_long >= RECO_LONG_EVERY_SEC
-            if loop_iter <= 3 or due_short or due_medium or due_long:
-                logger.info("[RECO_DEBUG] recommendations_loop iter=%d due_short=%s due_medium=%s due_long=%s",
-                    loop_iter, due_short, due_medium, due_long)
 
-            if not medium_bootstrapped:
-                try:
-                    counts = count_recommendations_by_horizon()
-                    if counts.get("medium", 0) == 0:
-                        logger.info("Medium Term has 0 records - running bootstrap scan")
-                        _scan_recommendations("medium")
-                        last_medium = now
-                    medium_bootstrapped = True
-                except Exception as e:
-                    logger.debug("Medium bootstrap check: %s", e)
-
-            horizons_due = []
+            # Fire each due horizon in its own background thread (parallel, non-blocking)
             if now - last_short >= RECO_SHORT_EVERY_SEC:
-                horizons_due.append("short")
+                if _fire_horizon_scan("short"):
+                    last_short = now
+                elif not _HORIZON_SCANNING.get("short"):
+                    last_short = now  # already-scanning case — advance to prevent spin
+
             if now - last_medium >= RECO_MEDIUM_EVERY_SEC:
-                horizons_due.append("medium")
+                if _fire_horizon_scan("medium"):
+                    last_medium = now
+                elif not _HORIZON_SCANNING.get("medium"):
+                    last_medium = now
+
             if now - last_long >= RECO_LONG_EVERY_SEC:
-                horizons_due.append("long")
+                if _fire_horizon_scan("long"):
+                    last_long = now
+                elif not _HORIZON_SCANNING.get("long"):
+                    last_long = now
 
-            if horizons_due:
-                with _globals_lock:
-                    already_scanning = [h for h in horizons_due if (_RECO_STATE.get(h) or {}).get("scanning")]
-                if already_scanning:
-                    logger.warning("[SCAN] Skipping trigger: horizons %s already scanning (possible prior timeout)",
-                        already_scanning)
-                    horizons_due = [h for h in horizons_due if h not in already_scanning]
-                if horizons_due:
-                    _scan_all_horizons(horizons_due)
-                    scan_time = int(time.time())
-                    if "short" in horizons_due: last_short = scan_time
-                    if "medium" in horizons_due: last_medium = scan_time
-                    if "long" in horizons_due: last_long = scan_time
-
-            evicted = _evict_ohlcv_cache()
-            if evicted > 0:
-                logger.info("[SCAN] Evicted %d stale OHLCV cache entries (remaining: %d)",
-                    evicted, len(_RECO_OHLCV_CACHE))
-            gc.collect()
+            # Housekeeping — only once per hour to avoid constant GC/IO overhead
+            now_f = time.time()
+            if now_f - _last_evict_ts >= 3600:
+                evicted = _evict_ohlcv_cache()
+                if evicted > 0:
+                    logger.info("[SCAN] Evicted %d stale OHLCV entries (remaining: %d)",
+                        evicted, len(_RECO_OHLCV_CACHE))
+                gc.collect()
+                _last_evict_ts = now_f
+            if now_f - _last_outcomes_ts >= 3600:
+                try:
+                    _run_explore_outcomes_update_batch()
+                except Exception as _eo_err:
+                    logger.warning("explore outcomes batch: %s", _eo_err)
+                _last_outcomes_ts = now_f
 
             fail_count = 0
-            backoff = _BACKOFF_BASE
         except Exception:
             logger.exception("_recommendations_loop: iteration failed")
             fail_count += 1
@@ -2260,29 +3952,52 @@ def _recommendations_loop() -> None:
                     requests.post(DISCORD_WEBHOOK_URL, json={"content": f"⚠️ Recommendations loop: {fail_count} consecutive failures. Degraded."}, timeout=3)
                 except Exception:
                     pass
-            backoff = min(_BACKOFF_MAX, backoff * 1.5)
-        time.sleep(max(5, int(backoff)))
+        time.sleep(30)  # 30s idle check — reduces CPU from ~130% to baseline
 
 
 def _ml_retrain_loop() -> None:
-    """Weekly ML retrain (walk-forward, deploy only if validation >60%)."""
+    """Weekly ML retrain (walk-forward, deploy only if validation >60%).
+    Also auto-collects training data from explore signal outcomes when training set is too small.
+    """
     import os
     freq_days = int(os.getenv("ML_RETRAIN_FREQUENCY", "7"))
     interval_sec = max(86400, freq_days * 86400)
     last_run = 0
     while True:
         try:
-            time.sleep(3600)  # Check hourly
+            time.sleep(3600)
             now = int(time.time())
             if now - last_run >= interval_sec:
                 try:
                     from ml_ensemble import get_ml_ensemble
                     ensemble = get_ml_ensemble()
-                    if len(ensemble._training_data) >= 100:
+
+                    # Auto-collect training data from signal outcomes if training set is small
+                    n_data = len(getattr(ensemble, "_training_data", []))
+                    if n_data < 100:
+                        try:
+                            from db import get_explore_signal_outcomes_for_training
+                            outcomes = get_explore_signal_outcomes_for_training(limit=500)
+                            if outcomes and len(outcomes) > 0:
+                                for row in outcomes:
+                                    try:
+                                        ensemble.add_training_sample(row)
+                                    except Exception:
+                                        pass
+                                logger.info("ML auto-collected %d training samples from signal outcomes (had %d)",
+                                           len(outcomes), n_data)
+                        except ImportError:
+                            logger.debug("get_explore_signal_outcomes_for_training not available")
+                        except Exception as _atd_err:
+                            logger.debug("ML auto-collect training data: %s", _atd_err)
+
+                    n_data = len(getattr(ensemble, "_training_data", []))
+                    min_samples = int(os.getenv("ML_MIN_TRAINING_SAMPLES", "50"))
+                    if n_data >= min_samples:
                         success = ensemble.train(force=True)
                         if success:
                             last_run = now
-                            min_acc = float(os.getenv("ML_MIN_ACCURACY", "0.60"))
+                            min_acc = float(os.getenv("ML_MIN_ACCURACY", "0.55"))
                             best = max(
                                 getattr(ensemble._model_performance.get("xgb"), "recent_accuracy", 0) or 0,
                                 getattr(ensemble._model_performance.get("rf"), "recent_accuracy", 0) or 0,
@@ -2291,6 +4006,11 @@ def _ml_retrain_loop() -> None:
                                 from db import save_ml_model_version
                                 save_ml_model_version("ensemble", f"v{now}", best, deployed=True)
                                 logger.info("ML retrain: deployed ensemble v%s (acc=%.2f%%)", now, best * 100)
+                            else:
+                                logger.info("ML retrain: accuracy %.2f%% below threshold %.2f%%, not deploying",
+                                           best * 100, min_acc * 100)
+                    else:
+                        logger.debug("ML retrain: only %d training samples (need %d), skipping", n_data, min_samples)
                 except Exception as e:
                     logger.debug("ML retrain loop: %s", e)
         except Exception as e:
@@ -2313,6 +4033,139 @@ def _ml_outcomes_loop() -> None:
                     logger.debug("ML outcomes job: %s", e)
         except Exception:
             pass
+
+
+def _screener_outcomes_loop() -> None:
+    """
+    Hourly job: track screener recommendation accuracy.
+    For each snapshot >= 24h old without an outcome, fetch current price,
+    compute return, and write win/loss to recommendation_performance.
+    Only tracks 'buy' signal recs with score > 50.
+
+    Phase 1.2c migration:
+      * Stopped opening a raw sqlite3 connection (no PRAGMAs, bypassed
+        write_txn). Reads now go through db._conn() (per-thread cached
+        with WAL/busy_timeout pragmas applied), inserts go through
+        db.write_txn(None, _do, name=...).
+      * Inner ``except Exception as e: logger.debug(...)`` swallow has
+        been replaced with logger.exception + _loop_health_err so the
+        operator can see persistent failures via /health/full.
+      * Outer ``except Exception: pass`` (which masked everything,
+        including the OperationalError loop) is gone — the loop body
+        records health and continues.
+    """
+    import json as _js
+    LOOP = "screener_outcomes"
+    last_run = 0
+    while True:
+        try:
+            time.sleep(1800)  # run every 30 min
+            now = int(time.time())
+            if now - last_run < 3600:
+                continue
+            last_run = now
+            if not _kraken_ready():
+                # Not failing — Kraken not ready is a known operational
+                # condition; just record liveness and loop.
+                _loop_health_ok(LOOP)
+                continue
+
+            cutoff_lo = now - 7 * 86400   # don't go older than 7d
+            cutoff_hi = now - 24 * 3600   # must be at least 24h old
+
+            from db import _conn as _read_conn, write_txn  # local: avoid import cycle at module top
+
+            con = _read_conn()
+            rows = con.execute(
+                """
+                SELECT id, symbol, score, regime_json, metrics_json, created_ts
+                FROM recommendations_snapshots
+                WHERE created_ts BETWEEN ? AND ?
+                ORDER BY id DESC LIMIT 500
+                """,
+                (cutoff_lo, cutoff_hi),
+            ).fetchall()
+            existing_rows = con.execute(
+                "SELECT symbol, recommendation_date FROM recommendation_performance "
+                "WHERE outcome IN ('price_up','price_down') AND recommendation_date >= ?",
+                (cutoff_lo,),
+            ).fetchall()
+            existing = {
+                (er["symbol"], er["recommendation_date"] // 3600 * 3600)
+                for er in existing_rows
+            }
+
+            # Build the candidate list outside the write_txn so price
+            # fetches (network I/O) don't hold the global write lock.
+            candidates: List[Tuple[Any, ...]] = []
+            for row in rows:
+                sym = row["symbol"]
+                rec_ts = int(row["created_ts"] or 0)
+                bucket = rec_ts // 3600 * 3600
+                if (sym, bucket) in existing:
+                    continue
+                try:
+                    metrics = _js.loads(row["metrics_json"] or "{}")
+                except Exception:
+                    logger.exception("screener_outcomes: bad metrics_json for %s", sym)
+                    continue
+                rec_price = float(metrics.get("price") or 0)
+                signal = metrics.get("signal", "")
+                score = float(row["score"] or 0)
+                if score < 50 or signal not in ("buy",) or rec_price <= 0:
+                    continue
+                try:
+                    cur_price = float(kc.fetch_ticker_last(sym))
+                except Exception:
+                    # Per-symbol fetch failures are expected (delisted,
+                    # rate-limited). Skip the row but DO NOT mark the
+                    # whole loop as failed.
+                    logger.debug("screener_outcomes: ticker fetch failed for %s", sym)
+                    continue
+                ret_pct = (cur_price - rec_price) / rec_price * 100 if rec_price > 0 else 0
+                outcome = "price_up" if ret_pct > 0 else "price_down"
+                regime = ""
+                try:
+                    rj = _js.loads(row["regime_json"] or "{}")
+                    regime = rj.get("label", "")
+                except Exception:
+                    logger.exception("screener_outcomes: bad regime_json for %s", sym)
+                candidates.append((
+                    sym, rec_ts, score, regime,
+                    rec_price, cur_price,
+                    round(ret_pct, 4),
+                    round((now - rec_ts) / 86400, 2),
+                    outcome,
+                    f"auto-tracked {round(ret_pct, 2)}% return",
+                    now,
+                    sym, bucket,  # for existing-set update
+                ))
+
+            inserted = 0
+            if candidates:
+                def _do(con) -> int:
+                    n = 0
+                    for c in candidates:
+                        con.execute(
+                            """
+                            INSERT OR IGNORE INTO recommendation_performance(
+                                symbol, recommendation_date, score_at_recommendation,
+                                regime_at_recommendation, entry_price, exit_price,
+                                pnl_realized, days_held, outcome, notes, created_at
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            c[:11],
+                        )
+                        n += 1
+                    return n
+                inserted = write_txn(None, _do, name="screener_outcomes_insert")
+
+            if inserted:
+                logger.info("Screener outcome tracker: recorded %d outcomes", inserted)
+            _loop_health_ok(LOOP)
+        except Exception as e:
+            logger.exception("_screener_outcomes_loop: iteration failed")
+            _loop_health_err(LOOP, e)
 
 
 def _portfolio_snapshot() -> Dict[str, Any]:
@@ -2361,10 +4214,10 @@ def _portfolio_snapshot() -> Dict[str, Any]:
                     return float(kc.fetch_ticker_last(sym))
                 except Exception:
                     return None
-            # Fallback: try XBT mapping for BTC variants
-            if a in ("BTC", "XXBT"):
+            # Fallback: try BTC/USD for BTC variants (ccxt Kraken uses BTC not XBT)
+            if a in ("BTC", "XBT", "XXBT"):
                 try:
-                    return float(kc.fetch_ticker_last("XBT/USD"))
+                    return float(kc.fetch_ticker_last(_resolve_symbol("BTC/USD")))
                 except Exception:
                     return None
             return None
@@ -2433,7 +4286,23 @@ def _portfolio_snapshot() -> Dict[str, Any]:
 
 
 def _portfolio_loop():
+    """Portfolio sampler — appends to in-memory history and writes to
+    portfolio_snapshots once per iteration.
+
+    Phase 1.2c migration:
+      * INSERT now goes through db.write_txn(None, ...) so the global
+        write lock is acquired and a per-iteration retry/backoff
+        applies on 'database is locked'.
+      * The ``except Exception: pass`` swallow around the DB write is
+        gone; failures log via logger.exception and update
+        _BACKGROUND_LOOP_HEALTH so /health/full surfaces them.
+      * cleanup_old_portfolio_snapshots is called via the chunked path
+        added in Phase 1.2b step 8 — the inner try/except still bounds
+        cleanup failures so a janitor failure doesn't take the
+        sampler down.
+    """
     global _last_portfolio_ts
+    LOOP = "portfolio"
     fail_count = 0
     backoff = _BACKOFF_BASE
     while True:
@@ -2446,32 +4315,45 @@ def _portfolio_loop():
                 if len(PORT_HISTORY) > 2000:
                     del PORT_HISTORY[:200]
                 _last_portfolio_ts = time.time()
-            # Record to portfolio_snapshots for charts (11.md)
+
             try:
-                from db import _conn, cleanup_old_portfolio_snapshots
-                con = _conn()
-                try:
+                from db import write_txn, cleanup_old_portfolio_snapshots
+                positions_count = int(snap.get("positions_count", 0))
+
+                def _do(con) -> None:
                     con.execute(
-                        "INSERT INTO portfolio_snapshots (total_value, total_pnl, active_positions, unrealized_pnl) VALUES (?, ?, ?, ?)",
-                        (total_usd, 0.0, snap.get("positions_count", 0), 0.0),
+                        "INSERT INTO portfolio_snapshots (total_value, total_pnl, active_positions, unrealized_pnl) "
+                        "VALUES (?, ?, ?, ?)",
+                        (total_usd, 0.0, positions_count, 0.0),
                     )
-                    con.commit()
-                    # Run cleanup once per day to keep last 90 days
-                    now_float = time.time()
-                    if now_float - _last_portfolio_cleanup_ts >= 86400:
-                        try:
-                            cleanup_old_portfolio_snapshots(keep_days=90)
-                            globals()["_last_portfolio_cleanup_ts"] = now_float
-                        except Exception:
-                            pass
-                finally:
-                    con.close()
-            except Exception:
-                pass
+                write_txn(None, _do, name="portfolio_snapshot_insert")
+
+                # Run cleanup once per day to keep last 90 days. Bounded
+                # try so a janitor failure doesn't stop the sampler.
+                now_float = time.time()
+                if now_float - _last_portfolio_cleanup_ts >= 86400:
+                    try:
+                        cleanup_old_portfolio_snapshots(keep_days=90)
+                        globals()["_last_portfolio_cleanup_ts"] = now_float
+                    except Exception:
+                        logger.exception("_portfolio_loop: cleanup_old_portfolio_snapshots failed")
+            except Exception as e:
+                # The DB write failed. We do NOT silently continue —
+                # surface it to the loop-level health and let the
+                # outer except retry with backoff.
+                logger.exception("_portfolio_loop: snapshot persist failed")
+                _loop_health_err(LOOP, e)
+                fail_count += 1
+                backoff = min(_BACKOFF_MAX, backoff * 2)
+                time.sleep(max(5, PORT_EVERY_SEC, int(backoff)))
+                continue
+
             fail_count = 0
             backoff = _BACKOFF_BASE
-        except Exception:
+            _loop_health_ok(LOOP)
+        except Exception as e:
             logger.exception("_portfolio_loop: iteration failed")
+            _loop_health_err(LOOP, e)
             fail_count += 1
             backoff = min(_BACKOFF_MAX, backoff * 2)
         time.sleep(max(5, PORT_EVERY_SEC, int(backoff)))
@@ -2644,6 +4526,10 @@ def _kill_switch_state() -> bool:
 
 
 def _should_autostart(bot: Dict[str, Any]) -> bool:
+    """Return True if the bot is eligible for auto-start on server boot.
+
+    Bug 8 fix: This is checked once at startup, not on every watchdog cycle.
+    """
     try:
         if int(bot.get("last_running", 0)) == 1:
             return True
@@ -2654,9 +4540,27 @@ def _should_autostart(bot: Dict[str, Any]) -> bool:
     return False
 
 
+def _watchdog_should_restart(bot: Dict[str, Any]) -> bool:
+    """Return True only when the watchdog is allowed to (re)start a stopped bot.
+
+    Bug 8 fix: when ``auto_restart`` is explicitly disabled the watchdog must
+    NOT restart the bot every cycle. We still allow a single recovery start at
+    boot via the autostart loop. After that, we only restart bots that have
+    opted in via ``auto_restart=1``.
+    """
+    try:
+        if int(bot.get("auto_restart", 0)) == 1 and int(bot.get("enabled", 0)) == 1:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _autostart_loop() -> None:
+    # Wait for BotManager initialization before attempting autostart
+    time.sleep(15)
     attempts = 0
-    max_attempts = 36  # ~3 minutes
+    max_attempts = 36
     while attempts < max_attempts:
         try:
             if bm is None:
@@ -2670,33 +4574,54 @@ def _autostart_loop() -> None:
                 time.sleep(5)
                 attempts += 1
                 continue
+            started_count = 0
             for b in bots:
                 if not _should_autostart(b):
                     continue
                 bot_id = int(b.get("id"))
-                snap = bm.snapshot(bot_id)
-                if bool(snap.get("running")):
+                try:
+                    snap = bm.snapshot(bot_id)
+                    if bool(snap.get("running")):
+                        continue
+                except Exception as bot_err:
+                    logger.debug("autostart: snapshot failed for bot %s: %s", bot_id, bot_err)
+                    continue
+                # Safety: skip bots with CRITICAL risk flag
+                if snap and snap.get("risk_level") == "CRITICAL":
+                    logger.info("autostart: skipping bot %d — CRITICAL risk flag active", bot_id)
+                    continue
+                # Safety: skip bots with $0 budget
+                _budget = float(b.get("base_order_size") or b.get("base_quote") or 0)
+                if _budget <= 0:
+                    logger.info("autostart: skipping bot %d — no budget allocated", bot_id)
                     continue
                 ok, reason = _can_start_bot_live(b)
                 if not ok:
                     pending_live = True
-                    logger.warning(
-                        "autostart: readiness gate blocked bot_id=%s market_type=%s reason=%s",
-                        bot_id,
-                        b.get("market_type"),
-                        reason,
-                    )
+                    if attempts < 3:
+                        logger.info("autostart: waiting for readiness bot_id=%s reason=%s", bot_id, reason)
                     continue
-                bm.start(bot_id)
+                try:
+                    bm.start(bot_id, silent=True)
+                    started_count += 1
+                except Exception as start_err:
+                    logger.warning("autostart: failed to start bot %s: %s", bot_id, start_err)
+            if started_count > 0:
+                logger.info("autostart: started %d bots on attempt %d", started_count, attempts + 1)
             if not pending_live:
+                logger.info("autostart: complete — all eligible bots started")
                 return
-        except Exception:
-            logger.exception("_autostart_loop: iteration failed")
+        except Exception as e:
+            logger.warning("autostart: iteration %d failed: %s", attempts + 1, e)
         time.sleep(5)
         attempts += 1
+    logger.info("autostart: finished after %d attempts (some bots may still be pending)", max_attempts)
 
 
 _WATCHDOG_STICKY_ERRORS: Dict[int, Dict[str, Any]] = {}
+
+# Bug 8: Minimum gap between watchdog restarts of the same bot. Default 5min.
+WATCHDOG_MIN_RESTART_INTERVAL_SEC = int(os.getenv("WATCHDOG_MIN_RESTART_INTERVAL_SEC", "300"))
 
 
 def _health_watchdog_loop() -> None:
@@ -2712,7 +4637,10 @@ def _health_watchdog_loop() -> None:
             bots = list_bots()
             now = int(time.time())
             for b in bots:
-                if not _should_autostart(b):
+                # Bug 8: Only restart bots that opted in via auto_restart=1.
+                # The previous behaviour restarted any enabled bot every ~60s
+                # which thrashed open deals.
+                if not _watchdog_should_restart(b):
                     continue
                 bot_id = int(b.get("id"))
                 snap = bm.snapshot(bot_id)
@@ -2721,15 +4649,23 @@ def _health_watchdog_loop() -> None:
                     if bot and int(bot.get("enabled", 0)) == 1:
                         last_restart = getattr(_health_watchdog_loop, f"_last_restart_{bot_id}", 0)
                         fail_count = getattr(_health_watchdog_loop, f"_fail_count_{bot_id}", 0)
-                        if (now - last_restart) > 60:
+                        if (now - last_restart) > WATCHDOG_MIN_RESTART_INTERVAL_SEC:
                             ok, reason = _can_start_bot_live(b)
                             if ok:
                                 try:
-                                    bm.start(bot_id)
+                                    last_err = str(snap.get("last_error") or "").strip()
+                                    bm.start(bot_id, silent=True)
                                     setattr(_health_watchdog_loop, f"_last_restart_{bot_id}", now)
                                     setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", 0)
                                     _WATCHDOG_STICKY_ERRORS.pop(bot_id, None)
-                                    add_log(bot_id, "WARN", "Watchdog restarted bot.", "SYSTEM")
+                                    detail = f" Reason: {last_err}" if last_err else ""
+                                    # add_log can hit "database is locked" during a startup
+                                    # write storm; swallow that so we don't take the watchdog
+                                    # down. journalctl still records the restart.
+                                    try:
+                                        add_log(bot_id, "WARN", f"Watchdog restarted bot (auto_restart=1).{detail}", "SYSTEM")
+                                    except Exception as log_err:
+                                        logger.warning("watchdog add_log skipped (locked?): %s", log_err)
                                 except Exception as restart_err:
                                     fail_count += 1
                                     setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", fail_count)
@@ -2737,7 +4673,10 @@ def _health_watchdog_loop() -> None:
                                         "error": f"Watchdog restart failed: {restart_err}",
                                         "fail_count": fail_count, "last_attempt_ts": now,
                                     }
-                                    add_log(bot_id, "ERROR", f"Watchdog restart failed ({fail_count}x): {restart_err}", "SYSTEM")
+                                    try:
+                                        add_log(bot_id, "ERROR", f"Watchdog restart failed ({fail_count}x): {restart_err}", "SYSTEM")
+                                    except Exception as log_err:
+                                        logger.warning("watchdog add_log skipped (locked?): %s", log_err)
                             else:
                                 fail_count += 1
                                 setattr(_health_watchdog_loop, f"_fail_count_{bot_id}", fail_count)
@@ -2746,57 +4685,114 @@ def _health_watchdog_loop() -> None:
                                     "fail_count": fail_count, "last_attempt_ts": now,
                                 }
                                 if fail_count <= 3:
-                                    add_log(bot_id, "WARN", f"Watchdog: cannot restart — {reason}", "SYSTEM")
+                                    try:
+                                        add_log(bot_id, "WARN", f"Watchdog: cannot restart — {reason}", "SYSTEM")
+                                    except Exception as log_err:
+                                        logger.warning("watchdog add_log skipped (locked?): %s", log_err)
                                 logger.warning(
                                     "watchdog: start blocked bot_id=%s market_type=%s reason=%s fails=%d",
                                     bot_id, b.get("market_type"), reason, fail_count,
                                 )
                     continue
                 last_tick = int(snap.get("last_tick_ts") or 0)
-                # Increase threshold to 5 minutes (300s) to avoid restarting bots waiting for market open
-                # Also check if bot is actually running - if running but stale tick, it might be waiting
-                stale_threshold = max(300, HEALTH_WATCHDOG_SEC * 5)  # At least 5 minutes
+                stale_threshold = 600  # 10 minutes for all bots
                 if last_tick and (now - last_tick) > stale_threshold:
-                    # Only restart if bot claims to be running but hasn't ticked
-                    # If bot is stopped, autostart will handle it above
                     if bool(snap.get("running")):
-                        # Check if it's a stock bot that might be waiting for market open
                         bot = get_bot(bot_id)
                         is_stock = bot and (len(str(bot.get("symbol", ""))) < 6 and "/" not in str(bot.get("symbol", "")))
-                        if is_stock:
-                            # Market-hours aware: skip restart when market closed (bot waiting for open)
-                            if not _alpaca_market_open():
-                                continue  # Don't restart; bot is correctly idle
-                            # For stocks, be even more lenient (market might be closed)
-                            if (now - last_tick) > 600:  # 10 minutes for stocks
-                                bm.stop(bot_id)
-                                time.sleep(1)
-                                ok, reason = _can_start_bot_live(b)
-                                if ok:
-                                    bm.start(bot_id)
-                                    add_log(bot_id, "WARN", f"Watchdog restarted stalled stock bot (last tick: {now - last_tick}s ago).", "SYSTEM")
-                                else:
-                                    logger.warning(
-                                        "watchdog: restart blocked bot_id=%s market_type=%s reason=%s",
-                                        bot_id,
-                                        b.get("market_type"),
-                                        reason,
-                                    )
-                        else:
-                            # For crypto, use normal threshold
-                            bm.stop(bot_id)
+                        if is_stock and not _alpaca_market_open():
+                            continue
+
+                        # Bug 1: NEVER cancel an open deal here. Only cancel a
+                        # *ghost* deal — one with no recorded entry — and only
+                        # if it has been stuck like that for hours. Real deals
+                        # with entry_avg are preserved across restart.
+                        _wd_deal = latest_open_deal(bot_id)
+                        if _wd_deal and _wd_deal.get("entry_avg") is None:
+                            _deal_age = now - int(_wd_deal.get("opened_at", now))
+                            if _deal_age > 7200:
+                                try:
+                                    cancel_ghost_deal(int(_wd_deal["id"]))
+                                    add_log(bot_id, "WARN",
+                                            f"Watchdog cancelled ghost deal #{_wd_deal['id']} ({_deal_age // 3600}h old, no entry).",
+                                            "SYSTEM")
+                                except Exception:
+                                    pass
+
+                        # Bug 8: Throttle stalled-bot restarts via the same
+                        # per-bot interval used for cold-start recovery.
+                        _last_restart = getattr(_health_watchdog_loop, f"_last_restart_{bot_id}", 0)
+                        if (now - _last_restart) < WATCHDOG_MIN_RESTART_INTERVAL_SEC:
+                            continue
+                        # Only restart if TRULY stale (>15 min for stocks, >10 min for crypto)
+                        _restart_threshold = 900 if is_stock else stale_threshold
+                        if (now - last_tick) > _restart_threshold:
+                            bm.stop(bot_id, silent=True)
                             time.sleep(1)
                             ok, reason = _can_start_bot_live(b)
                             if ok:
-                                bm.start(bot_id)
-                                add_log(bot_id, "WARN", f"Watchdog restarted stalled bot (last tick: {now - last_tick}s ago).", "SYSTEM")
+                                bm.start(bot_id, silent=True)
+                                setattr(_health_watchdog_loop, f"_last_restart_{bot_id}", now)
+                                try:
+                                    add_log(bot_id, "WARN",
+                                            f"Watchdog restarted stalled bot (last tick: {now - last_tick}s ago).",
+                                            "SYSTEM")
+                                except Exception as log_err:
+                                    logger.warning("watchdog add_log skipped (locked?): %s", log_err)
                             else:
                                 logger.warning(
                                     "watchdog: restart blocked bot_id=%s market_type=%s reason=%s",
-                                    bot_id,
-                                    b.get("market_type"),
-                                    reason,
+                                    bot_id, b.get("market_type"), reason,
                                 )
+            # Ghost deal detector: close deals that are OPEN with no entry for >2 hours
+            try:
+                ghost_deals = find_stale_ghost_deals(max_age_sec=7200)
+                for gd in ghost_deals:
+                    gd_id = int(gd["id"])
+                    gd_bot_id = int(gd["bot_id"])
+                    gd_age_hr = (now - int(gd.get("opened_at", now))) / 3600.0
+                    cancel_ghost_deal(gd_id)
+                    add_log(gd_bot_id, "WARN",
+                            f"Ghost deal #{gd_id} auto-cancelled: OPEN for {gd_age_hr:.1f}h with no entry (entry_avg=NULL).",
+                            "SYSTEM")
+                    logger.warning("watchdog: cancelled ghost deal #%d for bot %d (%.1fh old, no entry)",
+                                   gd_id, gd_bot_id, gd_age_hr)
+            except Exception as _gd_err:
+                logger.debug("Ghost deal check failed: %s", _gd_err)
+
+            # Reconciliation: compare local positions vs exchange (RECONCILIATION_ENABLED=1 to activate)
+            try:
+                from reconciliation import run_reconciliation
+                recon_snapshots = []
+                if bm:
+                    for b in bots:
+                        _bid = int(b.get("id"))
+                        _snap = bm.snapshot(_bid)
+                        if _snap and _snap.get("running") and float(_snap.get("base_pos") or 0.0) > 0:
+                            recon_snapshots.append({
+                                "bot_id": _bid,
+                                "symbol": b.get("symbol", ""),
+                                "base_pos": float(_snap.get("base_pos") or 0.0),
+                                "market_type": b.get("market_type", "crypto"),
+                            })
+
+                def _recon_client_fn(b_snap):
+                    mt = b_snap.get("market_type", "crypto")
+                    if mt in ("stocks", "stock"):
+                        _client = alpaca_live or alpaca_paper
+                        if _client:
+                            from alpaca_adapter import AlpacaAdapter
+                            return (AlpacaAdapter(_client), False)
+                        return (None, False)
+                    return (kc, True)
+
+                recon_warnings = run_reconciliation(recon_snapshots, _recon_client_fn)
+                for w in recon_warnings:
+                    logger.warning("Reconciliation: %s", w)
+            except ImportError:
+                pass
+            except Exception:
+                logger.debug("Reconciliation check failed (non-critical)", exc_info=True)
         except Exception:
             logger.exception("_health_watchdog_loop: iteration failed")
         time.sleep(HEALTH_WATCHDOG_SEC)
@@ -2891,7 +4887,7 @@ def shutdown():
             logger.info("Stopping all bots...")
             for b in list_bots():
                 try:
-                    bm.stop(int(b.get("id")))
+                    bm.stop(int(b.get("id")), silent=True)
                 except Exception as e:
                     logger.debug("Stop bot %s failed: %s", b.get("id"), e)
         except Exception as e:
@@ -2937,6 +4933,7 @@ def _init_alpaca_and_bm_sync():
     _has_alpaca_keys = bool(os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"))
     _enable_alpaca = os.getenv("ENABLE_ALPACA", "1" if _has_alpaca_keys else "0").strip().lower() in ("1", "true", "yes", "y", "on")
     if not _enable_alpaca or not _has_alpaca_keys:
+        logger.warning("WARNING: Stock signals are enabled but Alpaca is not configured — stock recommendations will appear but bots cannot be created for them. Add Alpaca API keys in Settings to enable stock trading.")
         logger.info("worker_api startup: Alpaca skipped (ENABLE_ALPACA=%s, keys=%s); crypto-only mode.", _enable_alpaca, "set" if _has_alpaca_keys else "missing")
         # Still create BotManager with Kraken only
         with _globals_lock:
@@ -3356,6 +5353,13 @@ def _startup_impl():
             KRAKEN_ERROR = str(e)
             logger.warning("worker_api startup: Kraken NOT initialized: %s", e)
 
+    try:
+        from db import repair_closed_deals_missing_entry
+
+        repair_closed_deals_missing_entry(kc)
+    except Exception as e:
+        logger.warning("startup: repair_closed_deals_missing_entry failed: %s", e)
+
     _STARTUP_STATUS["kraken_ready"] = KRAKEN_READY
     # ENABLE_ALPACA: 0 = crypto-only (skip Alpaca); 1 = require Alpaca for stocks. Default 0 if keys missing.
     _has_alpaca_keys = bool(os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"))
@@ -3373,6 +5377,7 @@ def _startup_impl():
     # Autopilot status (from DB)
     try:
         import autopilot
+        autopilot.ensure_autopilot_config_defaults()
         _STARTUP_STATUS["autopilot_enabled"] = autopilot.is_autopilot_enabled()
         ap_bots = [b for b in list_bots() if str(b.get("bot_type") or "").lower() == "autopilot"]
         _STARTUP_STATUS["autopilot_bots"] = len(ap_bots)
@@ -3389,11 +5394,17 @@ def _startup_impl():
         ("autostart", _autostart_loop),
         ("health_watchdog", _health_watchdog_loop),
         ("health_comprehensive", _health_comprehensive_loop),
+        ("explore_startup_scan", _explore_startup_sequential_scan),
         ("recommendations", _recommendations_loop),
         ("ml_retrain", _ml_retrain_loop),
         ("ml_outcomes", _ml_outcomes_loop),
+        ("screener_outcomes", _screener_outcomes_loop),
         ("autopilot", _autopilot_loop),
+        ("fear_greed", _fear_greed_loop),
+        ("perf_outcomes", _performance_outcomes_loop),
         ("thread_watchdog", _thread_watchdog_loop),
+        ("bots_summary_prewarm", _prewarm_bots_summary),
+        ("db_cleanup", _scheduled_db_cleanup),
     ]:
         try:
             _start_background_thread(name, target)
@@ -3404,6 +5415,42 @@ def _startup_impl():
         _comprehensive_health_check()  # returns (ok, issues)
     except Exception:
         pass
+
+    # Startup validation
+    _startup_checks = []
+    try:
+        init_db()
+        _cnt = len(list_bots())
+        _startup_checks.append(f"DB ✓ ({_cnt} bots)")
+    except Exception as e:
+        _startup_checks.append(f"DB ✗ ({e})")
+        logger.error("STARTUP VALIDATION FAILED: Database unreachable: %s", e)
+
+    if KRAKEN_READY:
+        _startup_checks.append("Kraken ✓")
+    else:
+        _startup_checks.append(f"Kraken ✗ ({KRAKEN_ERROR or 'not configured'})")
+
+    if ALPACA_PAPER_READY:
+        _startup_checks.append("Alpaca Paper ✓")
+    elif ALPACA_LIVE_READY:
+        _startup_checks.append("Alpaca Live ✓")
+    elif _ALPACA_KEYS_PRESENT:
+        _startup_checks.append(f"Alpaca ✗ ({ALPACA_ERROR or 'connection failed'})")
+    else:
+        _startup_checks.append("Alpaca ✗ (not configured)")
+
+    logger.info("Startup validation: %s", " | ".join(_startup_checks))
+    if ALLOW_LIVE_TRADING:
+        logger.info(
+            "\U0001f7e2 LIVE TRADING ENABLED \u2014 ALLOW_LIVE_TRADING=1 \u2014 "
+            "Real money orders will be placed on Kraken/Alpaca"
+        )
+    else:
+        logger.warning(
+            "\U0001f534 LIVE TRADING DISABLED \u2014 ALLOW_LIVE_TRADING=0 \u2014 "
+            "All real orders will be blocked"
+        )
     logger.info("worker_api startup: complete.")
     logger.info(
         "Startup diagnostics: Flask=%s DB=%s (bots=%s) Alpaca=%s WebSocket=%s Autopilot=%s (bots=%s) CandleTest=%s",
@@ -3486,7 +5533,7 @@ async def api_update_bot(bot_id: int, request: Request):
         "max_open_orders": int(min(50, max(1, int(_ov("max_open_orders", 6, lambda x: int(x) if x is not None else 6))))),
         "daily_loss_limit_pct": float(_ov("daily_loss_limit_pct", 0.06, lambda x: float(x) if x is not None else 0.06)),
         "pause_hours": int(_ov("pause_hours", 6, lambda x: int(x) if x is not None else 6)),
-        "auto_restart": int(_ov("auto_restart", 0, lambda x: int(x) if x is not None else 0)),
+        "auto_restart": int(_ov("auto_restart", 1, lambda x: int(x) if x is not None else 1)),
         "vol_gap_mult": float(_ov("vol_gap_mult", 1.0, lambda x: float(x) if x is not None else 1.0)),
         "tp_vol_mult": float(_ov("tp_vol_mult", 1.0, lambda x: float(x) if x is not None else 1.0)),
         "min_gap_pct": float(_ov("min_gap_pct", 0.003, lambda x: float(x) if x is not None else 0.003)),
@@ -3501,6 +5548,7 @@ async def api_update_bot(bot_id: int, request: Request):
         "spread_guard_pct": float(_ov("spread_guard_pct", 0.003, lambda x: float(x) if x is not None else 0.003)),
         "limit_timeout_sec": int(_ov("limit_timeout_sec", 8, lambda x: int(x) if x is not None else 8)),
         "max_drawdown_pct": float(_ov("max_drawdown_pct", 0.0, lambda x: float(x) if x is not None else 0.0)),
+        "hard_sl_pct": float(_ov("hard_sl_pct", 0.0, lambda x: float(x) if x is not None else 0.0)),
     }
     if settings["max_spend_quote"] <= 0:
         settings["max_spend_quote"] = settings["base_quote"] + settings["safety_quote"] * settings["max_safety"]
@@ -3591,7 +5639,27 @@ def _get_bot_client(bot: Dict[str, Any]):
 # =========================================================
 @app.get("/health")
 def health():
-    """Health check for nginx/deploy. Always 200 + JSON so upstream never 502s."""
+    """Ultra-fast liveness probe: returns in <50 ms regardless of DB / exchange state.
+
+    nginx and the deploy script call this every few seconds and MUST never 504. We
+    deliberately do not touch the DB, exchanges, or per-bot state here. Use
+    `/health/full` (formerly the heavy version) or `/api/health` for the rich
+    dashboard payload.
+    """
+    try:
+        return {"status": "ok", "ok": True, "timestamp": int(time.time())}
+    except Exception:
+        # Last-ditch fallback — must always return 200.
+        return {"status": "degraded", "ok": True, "timestamp": 0}
+
+
+@app.get("/health/full")
+def health_full():
+    """Detailed health (DB, Kraken, Alpaca, disk, bots, threads). Wrapped in a 2 s
+    timeout: if anything blocks (e.g. SQLite lock storm) we return `degraded`/200
+    so the upstream never bubbles a 5xx.
+    """
+    deadline = time.time() + 2.0
     try:
         ts = now_ts()
     except Exception:
@@ -3606,6 +5674,9 @@ def health():
         except Exception as e:
             db_ok = False
             logger.debug("DB health check failed: %s", e)
+
+        if time.time() > deadline:
+            return {"ok": True, "status": "degraded", "reason": "db_slow", "time": ts}
 
         status = "healthy" if db_ok else "degraded"
 
@@ -3638,9 +5709,84 @@ def health():
         except Exception:
             pass
 
+        # Scanner status
+        scanner_status = "idle"
+        last_scan_ago = None
+        try:
+            _sp = _SCAN_PROGRESS
+            if _sp.get("scan_start_ts", 0) > 0:
+                scan_age = int(time.time()) - int(_sp["scan_start_ts"])
+                last_scan_ago = f"{scan_age // 60} min ago" if scan_age > 60 else f"{scan_age}s ago"
+                scanner_status = "running" if _sp.get("current_symbol") else "idle"
+        except Exception:
+            pass
+
+        # Active bots count (time-budgeted: health must stay fast for nginx/upstream)
+        bots_active = 0
+        try:
+            if bm:
+                _t_budget = time.time() + 0.2
+                for b in list_bots():
+                    if time.time() > _t_budget:
+                        break
+                    try:
+                        snap = bm.snapshot(int(b["id"]))
+                        if snap and snap.get("running"):
+                            bots_active += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Background thread health
+        thread_health = {}
+        try:
+            for name, info in list(_background_threads.items()):
+                t = info.get("thread")
+                if t and t.is_alive():
+                    thread_health[name] = "alive"
+                elif name in _ONE_SHOT_THREADS:
+                    thread_health[name] = "completed"  # expected to exit
+                else:
+                    thread_health[name] = "dead"
+        except Exception:
+            logger.exception("health/full: thread roll-up failed")
+
+        # Background-loop health (Phase 1.2c).
+        # Per-loop iteration outcome surfaced as 'ok' / 'degraded' /
+        # 'failing' so /health/full doesn't lie when a loop is silently
+        # erroring (the bug the brief explicitly called out).
+        loop_health: Dict[str, Any] = {}
+        try:
+            with _loop_health_lock:
+                snap = {k: dict(v) for k, v in _BACKGROUND_LOOP_HEALTH.items()}
+            for name, st in snap.items():
+                fails = int(st.get("consecutive_failures", 0) or 0)
+                last_ok = float(st.get("last_ok_ts", 0) or 0)
+                last_err = float(st.get("last_err_ts", 0) or 0)
+                if fails == 0:
+                    sub = "ok"
+                elif fails < 3:
+                    sub = "degraded"
+                else:
+                    sub = "failing"
+                    status = "degraded"
+                loop_health[name] = {
+                    "status": sub,
+                    "consecutive_failures": fails,
+                    "last_ok_age_sec": int(time.time() - last_ok) if last_ok else None,
+                    "last_err_age_sec": int(time.time() - last_err) if last_err else None,
+                    "last_err": st.get("last_err"),
+                }
+        except Exception:
+            logger.exception("health/full: loop-health roll-up failed")
+
         return {
             "ok": True,
             "status": status,
+            "scanner": scanner_status,
+            "last_scan": last_scan_ago,
+            "bots_active": bots_active,
             "checks": {
                 "database": {
                     "status": "ok" if db_ok else "error",
@@ -3648,25 +5794,36 @@ def health():
                 },
                 "kraken": {
                     "status": "ok" if kr else "error",
-                    "latency_ms": kraken_latency
+                    "latency_ms": kraken_latency,
+                    "connected": kr,
                 },
                 "alpaca": {
-                    "status": "ok" if ALPACA_PAPER_READY or ALPACA_LIVE_READY else "error",
-                    "latency_ms": alpaca_latency
+                    "status": "ok" if ALPACA_PAPER_READY or ALPACA_LIVE_READY else ("not_configured" if not _ALPACA_KEYS_PRESENT else "error"),
+                    "latency_ms": alpaca_latency,
+                    "paper_ready": ALPACA_PAPER_READY,
+                    "live_ready": ALPACA_LIVE_READY,
                 },
                 "disk_space": {
                     "status": "ok" if disk_free_gb > 1.0 else "warning",
                     "free_gb": disk_free_gb
                 }
             },
+            "threads": thread_health,
+            "thread_restarts": {k: v for k, v in _THREAD_RESTART_COUNTS.items() if v > 0},
+            "loops": loop_health,
             "uptime_seconds": uptime_sec,
-            "version": "2.0.0",
+            "version": "3.0.0",
             "time": ts,
+            "fear_greed": {"value": _FEAR_GREED_CACHE.get("value", 50), "label": _FEAR_GREED_CACHE.get("label", "Neutral")},
             "last_autopilot_heartbeat_ts": last_autopilot_heartbeat if last_autopilot_heartbeat else None,
+            "kraken_ready": kr,
+            "alpaca_paper_ready": ALPACA_PAPER_READY,
+            "alpaca_live_ready": ALPACA_LIVE_READY,
         }
     except Exception as e:
-        logger.exception("health handler error")
-        return {"ok": False, "status": "error", "error": str(e)[:200], "time": ts}
+        logger.exception("health/full handler error")
+        # Always return 200 so the upstream proxy never sees a 5xx from /health/full.
+        return {"ok": True, "status": "degraded", "error": str(e)[:200], "time": ts}
 
 
 @app.get("/api/debug/db_info")
@@ -3923,6 +6080,12 @@ def api_startup_status():
 @app.get("/api/health")
 def api_health():
     """Health check for deployment and monitoring. Expanded: bots, DB metrics, circuit breaker, data quality."""
+    _now = time.time()
+    with _globals_lock:
+        _cached = _HEALTH_CACHE.get("result")
+        _cached_ts = _HEALTH_CACHE.get("ts", 0.0)
+    if _cached is not None and (_now - _cached_ts) < _HEALTH_CACHE_TTL:
+        return _json(_cached)
     try:
         db_ok = True
         try:
@@ -3954,21 +6117,30 @@ def api_health():
         thread_health = {}
         for name, info in _background_threads.items():
             t = info.get("thread")
+            alive = t.is_alive() if t else False
+            status = "alive" if alive else ("completed" if name in _ONE_SHOT_THREADS else "dead")
             thread_health[name] = {
-                "alive": t.is_alive() if t else False,
+                "alive": alive,
+                "status": status,
                 "uptime_sec": int(time.time() - info.get("started_at", 0)),
             }
         expanded["thread_health"] = thread_health
         expanded["last_portfolio_ts"] = _last_portfolio_ts
         expanded["last_reco_short_ts"] = _last_reco_short_ts
         expanded["last_reco_long_ts"] = _last_reco_long_ts
+        expanded["kraken_last_candle_ts"] = _kraken_last_candle_ts
+        expanded["alpaca_last_candle_ts"] = _alpaca_last_candle_ts
         # LIVE-HARDENED: uptime and autopilot heartbeat for dashboard monitoring
         expanded["uptime_sec"] = int(time.time() - _APP_START_TIME) if _APP_START_TIME else 0
         try:
             expanded["last_autopilot_heartbeat_ts"] = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0) or None
         except Exception:
             expanded["last_autopilot_heartbeat_ts"] = None
-        return _json(expanded)
+        result = expanded
+        with _globals_lock:
+            _HEALTH_CACHE["result"] = result
+            _HEALTH_CACHE["ts"] = time.time()
+        return _json(result)
     except Exception as e:
         return _json({"ok": False, "status": "error", "error": str(e), "ts": now_ts()}, 503)
 
@@ -4178,6 +6350,22 @@ def api_websocket_stats():
     return api_stats()
 
 
+@app.post("/api/notifications/test")
+def api_notifications_test():
+    """Send a test Discord notification to verify webhook configuration."""
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return _json({"ok": False, "error": "DISCORD_WEBHOOK_URL not configured"}, 400)
+    try:
+        import requests as _req
+        resp = _req.post(webhook, json={"content": "✅ Eirin Bot: test notification (Discord webhook working)"}, timeout=5)
+        if resp.status_code in (200, 204):
+            return _json({"ok": True, "message": "Test notification sent"})
+        return _json({"ok": False, "error": f"Discord returned {resp.status_code}: {resp.text[:200]}"}, 502)
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
 @app.get("/api/safety_check")
 def api_safety_check():
     """Live-trading safety check for UI and automation. Includes kill_switch and allow_live_trading for checklist."""
@@ -4189,13 +6377,11 @@ def api_safety_check():
     any_live = _has_live_bots()
     live_context = LIVE_TRADING_ENABLED or any_live
     kill_switch = bool(get_setting("kill_switch", "0").strip().lower() in ("1", "true", "yes", "y", "on"))
-    allow_live_trading = bool(getattr(bm, "ALLOW_LIVE_TRADING", False) if bm else False)
-    if not bm:
-        try:
-            from bot_manager import ALLOW_LIVE_TRADING as _ALLOW
-            allow_live_trading = bool(_ALLOW)
-        except Exception:
-            pass
+    try:
+        from bot_manager import ALLOW_LIVE_TRADING as _ALLOW
+        allow_live_trading = bool(_ALLOW)
+    except Exception:
+        allow_live_trading = False
 
     if live_context and not api_auth_enabled:
         blocking.append("WORKER_API_TOKEN missing for live trading")
@@ -4281,11 +6467,20 @@ def api_mark_notification_read(notification_id: int):
 @app.get("/api/notifications/unread_count")
 def api_notifications_unread_count():
     """Get count of unread notifications."""
+    _now = time.time()
+    with _globals_lock:
+        _cached = _NOTIF_UNREAD_CACHE.get("result")
+        _cached_ts = _NOTIF_UNREAD_CACHE.get("ts", 0.0)
+    if _cached is not None and (_now - _cached_ts) < _NOTIF_UNREAD_CACHE_TTL:
+        return _json(_cached)
     try:
         from notification_manager import get_unread_count
-
         count = get_unread_count()
-        return _json({"ok": True, "unread_count": count})
+        result = {"ok": True, "unread_count": count}
+        with _globals_lock:
+            _NOTIF_UNREAD_CACHE["result"] = result
+            _NOTIF_UNREAD_CACHE["ts"] = _now
+        return _json(result)
     except Exception as e:
         logger.error(f"Unread count error: {type(e).__name__}: {e}")
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}", "unread_count": 0}, 500)
@@ -4304,7 +6499,7 @@ def api_alpaca_symbols():
         
         # Filter to tradeable and sort by common popularity
         popular_symbols = [
-            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK.B", "V", "JNJ",
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "JNJ",
             "WMT", "JPM", "MA", "PG", "UNH", "DIS", "HD", "PYPL", "BAC", "VZ",
             "ADBE", "NFLX", "CRM", "NKE", "CMCSA", "PFE", "T", "INTC", "CSCO", "ABT",
             "KO", "PEP", "MRK", "AVGO", "TMO", "COST", "ABBV", "ACN", "TXN", "NEE",
@@ -4342,11 +6537,19 @@ def api_prices(symbols: str = "", market_type: str = "all"):
     out: Dict[str, Optional[float]] = {}
     changes: Dict[str, Optional[float]] = {}
     volumes: Dict[str, Optional[float]] = {}
-    
+
     req = [s.strip() for s in (symbols or "").split(",") if s.strip()]
     if not req:
         return _json({"ok": True, "prices": out, "changes": changes, "volumes": volumes})
-    
+
+    # Fast path: return cached result if still fresh (avoids 10–14 s Alpaca snapshot latency)
+    _prices_cache_key = f"{market_type}:{','.join(sorted(req))}"
+    _now = time.time()
+    with _globals_lock:
+        _cached_prices = _PRICES_CACHE.get(_prices_cache_key)
+    if _cached_prices and (_now - _cached_prices["ts"]) < _PRICES_CACHE_TTL:
+        return _json(_cached_prices["result"])
+
     _prices_deadline = time.time() + 5.0
     
     # Separate crypto and stocks
@@ -4449,7 +6652,10 @@ def api_prices(symbols: str = "", market_type: str = "all"):
                 for sym in stock_symbols:
                     out[sym] = None
     
-    return _json({"ok": True, "prices": out, "changes": changes, "volumes": volumes})
+    _prices_result = {"ok": True, "prices": out, "changes": changes, "volumes": volumes}
+    with _globals_lock:
+        _PRICES_CACHE[_prices_cache_key] = {"ts": time.time(), "result": _prices_result}
+    return _json(_prices_result)
 
 
 @app.get("/api/market/ticker")
@@ -4686,38 +6892,49 @@ def api_market_overview(quote: str = "USD", limit: int = 50, market_type: str = 
         return _json({"ok": False, "error": "No market data available"}, 503)
 
     try:
-        # Fetch tickers for top assets
-        tickers = kc.ex.fetch_tickers()
-        
+        tickers = _tickers_batch_cached(ttl_sec=30)
+        if not tickers:
+            try:
+                tickers = kc.ex.fetch_tickers()
+            except Exception as _ft_err:
+                if "safeMarket" in str(_ft_err) or "disambiguate" in str(_ft_err):
+                    logger.warning("market_overview: Kraken fetch_tickers safeMarket error, using cached batch: %s", _ft_err)
+                    tickers = {}
+                else:
+                    raise
+
         parsed = []
         q_upper = quote.upper()
-        
-        for sym, t in tickers.items():
+
+        for sym, t in (tickers or {}).items():
+            if not isinstance(t, dict):
+                continue
             if f"/{q_upper}" not in sym:
                 continue
-            
-            # Simple volume filter to remove garbage
-            vol = float(t.get("quoteVolume") or 0)
-            if vol < 50000: # Min $50k volume
+
+            try:
+                vol = float(t.get("quoteVolume") or 0)
+                if vol < 50000:
+                    continue
+                change = float(t.get("percentage") or 0)
+                close = float(t.get("last") or t.get("close") or 0)
+            except (TypeError, ValueError):
                 continue
-                
-            change = float(t.get("percentage") or 0)
-            close = float(t.get("last") or 0)
-            
+
             parsed.append({
                 "symbol": sym,
                 "last": close,
                 "percentage": change,
                 "quoteVolume": vol
             })
-            
+
         parsed.sort(key=lambda x: x["percentage"], reverse=True)
         gainers = parsed[:6]
         losers = sorted(parsed, key=lambda x: x["percentage"])[:6]
-        
+
         parsed.sort(key=lambda x: x["quoteVolume"], reverse=True)
         hot = parsed[:6]
-        
+
         return _json({
             "ok": True,
             "gainers": gainers,
@@ -4727,15 +6944,49 @@ def api_market_overview(quote: str = "USD", limit: int = 50, market_type: str = 
         })
 
     except Exception as e:
+        logger.error("market_overview crypto failed: %s", e)
         return _json({"ok": False, "error": str(e)}, 500)
 
 
 @app.get("/api/portfolio")
 def api_portfolio():
+    _now = time.time()
+    with _globals_lock:
+        _cached = _PORTFOLIO_CACHE.get("result")
+        _cached_ts = _PORTFOLIO_CACHE.get("ts", 0.0)
+    if _cached is not None and (_now - _cached_ts) < _PORTFOLIO_CACHE_TTL:
+        return _json(_cached)
     snap = _portfolio_snapshot()
     with _globals_lock:
         history = list(PORT_HISTORY[-500:])
-    return _json({"ok": True, "portfolio": snap, "history": history})
+    result = {"ok": True, "portfolio": snap, "history": history}
+    with _globals_lock:
+        _PORTFOLIO_CACHE["result"] = result
+        _PORTFOLIO_CACHE["ts"] = _now
+    return _json(result)
+
+
+@app.get("/api/dashboard/pnl-history")
+def api_dashboard_pnl_history(days: int = 7):
+    """Daily realized PnL for the last N days."""
+    try:
+        import sqlite3 as _sq
+        db_path = os.environ.get("DB_PATH", "botdb.sqlite3")
+        con = _sq.connect(db_path)
+        con.row_factory = _sq.Row
+        _days = max(1, min(90, int(days)))
+        cutoff = int(time.time()) - _days * 86400
+        rows = con.execute(
+            """SELECT date(closed_at, 'unixepoch') as day, SUM(realized_pnl_quote) as pnl, COUNT(*) as deals
+               FROM deals WHERE closed_at >= ? AND closed_at > 0 AND realized_pnl_quote IS NOT NULL
+               GROUP BY day ORDER BY day""",
+            (cutoff,),
+        ).fetchall()
+        con.close()
+        result = [{"date": r["day"], "pnl": round(float(r["pnl"] or 0), 2), "deals": int(r["deals"] or 0)} for r in rows]
+        return _json({"ok": True, "days": result})
+    except Exception as e:
+        return _json({"ok": True, "days": [], "error": str(e)[:100]})
 
 
 @app.get("/api/portfolio/performance")
@@ -4948,6 +7199,39 @@ def api_bot_metrics(bot_id: int, limit: int = 500):
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}", "perf": {}, "drawdown_series": []}, 500)
 
 
+@app.get("/api/bots/{bot_id}/performance")
+def api_bot_performance(bot_id: int):
+    """Comprehensive bot performance: total P&L, win rate, avg duration, deal count."""
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    try:
+        perf = bot_performance_stats(int(bot_id))
+        stats = bot_deal_stats(int(bot_id))
+        snap = None
+        if bm:
+            try:
+                snap = bm.snapshot(int(bot_id))
+            except Exception:
+                pass
+        unrealized = float(snap.get("unrealized_pnl", 0)) if snap else 0
+        realized = float(stats.get("realized_total", 0)) if stats else 0
+        return _json({
+            "ok": True,
+            "total_pnl": round(realized + unrealized, 2),
+            "realized_pnl": round(realized, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "deals_closed": perf.get("total", 0),
+            "wins": perf.get("wins", 0),
+            "losses": perf.get("losses", 0),
+            "win_rate": round(perf.get("win_rate", 0), 1),
+            "avg_duration_sec": perf.get("avg_duration_sec", 0),
+            "avg_profit_pct": round(perf.get("avg_profit_pct", 0), 2),
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
 @app.get("/api/pause")
 def api_pause_state():
     return _json({"ok": True, "paused": bool(_pause_state())})
@@ -5000,6 +7284,24 @@ async def api_kill_set(request: Request):
     return _json({"ok": True, "kill_switch": bool(_kill_switch_state())})
 
 
+def _fetch_status_last_price(b: Dict[str, Any]) -> Any:
+    """Best-effort last price for status row; may call exchange APIs."""
+    symbol = (b.get("symbol") or "").strip()
+    if not symbol:
+        return None
+    try:
+        market_type = classify_symbol(symbol)
+        if market_type == "stock":
+            client = alpaca_live if alpaca_live else alpaca_paper
+            if client:
+                ticker = client.get_ticker(symbol)
+                return ticker.get("last") if ticker else None
+        ticker = _ticker_cached(symbol, ttl_sec=60) or {}
+        return ticker.get("last") or ticker.get("close")
+    except Exception:
+        return None
+
+
 @app.get("/api/bots/{bot_id}/status")
 def api_bot_status(bot_id: int):
     b = get_bot(int(bot_id))
@@ -5044,28 +7346,21 @@ def api_bot_status(bot_id: int):
     if not snap.get("running") and not snap.get("last_event"):
         snap["last_event"] = "Stopped."
     
-    # Get last price if not in snapshot - use correct provider based on symbol type
+    # Get last price if not in snapshot (bounded wait so one slow exchange call cannot stall the worker)
     if snap.get("last_price") is None:
-        symbol = b.get("symbol", "")
-        lp = None
-        try:
-            market_type = classify_symbol(symbol)
-            if market_type == "stock":
-                # Stock: use Alpaca
-                client = alpaca_live if alpaca_live else alpaca_paper
-                if client:
-                    try:
-                        ticker = client.get_ticker(symbol)
-                        lp = ticker.get("last") if ticker else None
-                    except Exception:
-                        pass
-            else:
-                # Crypto: use Kraken
-                lp = _safe_last_price(symbol)
-        except Exception:
-            pass
-        if lp is not None:
-            snap["last_price"] = lp
+        holder: List[Any] = [None]
+
+        def _run_lp():
+            try:
+                holder[0] = _fetch_status_last_price(b)
+            except Exception:
+                holder[0] = None
+
+        th = threading.Thread(target=_run_lp, daemon=True)
+        th.start()
+        th.join(timeout=6.0)
+        if holder[0] is not None:
+            snap["last_price"] = holder[0]
 
     try:
         regime = latest_regime(int(bot_id))
@@ -5268,6 +7563,15 @@ def api_recommendations_scan_status():
 def api_recommendations_scan_progress():
     """Rich progress data for the live status panel: per-horizon state, current symbol, errors, history, ETA."""
     now_t = time.time()
+    # Skip cache while any horizon is actively scanning (progress updates are live)
+    _any_active = any(_HORIZON_SCANNING.get(h) for h in ("short", "medium", "long"))
+    if not _any_active:
+        with _globals_lock:
+            _sp_cached = _SCAN_PROGRESS_CACHE.get("result")
+            _sp_ts = _SCAN_PROGRESS_CACHE.get("ts", 0.0)
+        if _sp_cached is not None and (now_t - _sp_ts) < _SCAN_PROGRESS_CACHE_TTL:
+            return _json(_sp_cached)
+    _SCAN_STALE_THRESHOLD = 25 * 60  # 25 minutes: force-reset a stuck scanning=True
     with _globals_lock:
         prog = {k: v for k, v in _SCAN_PROGRESS.items()}
         horizons = {}
@@ -5275,6 +7579,21 @@ def api_recommendations_scan_progress():
         for h in ("short", "medium", "long"):
             st = (_RECO_STATE.get(h) or {}).copy()
             scanning = bool(st.get("scanning"))
+            # Watchdog: if scanning=True but started more than 25 min ago, force-reset the lock
+            if scanning:
+                started_at = st.get("started_at") or 0
+                if started_at and (now_t - started_at) > _SCAN_STALE_THRESHOLD:
+                    logger.warning(
+                        "[SCAN-WATCHDOG] %s scan stuck scanning=True for %.0f min — force-resetting",
+                        h, (now_t - started_at) / 60,
+                    )
+                    _RECO_STATE[h] = {
+                        **st,
+                        "scanning": False,
+                        "error": f"Watchdog reset after {int((now_t - started_at) / 60)}min stall",
+                        "last_run_ts": int(now_t),
+                    }
+                    scanning = False
             if scanning:
                 any_scanning = True
             last_ts = st.get("last_run_ts", 0)
@@ -5287,6 +7606,8 @@ def api_recommendations_scan_progress():
                 "last_run_ts": last_ts,
                 "last_run_ago_sec": int(now_t - last_ts) if last_ts else None,
             }
+    with _RECO_SCAN_ACTIVE_LOCK:
+        scan_running = _RECO_SCAN_ACTIVE or any_scanning
     eta_sec = None
     if any_scanning:
         cur_h = prog.get("current_horizon", "")
@@ -5297,9 +7618,21 @@ def api_recommendations_scan_progress():
         if done > 0 and total > done and elapsed > 0:
             rate = done / elapsed
             eta_sec = int((total - done) / rate)
-    return _json({
+    universe_size = {"equity": 0, "crypto": 0, "total": 0}
+    try:
+        from universe_builder import get_universe_stats, get_universe_age_seconds
+        _ust = get_universe_stats()
+        universe_size["equity"] = (_ust.get("equity") or {}).get("total", 0)
+        universe_size["crypto"] = (_ust.get("crypto") or {}).get("total", 0)
+        universe_size["total"] = universe_size["equity"] + universe_size["crypto"]
+        universe_size["age_sec"] = get_universe_age_seconds()
+    except Exception:
+        pass
+
+    _sp_result = {
         "ok": True,
         "any_scanning": any_scanning,
+        "scan_running": scan_running,
         "current_symbol": prog.get("current_symbol", ""),
         "current_horizon": prog.get("current_horizon", ""),
         "buy_signals_found": prog.get("buy_signals_found", 0),
@@ -5308,7 +7641,152 @@ def api_recommendations_scan_progress():
         "recent_errors": (prog.get("recent_errors") or [])[-5:],
         "scan_history": (prog.get("scan_history") or [])[-5:],
         "server_ts": int(now_t),
-    })
+        "universe_size": universe_size,
+    }
+    if not _any_active:
+        with _globals_lock:
+            _SCAN_PROGRESS_CACHE["result"] = _sp_result
+            _SCAN_PROGRESS_CACHE["ts"] = now_t
+    return _json(_sp_result)
+
+
+@app.get("/api/explore/scan_status")
+def api_explore_scan_status():
+    """Per-horizon scan progress for Explore UI (alias-style payload; see also /api/recommendations/scan_progress).
+
+    progress_pct semantics:
+      - status == "scanning"      → live percent (scanned/total * 100), 0 if total unknown
+      - status == "idle" w/ run   → 100 (the last scan completed; bar should read "done", not stuck)
+      - status == "idle" no run   → 0   (never run; bar should read empty)
+
+    This keeps the bar in lockstep with the frontend's idle/scanning/never-run buckets even
+    when scanned/total were never cleared back to 0 after the previous scan finished.
+    """
+    try:
+        from explore_composite_scorer import HORIZON_CONFIGS
+    except Exception:
+        HORIZON_CONFIGS = {}
+    now_t = time.time()
+    now_i = int(now_t)
+    with _globals_lock:
+        prog = dict(_SCAN_PROGRESS)
+        body: Dict[str, Any] = {"ok": True}
+        for h in ("short", "medium", "long"):
+            st = (_RECO_STATE.get(h) or {}).copy()
+            scanning = bool(st.get("scanning"))
+            last_ts = int(st.get("last_run_ts") or 0)
+            scanned = int(st.get("scanned") or 0)
+            total = int(st.get("total") or 0)
+            interval_sec = int(HORIZON_CONFIGS.get(h, {}).get("scan_interval_minutes", 60)) * 60
+            if scanning:
+                pct = int(min(100, scanned * 100 / max(1, total))) if total else 0
+            elif last_ts > 0:
+                pct = 100
+            else:
+                pct = 0
+            cur_sym = ""
+            if scanning and str(prog.get("current_horizon") or "") == h:
+                cur_sym = str(prog.get("current_symbol") or "")
+            eta_sec = None
+            if scanning and scanned > 0 and total > scanned:
+                elapsed = max(0.001, now_t - float(prog.get("scan_start_ts", now_t)))
+                rate = scanned / elapsed
+                if rate > 0:
+                    eta_sec = int((total - scanned) / rate)
+            entry: Dict[str, Any] = {
+                "status": "scanning" if scanning else "idle",
+                "current_symbol": cur_sym,
+                "progress_pct": pct,
+                "batch_current": 0,
+                "batch_total": 0,
+                "last_completed": last_ts,
+                "eta_seconds": eta_sec,
+            }
+            if not scanning and last_ts > 0:
+                entry["next_run_seconds"] = max(0, last_ts + interval_sec - now_i)
+            elif not scanning:
+                entry["next_run_seconds"] = None
+            body[h] = entry
+        return _json(body)
+
+
+@app.get("/api/market/regime")
+def api_market_regime():
+    """Latest persisted regime snapshots for key symbols."""
+    want = ["BTC/USD", "ETH/USD", "SPY"]
+    rows = get_latest_regime_for_symbols(want + ["XBT/USD"])
+    out: Dict[str, Any] = {}
+    for label, keys in (("BTC/USD", ("BTC/USD", "XBT/USD")), ("ETH/USD", ("ETH/USD",)), ("SPY", ("SPY",))):
+        picked = None
+        for k in keys:
+            if k in rows and rows[k]:
+                picked = rows[k]
+                break
+        if picked:
+            out[label] = picked
+    return _json({"ok": True, "symbols": out, "timestamp": now_ts()})
+
+
+@app.get("/api/explore/signal_accuracy")
+def api_explore_signal_accuracy():
+    return _json({"ok": True, "baselines": list_signal_accuracy_baselines()})
+
+
+@app.get("/api/portfolio/equity_curve")
+def api_portfolio_equity_curve(days: int = 30):
+    d = max(1, min(int(days), 730))
+    return _json({"ok": True, "days": d, "points": list_portfolio_equity_curve(d)})
+
+
+@app.get("/api/deals")
+def api_deals_list(status: Optional[str] = None, limit: int = 50):
+    """Cross-bot deals for dashboards; includes realized_pnl_pct when present."""
+    lim = max(1, min(int(limit), 500))
+    st = (status or "").strip().upper() or None
+    if st and st not in ("OPEN", "CLOSED"):
+        st = None
+    deals = list_all_deals(state=st, limit=lim)
+    return _json({"ok": True, "deals": deals, "count": len(deals)})
+
+
+@app.get("/api/universe/stats")
+def api_universe_stats():
+    """Return universe builder statistics."""
+    try:
+        from universe_builder import get_universe_stats, get_universe_age_seconds, get_equity_universe, get_crypto_universe
+        stats = get_universe_stats()
+        ages = get_universe_age_seconds()
+        eq = get_equity_universe()
+        cr = get_crypto_universe()
+        return _json({
+            "ok": True,
+            "equity_count": len(eq),
+            "crypto_count": len(cr),
+            "total": len(eq) + len(cr),
+            "stats": stats,
+            "age_seconds": ages,
+            "equity_sample": eq[:20],
+            "crypto_sample": cr[:20],
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)})
+
+
+@app.post("/api/universe/rebuild")
+def api_universe_rebuild():
+    """Force rebuild the scanning universe."""
+    try:
+        from universe_builder import get_full_universe, get_universe_stats
+        equities, crypto = get_full_universe(force_rebuild=True)
+        return _json({
+            "ok": True,
+            "equity_count": len(equities),
+            "crypto_count": len(crypto),
+            "total": len(equities) + len(crypto),
+            "stats": get_universe_stats(),
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)})
 
 
 @app.get("/api/recommendations/diagnose")
@@ -5469,6 +7947,1160 @@ def _get_scanner_fields_for_item(symbol: str, market_type: str, metrics: Dict[st
     return defaults
 
 
+_RECO_RESULT_CACHE: Dict[str, Tuple[float, Any]] = {}
+_RECO_RESULT_CACHE_TTL = 60  # 60 seconds — invalidated on new scan
+
+_EXPLORE_FEED_CACHE: Dict[str, Tuple[float, Any]] = {}
+_EXPLORE_FEED_CACHE_TTL = 2400  # 40-minute TTL — covers full 30-min scan interval with margin
+
+
+@app.get("/api/explore/feed")
+def api_explore_feed(
+    horizon: str = "short",
+    market_type: str = "all",
+    signal: str = "all",
+    limit: int = 80,
+    show_already_active: int = 0,
+):
+    """
+    Explore tab: read-only from explore_signals (buy/watch).
+
+    When EXPLORE_SMART_RANK is on (default), fetches a wider candidate set, re-ranks by
+    conviction + recency + 24h action + 90d backtest quality, and diversifies strategies.
+    """
+    _h = str(horizon).lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
+    lim = max(1, min(int(limit), 200))
+
+    _ef_cache_key = f"{h}|{market_type}|{signal}|{show_already_active}"
+    _ef_cached = _EXPLORE_FEED_CACHE.get(_ef_cache_key)
+    if _ef_cached:
+        _ef_ts, _ef_result = _ef_cached
+        if (time.time() - _ef_ts) < _EXPLORE_FEED_CACHE_TTL:
+            _cached_copy = dict(_ef_result)
+            _cached_copy["items"] = _cached_copy.get("items", [])[:lim]
+            _cached_copy["count"] = len(_cached_copy["items"])
+            _cached_copy.setdefault("data_source", "live")
+            # Refresh the scan timestamps from live state so the
+            # freshness badge ("Screener scan (X): Nm ago") stays in lockstep with
+            # the /api/explore/scan_status badge — both are sourced from _RECO_STATE.
+            _now_i_live = int(time.time())
+            with _globals_lock:
+                _short_st_live = (_RECO_STATE.get("short") or {}).copy()
+                _med_st_live = (_RECO_STATE.get("medium") or {}).copy()
+                _long_st_live = (_RECO_STATE.get("long") or {}).copy()
+            _live_last_scan_by_horizon = {
+                "short": {
+                    "ts": _short_st_live.get("last_run_ts"),
+                    "age_sec": (_now_i_live - int(_short_st_live.get("last_run_ts") or 0)) if _short_st_live.get("last_run_ts") else None,
+                },
+                "medium": {
+                    "ts": _med_st_live.get("last_run_ts"),
+                    "age_sec": (_now_i_live - int(_med_st_live.get("last_run_ts") or 0)) if _med_st_live.get("last_run_ts") else None,
+                },
+                "long": {
+                    "ts": _long_st_live.get("last_run_ts"),
+                    "age_sec": (_now_i_live - int(_long_st_live.get("last_run_ts") or 0)) if _long_st_live.get("last_run_ts") else None,
+                },
+            }
+            _cached_copy["last_scan_by_horizon"] = _live_last_scan_by_horizon
+            _hor_live = _live_last_scan_by_horizon.get(h) or {}
+            _cached_copy["last_scan_ts"] = _hor_live.get("ts")
+            _cached_copy["scan_age_sec"] = _hor_live.get("age_sec")
+            return _json(_cached_copy)
+
+    sig_f = str(signal or "all").lower().strip()
+    if sig_f == "buy":
+        statuses = ["buy"]
+    elif sig_f == "watch_only":
+        statuses = ["watch"]
+    elif sig_f in ("buy_watch", "watch"):
+        # UI historically used value="watch" for the label "Buy + Watch" — that wrongly fetched watch-only rows.
+        # buy_watch = both; watch kept for backward-compatible API clients that meant "both".
+        statuses = ["buy", "watch"]
+    else:
+        statuses = ["buy", "watch"]
+
+    from explore_signals import STRATEGY_LABELS
+
+    bt_row = get_latest_explore_backtest(h)
+    bt_90: Dict[str, Any] = {}
+    bt_60: Dict[str, Any] = {}
+    bt_30: Dict[str, Any] = {}
+    if bt_row and isinstance(bt_row.get("results"), dict):
+        _bt_windows = bt_row["results"].get("windows") or {}
+        bt_90 = _bt_windows.get("90d") or {}
+        bt_60 = _bt_windows.get("60d") or {}
+        bt_30 = _bt_windows.get("30d") or {}
+
+    fetch_mult = max(2, min(12, int(os.getenv("EXPLORE_FEED_FETCH_MULT", "6"))))
+    fetch_cap = min(500, max(lim * fetch_mult, lim + 80))
+    rows = list_explore_feed(h, market_type=market_type, statuses=statuses, limit=fetch_cap)
+    feed_data_source = "live"
+    if not rows:
+        try:
+            rows = _reco_rows_as_explore_feed_rows(h, market_type, statuses, fetch_cap)
+            if rows:
+                feed_data_source = "cached"
+        except Exception as _exfb:
+            logger.debug("explore feed fallback from recommendations: %s", _exfb)
+            rows = []
+
+    now_i = int(time.time())
+    use_smart = os.getenv("EXPLORE_SMART_RANK", "1").strip().lower() not in ("0", "false", "no", "off")
+    pick_scores: Dict[str, float] = {}
+    live_perf: Dict[str, Any] = {}
+    if use_smart and rows and os.getenv("EXPLORE_LIVE_STRAT_RANK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        try:
+            live_perf = _get_cached_strategy_win_rates(h, lookback_days=90)
+        except Exception:
+            live_perf = {}
+    if use_smart and rows:
+        rows, pick_scores = _explore_apply_smart_rank(rows, bt_90, lim, now_i, live_perf=live_perf or None)
+    else:
+        rows = rows[:lim]
+        pick_scores = {}
+
+    active_symbols, active_reason = _active_symbol_set()
+    with _globals_lock:
+        short_state = (_RECO_STATE.get("short") or {}).copy()
+        medium_state = (_RECO_STATE.get("medium") or {}).copy()
+        long_state = (_RECO_STATE.get("long") or {}).copy()
+    last_scan_by_horizon = {
+        "short": {"ts": short_state.get("last_run_ts"), "age_sec": now_i - short_state.get("last_run_ts", 0) if short_state.get("last_run_ts") else None},
+        "medium": {"ts": medium_state.get("last_run_ts"), "age_sec": now_i - medium_state.get("last_run_ts", 0) if medium_state.get("last_run_ts") else None},
+        "long": {"ts": long_state.get("last_run_ts"), "age_sec": now_i - long_state.get("last_run_ts", 0) if long_state.get("last_run_ts") else None},
+    }
+
+    # Composite scorer integration: enrich each signal with multi-layer analysis
+    try:
+        from explore_composite_scorer import (
+            strategy_quality_gate,
+            macro_environment_score,
+            assign_grade,
+            fix_200ma_display,
+            filter_correlated_signals,
+            apply_safety_filters,
+            generate_composite_summary,
+            technical_score as compute_technical_score,
+            buy_threshold_from_fear_greed,
+            compute_regime_adjusted_threshold,
+            regime_strategy_bonus,
+            SECTOR_MAP,
+            BEAR_STRATEGY_IDS,
+            position_size_pct_for_grade,
+        )
+        _composite_available = True
+    except Exception:
+        _composite_available = False
+
+    _fg_val = int(_FEAR_GREED_CACHE.get("value") or 50)
+    _btc_ctx_feed = _btc_context()
+
+    try:
+        _live_closed_deals = count_closed_deals()
+    except Exception:
+        _live_closed_deals = 0
+    # Weighted win-rate: recent 30d matters most (50%), 60d secondary (30%), 90d base (20%)
+    # A strategy qualifies as "active" only if BOTH conditions hold:
+    #   (a) 90d average return ≥ 0  (no money-losing strategies, even if recent WR is high), AND
+    #   (b) weighted_win_rate ≥ 38%  OR  30d win_rate ≥ 50%  (passes a quality bar).
+    # This keeps the backend "active" flag in sync with the UI verdict — a strategy with a
+    # negative 90d avg return is "⛔ DO NOT USE" in the backtest table, so it must not be
+    # marked active here either.
+    _active_strategies = 0
+    _total_strategies = 0
+    _pending_strategies = 0
+    _strategy_health: List[Dict[str, Any]] = []
+    _all_strat_keys = set(bt_90) | set(bt_60) | set(bt_30)
+    # Bug 11: minimum closed-trade count required to consider a strategy mature.
+    # Below this we mark the strategy as "pending" (collecting data) instead of
+    # "inactive" so new dry-run setups don't look broken to users.
+    _PENDING_TRADES_THRESHOLD = 10
+    for _sk in sorted(_all_strat_keys):
+        _sv90 = bt_90.get(_sk) or {}
+        _sv60 = bt_60.get(_sk) or {}
+        _sv30 = bt_30.get(_sk) or {}
+        if not any(isinstance(x, dict) for x in (_sv90, _sv60, _sv30)):
+            continue
+        _total_strategies += 1
+        _wr90 = float(_sv90.get("win_rate") or 0)
+        _wr60 = float(_sv60.get("win_rate") or 0)
+        _wr30 = float(_sv30.get("win_rate") or 0)
+        _ar90 = float(_sv90.get("avg_return") or 0)
+        _trades_90 = int(_sv90.get("trades") or _sv90.get("total_trades") or _sv90.get("count") or 0)
+        _trades_30 = int(_sv30.get("trades") or _sv30.get("total_trades") or _sv30.get("count") or 0)
+        _w_wr = _wr30 * 0.5 + _wr60 * 0.3 + _wr90 * 0.2
+        _passes_wr = (_w_wr >= 38) or (_wr30 >= 50)
+        _active = (_ar90 >= 0) and _passes_wr
+        # Bug 11: a strategy is *pending* (not inactive) when there isn't enough
+        # closed-trade history yet to judge it. Treat synthetic backtest data
+        # as legitimate pre-warm: trades_90 reflects backtest sample size.
+        _pending = (not _active) and (_trades_90 < _PENDING_TRADES_THRESHOLD) and (_live_closed_deals < _PENDING_TRADES_THRESHOLD)
+        if _active:
+            _active_strategies += 1
+        if _pending:
+            _pending_strategies += 1
+        _lab = STRATEGY_LABELS.get(_sk, _sk.replace("_", " ").title())
+        if _active:
+            _status = "active"
+            _st_reason = "Active: 90d avg return ≥ 0% and (weighted WR ≥ 38% or 30d WR ≥ 50%)."
+        elif _pending:
+            _status = "pending"
+            _needed = max(0, _PENDING_TRADES_THRESHOLD - max(_trades_90, _live_closed_deals))
+            _st_reason = (
+                f"Pending: collecting closed-trade data ({_trades_90} backtest trades, "
+                f"{_live_closed_deals} live closed deals). Needs {_needed} more to qualify."
+            )
+        elif _ar90 < 0:
+            _status = "inactive"
+            _st_reason = (
+                f"Inactive: negative 90d average return ({_ar90:.2f}%). "
+                "Never marked active even if recent WR is high — protects against bleeding strategies."
+            )
+        elif not _passes_wr:
+            _status = "inactive"
+            _st_reason = (
+                f"Inactive: weighted win rate {_w_wr:.0f}% (need ≥38%) and 30d WR {_wr30:.0f}% (need ≥50%)."
+            )
+        else:
+            _status = "inactive"
+            _st_reason = "Inactive: does not meet Strategy Health thresholds."
+        _strategy_health.append(
+            {
+                "id": _sk,
+                "label": _lab,
+                "active": bool(_active),
+                "status": _status,
+                "pending_progress": {
+                    "trades_90d": _trades_90,
+                    "trades_30d": _trades_30,
+                    "live_closed_deals": _live_closed_deals,
+                    "threshold": _PENDING_TRADES_THRESHOLD,
+                },
+                "reason": _st_reason,
+                "weighted_win_rate": round(_w_wr, 1),
+                "win_rate_90d": round(_wr90, 1),
+                "win_rate_30d": round(_wr30, 1),
+                "avg_return_90d": round(_ar90, 2),
+            }
+        )
+
+    items = []
+    for r in rows:
+        sym = str(r.get("symbol") or "")
+        norm_sym = _normalize_symbol(sym)
+        already_active = norm_sym in active_symbols
+        if not show_already_active and already_active:
+            continue
+        sid = str(r.get("strategy") or "")
+        detail = _explore_row_detail_json(r)
+        pat_id = str(detail.get("strategy_id") or "").strip()
+        evs = detail.get("evaluate_signal") if isinstance(detail.get("evaluate_signal"), dict) else {}
+        ds = str(evs.get("detected_strategy") or "").strip()
+        pat_label = STRATEGY_LABELS.get(pat_id, pat_id) if pat_id else ""
+        strat_display = pat_label or ds or (STRATEGY_LABELS.get(sid, sid) if sid else "—")
+        if strat_display == "—" or not str(strat_display).strip():
+            strat_display = sid or "—"
+        pr = str(r.get("reason") or "").strip()
+        hr = str(evs.get("strategy_reason") or "").strip()
+        if pr and hr and hr not in pr and pr not in hr:
+            reason_out = f"{pr} · Scanner: {hr}"
+        elif pr:
+            reason_out = pr
+        else:
+            reason_out = hr
+        bt_info = _explore_bt_lookup(bt_90, detail, r)
+        wr90 = float(bt_info["win_rate"]) if bt_info and bt_info.get("win_rate") is not None else None
+        conv = float(r.get("conviction_score") or 0)
+        st = str(r.get("status") or "watch")
+        pick_sc = float(pick_scores.get(sym, conv)) if pick_scores else float(conv)
+
+        is_crypto_item = "/" in sym or str(r.get("market_type") or "").lower() == "crypto"
+        asset_type_str = "crypto" if is_crypto_item else "stock"
+
+        # Hard classification rule — "/" means crypto, always
+        _item_mt = "crypto" if "/" in sym else "stocks"
+        if market_type == "stocks" and _item_mt != "stocks":
+            continue
+        if market_type == "crypto" and _item_mt != "crypto":
+            continue
+
+        # --- Composite scoring overlay ---
+        composite_grade = ""
+        composite_score_val = None
+        composite_signal = st
+        composite_summary = ""
+        composite_rr = None
+        composite_rr_display = "—"
+        composite_rr_color = "gray"
+        macro_label = "neutral"
+        strategy_gate_warn = False
+        safety_flags_out = []
+        composite_reasons = []
+        composite_flags = []
+        pct_above_200_val = None
+        chg24 = None
+        try:
+            chg24 = float(r.get("change_24h")) if r.get("change_24h") is not None else None
+        except (TypeError, ValueError):
+            pass
+
+        # Sparkline: initialise before composite block so it's always defined
+        _sparkline: List[float] = []
+
+        # Populate sparkline from cached OHLCV regardless of composite availability
+        try:
+            _spark_candles: list = []
+            if is_crypto_item and "/" in sym:
+                _spark_sym = _resolve_symbol(sym)
+                _spark_candles = _ohlcv_cached(_spark_sym, "1d", 10, 1800)
+            else:
+                # Stock: scan writes key "{sym}|1d|500" to _RECO_OHLCV_CACHE; also check
+                # short-form key written by the fallback fetch below
+                _spark_key = f"{sym}|1d|500"
+                _spark_fb_key = f"{sym}|spark|1d"
+                with _globals_lock:
+                    _spark_cached = _RECO_OHLCV_CACHE.get(_spark_key) or _RECO_OHLCV_CACHE.get(_spark_fb_key)
+                if _spark_cached and _spark_cached.get("data"):
+                    _spark_candles = _spark_cached["data"]
+                elif alpaca_live or alpaca_paper:
+                    # Scan hasn't run yet — fetch directly from Alpaca and cache for 30 min
+                    try:
+                        _alpaca_cl = alpaca_live if alpaca_live else alpaca_paper
+                        _fetched = _alpaca_cl.get_ohlcv(sym, timeframe="1d", limit=10) or []
+                        if _fetched:
+                            _spark_candles = _fetched
+                            with _globals_lock:
+                                _RECO_OHLCV_CACHE[_spark_fb_key] = {"ts": time.time(), "data": _fetched}
+                    except Exception:
+                        pass
+            if _spark_candles:
+                _spark_closes = [float(c[4]) for c in _spark_candles if isinstance(c, (list, tuple)) and len(c) > 4]
+                if len(_spark_closes) >= 3:
+                    _sparkline = _spark_closes[-7:]
+        except Exception:
+            pass
+
+        if _composite_available and (bt_90 or bt_30):
+            try:
+                _strat_key = pat_id or sid or ""
+                # Use weighted backtest data for the quality gate:
+                # merge 30d/60d/90d win rates so the gate benefits from recent performance
+                _bt_for_gate = {}
+                for _btsrc in (bt_90, bt_60, bt_30):
+                    for _k, _v in (_btsrc or {}).items():
+                        if _k not in _bt_for_gate and isinstance(_v, dict):
+                            _bt_for_gate[_k] = _v
+                # Prefer 30d data if it has ≥10 signals (more recent)
+                if bt_30.get(_strat_key, {}).get("signals", 0) >= 10:
+                    _bt_for_gate[_strat_key] = bt_30[_strat_key]
+                elif bt_60.get(_strat_key, {}).get("signals", 0) >= 10:
+                    _bt_for_gate[_strat_key] = bt_60[_strat_key]
+                _gate = strategy_quality_gate(_strat_key, _bt_for_gate)
+                strategy_gate_warn = _gate.get("warn", False)
+
+                _btc_labels = _btc_ctx_feed.get("labels") or {}
+                _btc_regime = str(
+                    _btc_ctx_feed.get("regime") or _btc_ctx_feed.get("regime_label")
+                    or _btc_labels.get("1d") or _btc_labels.get("4h") or ""
+                ).upper()
+                _btc_dt = float(_btc_ctx_feed.get("downtrend_score") or _btc_ctx_feed.get("dt_score") or _btc_ctx_feed.get("btc_down") or 0)
+                _btc_hv_val = float(_btc_ctx_feed.get("hv") or _btc_ctx_feed.get("btc_hv") or 0)
+                _macro = macro_environment_score(_fg_val, _btc_regime, _btc_dt, _btc_hv_val, asset_type_str)
+                macro_label = _macro.get("macro_label", "neutral")
+                composite_flags = _macro.get("flags", [])
+
+                _item_price = float(r.get("price") or 0)
+                _safety = apply_safety_filters(sym, chg24, None, None, None, [], asset_type_str, current_price=_item_price)
+                safety_flags_out = _safety.get("flags", [])
+
+                if not is_crypto_item:
+                    _earnings_days = None
+                    try:
+                        _earnings_days = detail.get("earnings_days")
+                        if _earnings_days is None:
+                            from earnings_calendar import days_until_earnings
+                            _earnings_days = days_until_earnings(sym)
+                    except Exception:
+                        pass
+                    if _earnings_days is not None:
+                        try:
+                            _ed_int = int(_earnings_days)
+                            if 0 <= _ed_int <= 3:
+                                safety_flags_out.append(
+                                    f"⚠️ Earnings in {_ed_int} days — "
+                                    f"high volatility risk"
+                                )
+                            elif 4 <= _ed_int <= 7:
+                                safety_flags_out.append(
+                                    f"📅 Earnings in {_ed_int} days — "
+                                    f"potential catalyst"
+                                )
+                        except (TypeError, ValueError):
+                            pass
+
+                # Try to get OHLCV data for technical scoring & R:R
+                _candles_1d = []
+                try:
+                    if is_crypto_item and "/" in sym:
+                        _resolved_sym = _resolve_symbol(sym)
+                        _candles_1d = _ohlcv_cached(_resolved_sym, "1d", 200, 1800)
+                    elif not is_crypto_item:
+                        _cached_key = f"{sym}|1d|500"
+                        with _globals_lock:
+                            _ck = _RECO_OHLCV_CACHE.get(_cached_key)
+                        if _ck and _ck.get("data"):
+                            _candles_1d = _ck["data"]
+                        if not _candles_1d:
+                            try:
+                                import yfinance as yf
+                                def _yf_candles_feed(s: str, interval: str, period: str) -> list:
+                                    try:
+                                        t = yf.Ticker(s)
+                                        hist = t.history(period=period, interval=interval)
+                                        if hist is None or hist.empty:
+                                            return []
+                                        out = []
+                                        for ts_idx, row in hist.iterrows():
+                                            try:
+                                                out.append([int(ts_idx.timestamp()), float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"]), float(row["Volume"])])
+                                            except Exception:
+                                                continue
+                                        return out
+                                    except Exception:
+                                        return []
+                                _candles_1d = _yf_candles_feed(sym, "1d", "1y") if "/" not in sym else []
+                            except Exception:
+                                pass
+                except Exception as _ohlcv_err:
+                    logger.debug("Feed OHLCV fetch failed for %s: %s", sym, _ohlcv_err)
+                _closes = [float(c[4]) for c in _candles_1d if isinstance(c, (list, tuple)) and len(c) > 4]
+                _highs = [float(c[2]) for c in _candles_1d if isinstance(c, (list, tuple)) and len(c) > 2]
+                _lows = [float(c[3]) for c in _candles_1d if isinstance(c, (list, tuple)) and len(c) > 3]
+                _vols = [float(c[5]) for c in _candles_1d if isinstance(c, (list, tuple)) and len(c) > 5]
+                # Populate 7-day sparkline from daily closes
+                if len(_closes) >= 3:
+                    _sparkline = _closes[-7:]
+
+                _tech = {"score": conv, "risk_reward_ratio": None, "trend_direction": "neutral",
+                         "rsi": None, "volume_ratio": None, "pct_above_200": None}
+                if len(_closes) >= 50:
+                    try:
+                        _tech = compute_technical_score(_closes, _highs, _lows, _vols, _strat_key)
+                        pct_above_200_val = _tech.get("pct_above_200")
+                        _rr = _tech.get("risk_reward_ratio")
+                        if _rr is not None:
+                            composite_rr = _rr
+                            composite_rr_display = f"{_rr:.1f}:1"
+                            composite_rr_color = "green" if _rr >= 2 else ("yellow" if _rr >= 1.5 else "red")
+                    except Exception:
+                        pass
+
+                composite_grade = assign_grade(conv, _gate, _macro, _tech, _safety, strategy_id=_strat_key)
+
+                composite_score_val = conv
+                if _gate["max_score_cap"] < conv and _gate["max_score_cap"] > 0:
+                    composite_score_val = _gate["max_score_cap"]
+                _penalty = _safety.get("score_penalty", 0)
+                if _penalty > 0:
+                    composite_score_val = max(0, composite_score_val - _penalty)
+                composite_score_val = max(0, min(100, composite_score_val + _macro.get("score_adjustment", 0)))
+                # Regime-aware per-strategy bonus — replaces the flat -4 RANGE penalty
+                try:
+                    _regime_bonus = regime_strategy_bonus(_btc_regime, _strat_key)
+                    if _regime_bonus != 0:
+                        composite_score_val = max(0, min(100, float(composite_score_val) + _regime_bonus))
+                except Exception:
+                    pass
+                _tc_bear = _btc_regime in ("BEAR", "STRONG_BEAR", "DOWNTREND")
+                if _strat_key == "trend_continuation" and _fg_val > 40 and not _tc_bear:
+                    composite_score_val = min(100.0, float(composite_score_val) + 10.0)
+
+                _buy_cut = compute_regime_adjusted_threshold(_fg_val, asset_type_str, _btc_regime)
+                if _strat_key == "trend_continuation" and _fg_val > 40:
+                    _buy_cut = max(55, _buy_cut - 5)
+                if composite_score_val < _buy_cut and st == "buy":
+                    composite_signal = "watch"
+                if not _gate["passed"] and st == "buy":
+                    composite_signal = "watch"
+                _bear_exempt_strategies = {
+                    "relative_strength_bear", "oversold_extreme_fear",
+                    "volume_capitulation", "oversold_bounce",
+                }
+                _macro_block = _macro.get("block_buy") and _strat_key not in _bear_exempt_strategies
+                if _macro_block and st == "buy":
+                    composite_signal = "wait"
+                if _safety.get("block_buy") and st == "buy":
+                    composite_signal = "wait"
+                _rrg = _tech.get("risk_reward_ratio")
+                if _rrg is not None and _rrg < 1.5 and composite_signal == "buy":
+                    composite_signal = "wait"
+                    composite_reasons_pre = [
+                        f"Risk:Reward {_rrg:.1f}:1 below minimum 1.5:1 — not actionable as BUY",
+                    ]
+                else:
+                    composite_reasons_pre = []
+
+                composite_reasons = composite_reasons_pre + [_gate["reason"]] + _macro.get("flags", []) + _safety.get("flags", [])
+                if _tech.get("reasons"):
+                    composite_reasons.extend(_tech["reasons"][:3])
+            except Exception as _comp_err:
+                logger.debug("Composite scoring failed for %s: %s", sym, _comp_err)
+
+        # Fix 200MA display
+        if _composite_available and reason_out:
+            try:
+                reason_out = fix_200ma_display(pct_above_200_val, reason_out)
+            except Exception:
+                pass
+
+        bt_warn = bool(bt_info.get("warn")) if isinstance(bt_info, dict) else False
+        effective_signal = composite_signal if _composite_available else st
+        if bt_warn and effective_signal == "buy" and strategy_gate_warn:
+            effective_signal = "watch"
+
+        # Backtest-aware rating
+        _BEAR_STRAT_IDS = {
+            "relative_strength_bear",
+            "oversold_extreme_fear",
+            "oversold_bounce",
+            "volume_capitulation",
+        }
+        _is_bear_strat = str(pat_id or sid or "").lower() in _BEAR_STRAT_IDS
+        if _is_bear_strat and conv > 0:
+            _final_score = conv
+        else:
+            _final_score = composite_score_val if composite_score_val is not None else conv
+        if effective_signal == "buy" and _final_score >= 75 and not strategy_gate_warn:
+            rating = "Strong Buy"
+        elif effective_signal == "buy":
+            rating = "Buy"
+        elif effective_signal == "watch":
+            rating = "Watch"
+        else:
+            rating = "Wait"
+
+        # Generate composite summary after all scoring is done
+        if _composite_available and composite_score_val is not None:
+            try:
+                _summary_item = {
+                    "explore_strategy": strat_display,
+                    "explore_strategy_id": pat_id or sid,
+                    "conviction_grade": composite_grade,
+                    "macro_label": macro_label,
+                    "backtest_win_rate_90d": wr90,
+                    "signal": effective_signal,
+                    "composite_score": composite_score_val,
+                    "score": _final_score,
+                    "safety_flags": safety_flags_out,
+                    "strategy_gate_warn": strategy_gate_warn,
+                }
+                composite_summary = generate_composite_summary(_summary_item)
+            except Exception:
+                pass
+
+        _bt_sigs = int(float((bt_info or {}).get("signals") or 0))
+        _bt_avg_ret = float((bt_info or {}).get("avg_return") or 0.0)
+        _strategy_evidence_line = ""
+        if wr90 is not None and _bt_sigs > 0:
+            _strategy_evidence_line = (
+                f"Based on {strat_display} which has won {wr90:.0f}% of {_bt_sigs} backtested trades "
+                f"with avg return of {_bt_avg_ret:+.1f}%."
+            )
+        elif wr90 is not None:
+            _strategy_evidence_line = (
+                f"{strat_display} — {wr90:.0f}% 90d aggregate pattern win rate (see backtest panel for sample size)."
+            )
+
+        _facts_d = detail.get("facts") if isinstance(detail.get("facts"), dict) else {}
+        _vol_ratio_item = detail.get("volume_ratio")
+        if _vol_ratio_item is None and _facts_d:
+            _vol_ratio_item = (
+                _facts_d.get("volume_ratio")
+                if _facts_d.get("volume_ratio") is not None
+                else _facts_d.get("volume_mult")
+            )
+        try:
+            _vol_ratio_item = float(_vol_ratio_item) if _vol_ratio_item is not None else None
+        except (TypeError, ValueError):
+            _vol_ratio_item = None
+        try:
+            _avg_vol_d = float(detail["avg_volume_20d"]) if detail.get("avg_volume_20d") is not None else None
+        except (TypeError, ValueError):
+            _avg_vol_d = None
+        try:
+            _vol_now_d = float(
+                detail.get("vol_24h")
+                or detail.get("volume_24h")
+                or detail.get("volume")
+                or r.get("volume_24h")
+                or r.get("volume")
+                or 0
+            )
+        except (TypeError, ValueError):
+            _vol_now_d = 0.0
+        _vol_now_d = _vol_now_d or None
+        if (
+            (_vol_ratio_item is None or _vol_ratio_item <= 0)
+            and _avg_vol_d
+            and _avg_vol_d > 0
+            and _vol_now_d
+            and _vol_now_d > 0
+        ):
+            _vol_ratio_item = float(_vol_now_d) / float(_avg_vol_d)
+
+        items.append(
+            {
+                "symbol": sym,
+                "explore_feed": True,
+                "score": _final_score,
+                "conviction_score": conv,
+                "composite_score": composite_score_val,
+                "pick_score": round(pick_sc, 2),
+                "smart_rank_applied": bool(use_smart and pick_scores),
+                "signal": effective_signal,
+                "horizon": h,
+                "market_type": "crypto" if "/" in sym else "stocks",
+                "price": r.get("price"),
+                "volume": float(
+                    detail.get("vol_24h") or detail.get("volume_24h") or detail.get("volume")
+                    or r.get("volume_24h") or r.get("volume") or 0
+                ) or None,
+                "volume_ratio": _vol_ratio_item,
+                "avg_volume": _avg_vol_d,
+                "change_pct": chg24,
+                "explore_strategy": strat_display,
+                "explore_strategy_id": pat_id or sid,
+                "scanner_strategy": ds or None,
+                "scanner_strategy_reason": hr or None,
+                "strategy_reason": reason_out,
+                "explore_reason": reason_out,
+                "backtest_win_rate_90d": wr90,
+                "backtest_warn_90d": bt_warn,
+                "backtest_aggregate_note": (
+                    "Aggregate 90d win rate for this chart pattern across the backtest universe — not this symbol's live P&L or a profit guarantee."
+                    if wr90 is not None
+                    else None
+                ),
+                "detail": detail,
+                "signal_ts": r.get("signal_ts"),
+                "updated_ts": r.get("updated_ts"),
+                "rating": rating,
+                "sparkline": _sparkline,
+                "already_active": already_active,
+                "active_reason": list(active_reason.get(norm_sym) or []),
+                "factor_scores": (detail.get("facts") if isinstance(detail, dict) else None) or {},
+                "conviction_grade": composite_grade,
+                "macro_label": macro_label,
+                "strategy_gate_warn": strategy_gate_warn,
+                "safety_flags": safety_flags_out,
+                "composite_reasons": composite_reasons,
+                "composite_flags": composite_flags,
+                "composite_summary": composite_summary,
+                "risk_reward_display": composite_rr_display,
+                "risk_reward_color": composite_rr_color,
+                "strategy_evidence_line": _strategy_evidence_line,
+                "live_unproven_badge": bool(effective_signal == "buy" and _live_closed_deals <= 0),
+                "sector": SECTOR_MAP.get(sym, "") if _composite_available else "",
+                "suggested_position_pct": (
+                    position_size_pct_for_grade(
+                        composite_grade, h,
+                        is_bear_strategy=(pat_id or sid or "") in BEAR_STRATEGY_IDS,
+                    ) if _composite_available and composite_grade else None
+                ),
+            }
+        )
+
+    # Apply cross-signal correlation filter
+    if _composite_available and items:
+        try:
+            items = filter_correlated_signals(items)
+        except Exception as _filt_err:
+            logger.debug("Cross-signal filter failed: %s", _filt_err)
+
+    try:
+        from stock_universe import JUNK_TICKERS
+        def _sym_ok(it):
+            s = (it.get("symbol") or "").upper()
+            base = s.split("/")[0] if "/" in s else s
+            if base in JUNK_TICKERS:
+                return False
+            if "/" in s and base in INVALID_KRAKEN_BASES:
+                return False
+            return True
+        items = [it for it in items if _sym_ok(it)]
+    except Exception:
+        pass
+
+    # DCA entry plan for buy signals
+    def _build_dca_plan(
+        symbol: str, price: float,
+        suggested_position_pct: float,
+        portfolio_total: float,
+        horizon: str,
+    ) -> Dict[str, Any]:
+        total_usd = (suggested_position_pct / 100.0) * portfolio_total
+        t1_pct, t2_pct, t3_pct = 0.40, 0.35, 0.25
+        drop2, drop3 = 0.03, 0.07
+        return {
+            "total_usd": round(total_usd, 2),
+            "tranche_1": {
+                "usd": round(total_usd * t1_pct, 2),
+                "trigger": "Buy now",
+                "price": round(price, 4),
+            },
+            "tranche_2": {
+                "usd": round(total_usd * t2_pct, 2),
+                "trigger": f"Buy if drops {drop2*100:.0f}%",
+                "price": round(price * (1 - drop2), 4),
+            },
+            "tranche_3": {
+                "usd": round(total_usd * t3_pct, 2),
+                "trigger": f"Buy if drops {drop3*100:.0f}%",
+                "price": round(price * (1 - drop3), 4),
+            },
+            "strategy": "Bear market DCA — scale in on weakness",
+        }
+
+    _dca_portfolio = 100.0
+    try:
+        _bm_dca = globals().get("bm")
+        if _bm_dca and hasattr(_bm_dca, "get_portfolio_total"):
+            _dca_portfolio = float(_bm_dca.get_portfolio_total() or 100.0)
+        if _dca_portfolio <= 0:
+            _dca_portfolio = 100.0
+    except Exception:
+        pass
+
+    for _it in items:
+        if _it.get("signal") == "buy":
+            _it_price = float(_it.get("price") or 0)
+            _it_pct = float(_it.get("suggested_position_pct") or 3.0)
+            if _it_price > 0:
+                _it["dca_plan"] = _build_dca_plan(
+                    _it["symbol"], _it_price, _it_pct,
+                    _dca_portfolio, h,
+                )
+
+    explore_rejected_payload: List[Dict[str, Any]] = []
+    try:
+        _rej_raw = list_explore_rejected(h, limit=50)
+        for _r in _rej_raw:
+            _sid = str(_r.get("strategy") or "")
+            explore_rejected_payload.append(
+                {
+                    **_r,
+                    "strategy": STRATEGY_LABELS.get(_sid, _sid) if _sid else "",
+                }
+            )
+    except Exception:
+        pass
+
+    with _globals_lock:
+        state_h = (_RECO_STATE.get(h) or {}).copy()
+    last_scan = (last_scan_by_horizon.get(h) or {}).get("ts") or 0
+    scan_age = now_i - int(last_scan) if last_scan else 999999
+    status = "ready"
+    reason = "ok" if items else "no_matches"
+    message = "Explore feed (pattern strategies)" if items else "No buy/watch rows yet — run Rescan or wait for the scanner."
+    if not items and not last_scan and not state_h.get("scanning"):
+        status = "warming_up"
+        reason = "no_scan_yet"
+        message = "Generating explore signals… first scan starting."
+        import threading
+
+        def _kick():
+            try:
+                _scan_recommendations(h)
+            except Exception as _ke:
+                logger.warning("explore feed auto-scan failed: %s", _ke)
+
+        threading.Thread(target=_kick, daemon=True).start()
+
+    _td = max(_total_strategies, 5)
+    _buy_thr_fg = 65
+    try:
+        from explore_composite_scorer import buy_threshold_from_fear_greed as _btfg_disp
+
+        _buy_thr_fg = int(_btfg_disp(_fg_val, "crypto"))
+    except Exception:
+        pass
+    _btc_regime_label = ""
+    try:
+        _labels = _btc_ctx_feed.get("labels") or {}
+        _btc_regime_label = str(
+            _btc_ctx_feed.get("regime")
+            or _btc_ctx_feed.get("regime_label")
+            or _labels.get("1d")
+            or _labels.get("4h")
+            or ""
+        ).upper()
+    except Exception:
+        pass
+    # Bug 11: include pending count + a softer banner for early-stage setups.
+    _banner = (
+        f"⚠️ Only {_active_strategies} of {_td} strategies are currently treated as active "
+        f"(≥40% win rate and non-losing avg return in the 90d backtest). "
+    )
+    if _pending_strategies > 0 and _live_closed_deals < 10:
+        _banner += (
+            f"{_pending_strategies} strategies are pending — they will activate automatically "
+            f"once {max(0, 10 - _live_closed_deals)} more live trades close. "
+        )
+    _banner += "Recommendations rely on pattern signals with limited multi-strategy confirmation — use position sizing accordingly."
+    _explore_disclaimer = {
+        "active_strategies": _active_strategies,
+        "pending_strategies": _pending_strategies,
+        "total_strategies": _td,
+        "completed_closed_deals": _live_closed_deals,
+        "trades_needed_for_activation": max(0, 10 - _live_closed_deals),
+        "fear_greed": _fg_val,
+        "_btc_regime": _btc_regime_label,
+        "buy_score_threshold": _buy_thr_fg,
+        "strategy_health": _strategy_health,
+        "banner": _banner,
+    }
+
+    def _build_market_summary(regime: str, fg: int, risk_off: bool) -> str:
+        parts = []
+        if regime in ("STRONG_BEAR", "BEAR", "TREND_DOWN"):
+            parts.append("BTC in downtrend")
+        elif regime in ("RANGING", "RANGE"):
+            parts.append("BTC ranging sideways")
+        elif regime in ("BULL", "STRONG_BULL", "BREAKOUT"):
+            parts.append("BTC in uptrend")
+        if fg <= 15:
+            parts.append(
+                f"extreme fear (F&G={fg}) — historically "
+                f"near cycle bottoms, contrarian opportunity"
+            )
+        elif fg <= 30:
+            parts.append(f"market fearful (F&G={fg})")
+        elif fg >= 75:
+            parts.append(f"market greedy (F&G={fg}) — caution")
+        if risk_off:
+            parts.append(
+                "defensive mode active — only relative "
+                "strength and oversold signals showing"
+            )
+        return (
+            ". ".join(parts).capitalize() + "."
+            if parts else "Neutral market conditions."
+        )
+
+    _horizons_for_ui: Dict[str, Any] = {}
+    with _globals_lock:
+        for _hh in ("short", "medium", "long"):
+            _st_err = (_RECO_STATE.get(_hh) or {}).copy()
+            _horizons_for_ui[_hh] = {"error": str(_st_err.get("error") or "")}
+
+    _macro_risk_off = _btc_regime_label in ("BEAR", "STRONG_BEAR") and _fg_val <= 20
+    _market_conditions = {
+        "btc_regime": _btc_regime_label or "UNKNOWN",
+        "fear_greed_value": _fg_val,
+        "fear_greed_label": _FEAR_GREED_CACHE.get("label", "Neutral"),
+        "fear_greed_contrarian": _fg_val <= 20,
+        "macro_risk_off": _macro_risk_off,
+        "active_strategies": _active_strategies,
+        "total_strategies": _td,
+        "summary": _build_market_summary(
+            str(_btc_regime_label or ""),
+            _fg_val,
+            bool(_macro_risk_off),
+        ),
+    }
+
+    _ef_response = {
+        "ok": True,
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "horizon": h,
+        "items": items,
+        "count": len(items),
+        "has_more": False,
+        "last_scan_ts": last_scan,
+        "scan_age_sec": scan_age,
+        "last_scan_by_horizon": last_scan_by_horizon,
+        "explore_rejected": explore_rejected_payload,
+        "cache_ts": now_i,
+        "explore_smart_rank": use_smart,
+        "explore_disclaimer": _explore_disclaimer,
+        "market_conditions": _market_conditions,
+        "horizons": _horizons_for_ui,
+        "data_source": feed_data_source,
+    }
+    _EXPLORE_FEED_CACHE[_ef_cache_key] = (time.time(), _ef_response)
+    if len(_EXPLORE_FEED_CACHE) > 30:
+        _oldest = min(_EXPLORE_FEED_CACHE, key=lambda k: _EXPLORE_FEED_CACHE[k][0])
+        _EXPLORE_FEED_CACHE.pop(_oldest, None)
+    return _json(_ef_response)
+
+
+@app.post("/api/explore/backtest")
+def api_explore_backtest_run(horizon: str = "short"):
+    """Run historical validation (sample universe) and persist results."""
+    _h = str(horizon).lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
+    try:
+        from explore_backtest import default_universe_symbols, run_explore_backtest
+
+        def _fetch(sym: str):
+            try:
+                # Stocks: use alpaca or yfinance fallback
+                if "/" not in sym:
+                    try:
+                        import yfinance as yf
+                        t = yf.Ticker(sym)
+                        hist = t.history(period="1y", interval="1d")
+                        if hist is not None and not hist.empty:
+                            candles = []
+                            for ts, row in hist.iterrows():
+                                candles.append([
+                                    int(ts.timestamp()),
+                                    float(row["Open"]),
+                                    float(row["High"]),
+                                    float(row["Low"]),
+                                    float(row["Close"]),
+                                    float(row["Volume"]),
+                                ])
+                            return candles
+                    except Exception:
+                        pass
+                    return []
+                else:
+                    # Crypto: use kraken_client
+                    if kc is None:
+                        return []
+                    try:
+                        now_ms = int(time.time() * 1000)
+                        since_ms = now_ms - (365 * 86400 * 1000)
+                        raw = kc.fetch_ohlcv_range(sym, "1d", since_ms, now_ms)
+                        return list(raw or [])
+                    except Exception:
+                        return []
+            except Exception:
+                return []
+
+        stocks, crypto = default_universe_symbols()
+        res = run_explore_backtest(
+            fetch_candles=_fetch,
+            stock_symbols=stocks,
+            crypto_symbols=crypto,
+            horizon=h,
+        )
+        save_explore_backtest_results(h, res)
+        return _json({"ok": True, "result": res})
+    except Exception as e:
+        logger.exception("explore backtest failed: %s", e)
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.post("/api/explore/backtest/refresh")
+def api_explore_backtest_refresh():
+    """Force refresh of explore strategy backtests."""
+    try:
+        import threading
+        t = threading.Thread(
+            target=_run_missing_backtests,
+            kwargs={"force": True},
+            daemon=True,
+        )
+        t.start()
+        return _json({
+            "ok": True,
+            "message": "Backtest refresh started"
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/api/explore/backtest/latest")
+def api_explore_backtest_latest(horizon: str = "short"):
+    _h = str(horizon).lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
+    row = get_latest_explore_backtest(h)
+    if not row:
+        return _json({"ok": True, "horizon": h, "result": None})
+    return _json({"ok": True, "horizon": h, "result": row})
+
+
+@app.get("/api/explore/strategy-performance")
+def api_explore_strategy_performance(horizon: str = "short", days: int = 90):
+    """Per-strategy win rates from explore_signal_outcomes (not cached here — use for analytics)."""
+    _h = str(horizon or "short").lower().strip()
+    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
+    d = max(7, min(int(days), 365))
+    strat = get_strategy_win_rates(h, lookback_days=d)
+    low_acc = [k for k, v in (strat or {}).items() if v.get("low_accuracy")]
+    return _json({
+        "ok": True,
+        "horizon": h,
+        "days": d,
+        "strategies": strat or {},
+        "low_accuracy_strategies": low_acc,
+    })
+
+
+def _compute_suggested_entry(breakdown: dict, price: float, signal: str) -> Optional[str]:
+    """Compute suggested entry text based on S/R proximity."""
+    if signal != "buy" or not price or price <= 0:
+        return None
+    try:
+        sr = breakdown.get("support_resistance", {}) if isinstance(breakdown, dict) else {}
+        sr_val = float(sr.get("value", 0)) if sr else 0
+        if sr_val >= 3.0:
+            return "Current price is near support — good entry."
+        elif sr_val <= -3.0:
+            pullback_target = round(price * 0.985, 4 if price < 10 else 2)
+            return f"Consider waiting for pullback to ~${pullback_target}"
+        else:
+            return None
+    except Exception:
+        return None
+
+def _stock_market_open() -> bool:
+    """Returns True if US stock market is currently open."""
+    try:
+        import datetime as _dt
+        now_et = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=-5)))
+        if now_et.weekday() >= 5:
+            return False
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        return market_open <= now_et <= market_close
+    except Exception:
+        return True
+
+
+def _conviction_grade(score: float) -> str:
+    if score >= 80:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 50:
+        return "C"
+    return "D"
+
+
+def _get_explore_feed_items(
+    horizon: str = "short",
+    limit: int = 20,
+    signal_filter: str = "buy",
+    market_type: str = "crypto",
+) -> List[Dict[str, Any]]:
+    """Read directly from explore_signals table (buy/watch only). Never falls back to recommendations."""
+    from stock_universe import JUNK_TICKERS
+    from explore_signals import STRATEGY_LABELS as _STRAT_LABELS
+
+    try:
+        from db import _conn as _db_conn
+        con = _db_conn()
+        cur = con.execute(
+            """
+            SELECT symbol, status, conviction_score, strategy, reason,
+                   market_type, updated_ts, detail_json, price, change_24h
+            FROM explore_signals
+            WHERE status IN ('buy', 'watch')
+              AND updated_ts > (strftime('%s','now') - 7200)
+            ORDER BY conviction_score DESC, updated_ts DESC
+            LIMIT ?
+            """,
+            (limit * 4,),
+        )
+        rows = cur.fetchall()
+    except Exception as _db_err:
+        logger.warning("_get_explore_feed_items: DB query failed: %s", _db_err)
+        return []
+
+    if not rows:
+        return []
+
+    _STRAT_LABEL_TO_ID = {v: k for k, v in _STRAT_LABELS.items()}
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = str(r["symbol"] or "").strip()
+        if not sym:
+            continue
+        is_crypto = "/" in sym
+        base = sym.split("/")[0].upper() if is_crypto else sym.upper()
+        if base in JUNK_TICKERS:
+            continue
+        if is_crypto and base in INVALID_KRAKEN_BASES:
+            continue
+
+        item_market = str(r["market_type"] or "").strip().lower() or ("crypto" if is_crypto else "stocks")
+        if market_type not in ("all", "") and item_market != market_type:
+            continue
+
+        conv = float(r["conviction_score"] or 0)
+        st = str(r["status"] or "watch")
+        if signal_filter == "buy" and st != "buy":
+            continue
+
+        strat_col = str(r["strategy"] or "").strip()
+        detail_json_raw = r["detail_json"] or "{}"
+        try:
+            detail = json.loads(detail_json_raw) if isinstance(detail_json_raw, str) else (detail_json_raw or {})
+        except (json.JSONDecodeError, TypeError):
+            detail = {}
+        strat_id = str(detail.get("strategy_id") or "").strip()
+        if not strat_id:
+            strat_id = _STRAT_LABEL_TO_ID.get(strat_col, strat_col)
+        strat_label = strat_col or _STRAT_LABELS.get(strat_id, strat_id) or "smart_dca"
+
+        reason = str(r["reason"] or "").strip()
+        grade = _conviction_grade(conv)
+
+        items.append({
+            "symbol": sym,
+            "score": conv,
+            "signal": st,
+            "horizon": horizon,
+            "market_type": item_market,
+            "price": r["price"],
+            "change_pct": r["change_24h"],
+            "volume": None,
+            "market_cap": None,
+            "rating": "Neutral",
+            "confidence": conv / 100.0 if conv > 1 else conv,
+            "sparkline": [],
+            "regime_1d": None,
+            "regime_4h": None,
+            "regime_label": None,
+            "weekly_trend": None,
+            "strategy": strat_id or "smart_dca",
+            "strategy_id": strat_id or "smart_dca",
+            "strategy_mode": strat_label or "smart_dca",
+            "suggested_strategy": strat_label or "smart_dca",
+            "recommended_strategy": strat_label or "smart_dca",
+            "explore_strategy": strat_label or "smart_dca",
+            "explore_strategy_id": strat_id or "smart_dca",
+            "strategy_reason": reason,
+            "volatility": None,
+            "risk_flags": [],
+            "updated_ts": r["updated_ts"],
+            "signal_age_sec": None,
+            "eligible": True,
+            "research_only": False,
+            "reasons": [reason] if reason else [],
+            "already_active": False,
+            "active_reason": [],
+            "conviction_grade": grade,
+            "conviction_score": conv,
+            "composite_score": float(detail.get("composite_score") or 0) if detail.get("composite_score") is not None else None,
+            "explore_feed": True,
+        })
+    items.sort(key=lambda x: x["score"], reverse=True)
+    return items[:limit]
+
+
 @app.get("/api/recommendations")
 def api_recommendations(
     horizon: str = "short",
@@ -5557,21 +9189,59 @@ def api_recommendations(
             "count": 0
         })
     
+    # Result cache: avoid re-processing on rapid page loads (2-min bucket refreshes stale-watch / age logic)
+    _cache_tb = int(time.time()) // 120
+    _cache_key = f"{h}|{market_type}|{signal_filter}|{sort_by}|{volatility_filter}|{regime_filter}|{sector_filter}|{limit}|{offset}|{min_score}|{_cache_tb}"
+    _cached = _RECO_RESULT_CACHE.get(_cache_key)
+    if _cached:
+        _ts, _result = _cached
+        if (time.time() - _ts) < _RECO_RESULT_CACHE_TTL:
+            try:
+                _er_fresh = list_explore_rejected(h, limit=50)
+                _merged = dict(_result)
+                _merged["explore_rejected"] = _er_fresh
+            except Exception:
+                _merged = dict(_result)
+            return _json(_merged)
+
     # Fetch cached recommendations – over-fetch so Explore has enough per asset type.
     if market_type in ("crypto", "stocks"):
         fetch_limit = 1200
     else:
         fetch_limit = min(max(limit * 4, 200), 800)
     rows = []
+    reco_data_source = "recommendations_latest"
     try:
         # Direct call - exclude blocklisted (STABLE, etc.) at source
         rows = list_recommendations(h, limit=fetch_limit, exclude_bases=list(CRYPTO_BLOCKLIST))
         if not rows:
-            rows = []  # Ensure it's a list
+            try:
+                ex_fb = list_explore_feed(
+                    h, market_type=market_type, statuses=["buy", "watch"], limit=min(fetch_limit, 400),
+                )
+                rows = _explore_feed_as_recommendation_rows(ex_fb)
+                if rows:
+                    reco_data_source = "explore_signals"
+            except Exception as _rfb:
+                logger.debug("recommendations explore_signals fallback: %s", _rfb)
+            if not rows:
+                rows = []
     except Exception as e:
         logger.error(f"list_recommendations failed: {e}")
         rows = []
         # Don't return error - just return empty list with status
+
+    explore_rejected_payload: List[Dict[str, Any]] = []
+    explore_rejected_symbols: set = set()
+    try:
+        explore_rejected_payload = list_explore_rejected(h, limit=50)
+        explore_rejected_symbols = {
+            str(x.get("symbol") or "").strip()
+            for x in explore_rejected_payload
+            if x.get("symbol")
+        }
+    except Exception as _exr_err:
+        logger.debug("explore_rejected load: %s", _exr_err)
 
     # Log DB counts when medium is empty (diagnostics)
     if h == "medium" and len(rows) == 0:
@@ -5647,6 +9317,31 @@ def api_recommendations(
     seen_normalized: set = set()  # Dedupe by normalized symbol
     btc_ctx = _btc_context()
     macro_risk_off = bool(btc_ctx.get("risk_off", False))
+    _strategy_perf = _get_cached_strategy_win_rates(h, 90)
+
+    # BTC inter-market regime penalty for altcoins
+    _btc_regime_label = ""
+    _btc_inter_market_adj = 0.0
+    try:
+        btc_rec = None
+        for _r in rows:
+            _s = str(_r.get("symbol") or "").upper()
+            if _s in ("XBT/USD", "BTC/USD"):
+                btc_rec = _r
+                break
+        if btc_rec:
+            _bm = json.loads(btc_rec.get("metrics_json") or "{}")
+            _btc_regime_label = str(_bm.get("regime") or "").upper()
+            if _btc_regime_label in ("BEAR", "STRONG_BEAR"):
+                _btc_inter_market_adj = -5.0
+            elif _btc_regime_label in ("WEAK_BEAR", "RANGING", "RANGE"):
+                _btc_inter_market_adj = -2.0
+            elif _btc_regime_label in ("BULL", "STRONG_BULL"):
+                _btc_inter_market_adj = 3.0
+            if _btc_inter_market_adj != 0:
+                logger.info("BTC regime: %s — applying %.0f inter-market adjustment to altcoins", _btc_regime_label, _btc_inter_market_adj)
+    except Exception:
+        pass
 
     items = []
     eligible_count = 0
@@ -5679,19 +9374,34 @@ def api_recommendations(
                 metrics = json.loads(r.get("metrics_json") or "{}")
             except (json.JSONDecodeError, TypeError):
                 metrics = {}
+            risk_flags = []
+            try:
+                _rf_raw = r.get("risk_flags_json")
+                if _rf_raw:
+                    risk_flags = json.loads(_rf_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Exclude symbols explicitly rejected in explore_signals (DB)
+            if sym in explore_rejected_symbols:
+                continue
+            score_breakdown = {}
+            try:
+                _sbd_raw_early = r.get("score_breakdown_json")
+                if _sbd_raw_early:
+                    score_breakdown = json.loads(_sbd_raw_early)
+            except (json.JSONDecodeError, TypeError):
+                pass
             
-            # 1. Market Separation (normalize legacy "stock" -> "stocks")
-            item_market = (metrics.get("market_type") or "").strip().lower()
-            if not item_market:
-                item_market = "stocks" if (len(sym) < 6 and "/" not in sym) else "crypto"
-            if item_market == "stock":
+            # 1. Market Separation — always trust symbol format, not DB
+            if "/" in str(sym):
+                item_market = "crypto"
+            else:
                 item_market = "stocks"
 
             if market_type != "all":
-                want = market_type.lower()
-                if want == "stocks" and item_market != "stocks":
+                if market_type == "stocks" and item_market != "stocks":
                     continue
-                if want == "crypto" and item_market != "crypto":
+                if market_type == "crypto" and item_market != "crypto":
                     continue
 
             # Skip stock recommendations when Alpaca is not connected - prevents false signals
@@ -5759,6 +9469,30 @@ def api_recommendations(
             # Determine signal from score: per-market buy threshold, shared watch threshold
             buy_thresh = _reco_buy_threshold_stocks() if item_market == "stocks" else _reco_buy_threshold_crypto()
             item_signal = "buy" if score >= buy_thresh else ("watch" if score >= _reco_watch_threshold() else "wait")
+
+            # 5-override. Bear-market oversold dip detection for crypto:
+            # Even when score=0 (bear regime, ineligible), surface quality cryptos as WATCH
+            # when RSI is extremely oversold (< 30) — these are DCA/reversal setup candidates.
+            # Only applies in signal=watch or signal=all contexts (never promotes to BUY).
+            if item_market == "crypto" and item_signal == "wait" and signal_filter in ("watch", "all"):
+                _bear_rsi = None
+                try:
+                    _bear_rsi = float(metrics.get("rsi_value") or r.get("rsi_value") or 0)
+                except (TypeError, ValueError):
+                    pass
+                _bear_regime = (metrics.get("regime") or "").upper()
+                _bear_volume = float(metrics.get("volume_24h_quote") or metrics.get("volume_24h") or 0)
+                _min_bear_vol = 500_000  # Only surface liquid crypto for dip setups
+                if (_bear_rsi and _bear_rsi <= 30
+                        and _bear_regime in ("BEAR", "STRONG_BEAR", "WEAK_BEAR", "RANGE")
+                        and _bear_volume >= _min_bear_vol
+                        and score == 0.0):
+                    # Promote to WATCH with a base score of 52 (just above watch threshold)
+                    # so it appears with low priority but is visible for DCA consideration.
+                    score = 52.0
+                    item_signal = "watch"
+                    risk_flags = list(risk_flags) + [f"Oversold dip setup (RSI {_bear_rsi:.0f}) — bear regime, DCA only"]
+
             if signal_filter == "buy" and item_signal != "buy":
                 continue  # Skip non-buy items
             elif signal_filter == "watch" and item_signal not in ("buy", "watch"):
@@ -5794,11 +9528,235 @@ def api_recommendations(
                 if want == "bear" and ir not in ("BEAR", "HIGH_VOL_DEFENSIVE", "RISK_OFF"):
                     continue
 
-            # 5d. Macro Risk-Off: informational warning (score already penalized in intelligence layer)
+            # 5d. Hard regime gate: block BUY only in clearly bearish regimes.
+            # RANGE and HIGH_VOL_DEFENSIVE are NOT hard-blocked — stocks frequently trade in
+            # these regimes and can still be profitable entries with sufficient score conviction.
+            # Only hard-block truly bearish/risk-off conditions.
+            _BULLISH_REGIMES = {"BULL", "STRONG_BULL", "BREAKOUT", "TREND_UP", "WEAK_BULL"}
+            # Hard block: clearly bearish — no BUY regardless of score
+            _BLOCKED_BUY_REGIMES = {"BEAR", "STRONG_BEAR", "RISK_OFF"}
+            # Elevated conviction needed: sideways/high-vol — require score >= 72 (not full block)
+            _ELEVATED_SCORE_REGIMES = {"RANGE", "RANGING", "HIGH_VOL_DEFENSIVE", "SIDEWAYS", "WEAK_BEAR"}
+            if item_signal == "buy":
+                _item_regime_gate = (metrics.get("regime") or "").strip().upper()
+                if not _item_regime_gate:
+                    # No regime data stored — require above-average conviction
+                    if score < 75.0:
+                        item_signal = "watch"
+                elif _item_regime_gate in _BLOCKED_BUY_REGIMES:
+                    item_signal = "watch"  # Hard block: bearish/risk-off regime
+                elif _item_regime_gate in _ELEVATED_SCORE_REGIMES:
+                    # Sideways/high-vol: require elevated score but don't hard-block
+                    if score < 72.0:
+                        item_signal = "watch"
+                elif _item_regime_gate not in _BULLISH_REGIMES:
+                    # Unknown/neutral regime — require solid conviction
+                    if score < 70.0:
+                        item_signal = "watch"
+            # 5d-ii. Hard RSI gate: RSI >= 80 should never be a BUY
+            if item_signal == "buy":
+                _rsi_gate = None
+                try:
+                    _rsi_gate = float(metrics.get("rsi_value") or r.get("rsi_value") or 0)
+                except (TypeError, ValueError):
+                    pass
+                if _rsi_gate and _rsi_gate >= 80:
+                    item_signal = "watch"
+
+            # 5d-ii-b. Extended RSI penalties: RSI > 72 = -5, RSI > 78 = -10 + demote
+            if _rsi_gate and _rsi_gate > 72 and _rsi_gate < 80:
+                _rsi_penalty = -5 if _rsi_gate <= 78 else -10
+                score = max(0, score + _rsi_penalty)
+                if _rsi_gate > 78 and item_signal == "buy":
+                    item_signal = "watch"
+
+            # 5d-ii-c. Volume conviction: gentle penalty, only block extreme illiquidity
+            _vr_for_gate = float(metrics.get("volume_ratio") or r.get("volume_ratio") or 1.0)
+            if _vr_for_gate < 0.2:
+                score = min(score, 30)
+                if item_signal == "buy":
+                    item_signal = "watch"
+                risk_flags.append("Extreme illiquidity — volume ratio < 0.2")
+            elif _vr_for_gate < 1.5:
+                _vol_penalty = max(-5.0, (_vr_for_gate - 1.5) * 10.0)
+                score = max(0, score + _vol_penalty)
+                if _vol_penalty < -2:
+                    risk_flags.append("Low volume — use smaller position")
+
+            # 5d-ii-d. Long-term downtrend penalty: -5 per 20% of drawdown (max -15)
+            for _rf in risk_flags:
+                _rf_s = str(_rf).lower()
+                if "down" in _rf_s and "long-term" in _rf_s:
+                    import re as _re_mod
+                    _dd_match = _re_mod.search(r'-(\d+)%', str(_rf))
+                    if _dd_match:
+                        _dd_val = int(_dd_match.group(1))
+                        _tiers = min(_dd_val // 20, 3)
+                        score = max(0, score - _tiers * 5)
+                    break
+
+            # 5d-iii. Signal age penalty (Problem 1) + Price confirmation (Problem 3) + Three-gate BUY (Problem 4)
+            _created_ts_raw = int(r.get("created_ts") or r.get("updated_ts") or 0)
+            _signal_age_minutes = (now - _created_ts_raw) / 60.0 if _created_ts_raw > 0 else None
+            _change_pct = None
+            try:
+                _ch = r.get("change_24h") or metrics.get("change_24h")
+                if _ch is not None:
+                    _change_pct = float(_ch)
+            except (TypeError, ValueError):
+                pass
+            _tentative_signal = "buy" if score >= buy_thresh else "watch"
+            _price_conf_delta = 0.0
+            _price_conf_label = ""
+            _stale_penalty = 0.0
+            _signal_freshness_label = "Fresh"
+            try:
+                _price_conf_delta, _price_conf_label = price_confirmation_score(_change_pct, _tentative_signal)
+                score += _price_conf_delta
+                _pen, _reason, _force_watch = signal_age_penalty(_signal_age_minutes)
+                if _force_watch:
+                    _pre_cap = score
+                    score = min(score, 62.0)
+                    _stale_penalty = max(0, _pre_cap - 62)
+                    item_signal = "watch"
+                    _signal_freshness_label = "Previous Session"
+                elif _pen > 0:
+                    score = max(0, score - _pen)
+                    _stale_penalty = _pen
+                    _signal_freshness_label = _reason if _pen >= 15 else "Aging"
+                if _signal_age_minutes is not None:
+                    if _signal_age_minutes > 480:
+                        _signal_freshness_label = "Previous Session"
+                    elif _signal_age_minutes >= 120:
+                        _signal_freshness_label = "Previous Session (-15)"
+                    elif _signal_age_minutes >= 60:
+                        _signal_freshness_label = "Aging (-7)"
+            except Exception as _e:
+                logger.warning("explore_scorer failed (row %s): %s", sym, _e)
+            # Three-gate BUY: all must pass or status = WATCH
+            # Gate 3: aligned with the actual per-market buy threshold so there's no hidden
+            # secondary floor that silently demotes valid signals (e.g. stocks scoring 68-69).
+            if item_signal == "buy":
+                _gate1 = _signal_age_minutes is None or _signal_age_minutes < 480
+                _gate2 = _price_conf_delta > -20
+                _gate3 = score >= buy_thresh  # Use actual market-specific buy threshold
+                if not (_gate1 and _gate2 and _gate3):
+                    item_signal = "watch"
+            # Build score breakdown audit for UI (Problem 5)
+            _regime_val = float(score_breakdown.get("regime", {}).get("value", 0) if isinstance(score_breakdown.get("regime"), dict) else 0)
+            _trend_val = float(score_breakdown.get("trend", {}).get("value", 0) if isinstance(score_breakdown.get("trend"), dict) else 0)
+            _vol_val = float(score_breakdown.get("volume", {}).get("value", 0) if isinstance(score_breakdown.get("volume"), dict) else 0)
+            _score_breakdown_audit = {
+                "regime": _regime_val,
+                "trend": _trend_val,
+                "volume": _vol_val,
+                "price_confirmation": _price_conf_delta,
+                "price_confirmation_label": _price_conf_label,
+                "signal_freshness": _signal_freshness_label,
+                "stale_penalty": _stale_penalty,
+            }
+
+            # 5d-iv. BTC inter-market penalty for altcoins
+            _btc_adj_applied = 0.0
+            if _btc_inter_market_adj != 0 and item_market == "crypto":
+                _sym_upper = sym.upper()
+                if _sym_upper not in ("XBT/USD", "BTC/USD"):
+                    score = max(0, score + _btc_inter_market_adj)
+                    _btc_adj_applied = _btc_inter_market_adj
+                    # Re-check buy threshold after penalty
+                    if item_signal == "buy" and score < buy_thresh:
+                        item_signal = "watch"
+
+            # 5d-iv-b. Fear & Greed dynamic adjustment (crypto: extreme fear = bonus, extreme greed = penalty)
+            _fear_greed_adj = 0.0
+            if item_market == "crypto":
+                _fear_greed_adj = _fear_greed_score_adjustment()
+                if _fear_greed_adj != 0:
+                    score = max(0, min(95, score + _fear_greed_adj))
+                    if item_signal == "buy" and score < buy_thresh:
+                        item_signal = "watch"
+
+            # 5d-iv-c. BTC macro momentum overlay: when BTC probability of down + high vol are both
+            # elevated, apply an extra penalty and require higher conviction for BUY.
+            # This catches cases where individual symbols look great but the macro backdrop is risky
+            # (e.g. BTC RANGING with 75% downward probability and 91% high-vol probability).
+            _btc_down_prob = float(btc_ctx.get("btc_down", 0))
+            _btc_hv_prob = float(btc_ctx.get("btc_hv", 0))
+            if item_market == "crypto" and sym.upper() not in ("XBT/USD", "BTC/USD"):
+                if _btc_down_prob >= 0.70 and _btc_hv_prob >= 0.70:
+                    # Dangerous macro environment: high downward momentum + high volatility
+                    score = max(0, score - 5)
+                    if item_signal == "buy" and score < (buy_thresh + 5):
+                        item_signal = "watch"
+                elif _btc_down_prob >= 0.60 and _btc_hv_prob >= 0.60:
+                    # Cautious environment: moderate downward + elevated vol
+                    score = max(0, score - 2)
+                    if item_signal == "buy" and score < buy_thresh:
+                        item_signal = "watch"
+
+            # 5d-v. Momentum confirmation bonus from score breakdown
+            _sbd_momentum = score_breakdown.get("momentum", {})
+            _sbd_trend = score_breakdown.get("trend", {})
+            _mom_val = float(_sbd_momentum.get("value", 0) if isinstance(_sbd_momentum, dict) else 0)
+            _trend_val = float(_sbd_trend.get("value", 0) if isinstance(_sbd_trend, dict) else 0)
+            if _mom_val > 0 and _trend_val > 0:
+                score = min(95, score + 3)
+
+            # 5d-vi. ATR volatility filter: too flat (< 1.5%) or too volatile (> 12%) → demote
+            _atr_raw = float(metrics.get("atr_pct") or 0)
+            _vol_raw = float(metrics.get("volatility") or metrics.get("vol") or 0)
+            _atr_pct = _atr_raw if _atr_raw > 0.5 else (_vol_raw * 100 if _vol_raw > 0 else 0)
+            if _atr_pct > 0:
+                if _atr_pct < 1.5 or _atr_pct > 12:
+                    if item_signal == "buy":
+                        item_signal = "watch"
+
+            # 5d-vi-b. Volume ratio gate: require above-average volume for BUY conviction.
+            # Breakouts/moves on low relative volume have historically poor follow-through.
+            if item_signal == "buy":
+                _vol_ratio_gate = float(metrics.get("volume_ratio") or r.get("volume_ratio") or 0)
+                if 0 < _vol_ratio_gate < 0.75:
+                    # Volume is 25%+ below average — price move lacks institutional confirmation
+                    item_signal = "watch"
+                    risk_flags = list(risk_flags) + [f"Below-avg volume ({_vol_ratio_gate:.2f}x) — weak BUY conviction"]
+
+            # 5d-vi-c. High Vol Defensive strategy gate: when ATR forces a defensive strategy,
+            # require higher score conviction before calling it a BUY.
+            # High-vol assets in defensive mode have poor risk/reward unless the signal is very strong.
+            if item_signal == "buy":
+                _strategy_gate = (metrics.get("strategy") or metrics.get("suggested_strategy") or metrics.get("recommended_strategy") or "").lower()
+                if "high_vol" in _strategy_gate and score < 78.0:
+                    item_signal = "watch"
+
+            # Re-apply signal filter after regime gate
+            if signal_filter == "buy" and item_signal != "buy":
+                continue
+
+            # 5e. Macro Risk-Off: block only if asset is also falling
             macro_warning = None
             if macro_risk_off and item_signal == "buy":
-                macro_warning = "Market conditions are cautious. Defensive strategies and smaller sizing recommended."
-            
+                if _change_pct is not None and _change_pct < -2.0:
+                    item_signal = "watch"
+                    macro_warning = "Risk-off + falling price — demoted to watch."
+                elif _change_pct is None:
+                    item_signal = "watch"
+                    macro_warning = "Risk-off + unknown price change — demoted to watch."
+                else:
+                    macro_warning = "Risk-off but asset showing relative strength — allowing signal."
+
+            # Override: always allow defensive assets even in risk-off
+            _is_defensive = sym.upper() in DEFENSIVE_ASSETS
+            if macro_risk_off and item_signal == "watch" and _is_defensive:
+                if score >= _reco_watch_threshold():
+                    item_signal = "buy"
+                    macro_warning = "Defensive asset promoted to buy during risk-off."
+
+            # 5f. Market hours check — demote stock buys outside trading hours
+            if item_market == "stocks" and item_signal == "buy":
+                if not _stock_market_open():
+                    item_signal = "watch"
+                    _score_breakdown_audit["market_hours"] = "Market closed — signal valid at open"
+
             # 6. Populate Ticker Data (FAST - use metrics only, no network calls)
             # Prices will be filled via /api/prices endpoint async
             price_from_metrics = metrics.get("price")
@@ -5815,6 +9773,17 @@ def api_recommendations(
             elif sort_by == "winrate":
                 sort_key = float(metrics.get("winrate") or metrics.get("win_rate") or score)
             # else: sort_by == "score", use score as sort_key
+            # Tiebreaker: when many picks share the same score (all hit the 92 cap),
+            # add a small fractional bonus so best-quality picks rank first.
+            # Components: entry quality (A=+0.4, B=+0.2, C=0), volume ratio (capped +0.3), earnings risk (-0.5 if <3 days).
+            _eq_tiebreak = {"A": 0.40, "B": 0.20, "C": 0.0}.get(
+                str(r.get("entry_quality") or metrics.get("entry_quality") or "C").upper(), 0.0
+            )
+            _vr_raw = float(metrics.get("volume_ratio") or r.get("volume_ratio") or 1.0)
+            _vr_tiebreak = min(0.30, max(0.0, (_vr_raw - 1.0) * 0.15))  # above-avg volume is a bonus
+            _ed = metrics.get("earnings_days")
+            _earnings_risk = -0.50 if isinstance(_ed, (int, float)) and 0 <= _ed <= 3 else 0.0
+            sort_key += _eq_tiebreak + _vr_tiebreak + _earnings_risk
 
             # Sparkline - only use cache, don't fetch on-demand (too slow)
             sparkline = []
@@ -5830,8 +9799,45 @@ def api_recommendations(
             except Exception:
                 pass
 
-            # Rating buckets: strict thresholds to prevent misleading labels
-            if score >= 75:
+            # Hybrid screener data from DB
+            _db_composite = r.get("composite_score")
+            _db_confidence = r.get("confidence_score")
+            _db_conviction = r.get("conviction_grade")
+            _db_factor_scores = {}
+            try:
+                _fs_raw = r.get("factor_scores_json")
+                if _fs_raw:
+                    _db_factor_scores = json.loads(_fs_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            _db_signal_flags = []
+            try:
+                _sf_raw = r.get("signal_flags_json")
+                if _sf_raw:
+                    _db_signal_flags = json.loads(_sf_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # Also read from metrics (populated during scan)
+            if _db_composite is None:
+                _db_composite = metrics.get("composite_score")
+            if _db_confidence is None:
+                _db_confidence = metrics.get("confidence_score")
+            if _db_conviction is None:
+                _db_conviction = metrics.get("conviction_grade")
+            if not _db_factor_scores:
+                _db_factor_scores = metrics.get("factor_scores") or {}
+
+            # Rating: use conviction grade when available, fall back to score buckets
+            if _db_conviction == "A":
+                rating = "Strong Buy"
+            elif _db_conviction == "B":
+                rating = "Buy"
+            elif _db_conviction == "C":
+                rating = "Watch"
+            elif _db_conviction == "D":
+                rating = "Avoid"
+            elif score >= 85:
                 rating = "Strong Buy"
             elif score >= 55:
                 rating = "Buy"
@@ -5840,26 +9846,22 @@ def api_recommendations(
             else:
                 rating = "Avoid"
 
-            # Fast JSON parse with fallbacks (lazy - only parse if needed)
             regime = {}
             reasons = []
-            risk_flags = []
             try:
                 regime_raw = r.get("regime_json")
                 if regime_raw:
-                    regime = json.loads(regime_raw)
+                    parsed = json.loads(regime_raw)
+                    if isinstance(parsed, dict) and "label" in parsed and "1d" not in parsed:
+                        regime = {"1d": parsed, "4h": parsed}
+                    else:
+                        regime = parsed
             except (json.JSONDecodeError, TypeError):
                 pass
             try:
                 reasons_raw = r.get("reasons_json")
                 if reasons_raw:
                     reasons = json.loads(reasons_raw)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            try:
-                risk_flags_raw = r.get("risk_flags_json")
-                if risk_flags_raw:
-                    risk_flags = json.loads(risk_flags_raw)
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -5872,13 +9874,6 @@ def api_recommendations(
             if not show_already_active and already_active:
                 continue
 
-            score_breakdown = {}
-            try:
-                sbd_raw = r.get("score_breakdown_json")
-                if sbd_raw:
-                    score_breakdown = json.loads(sbd_raw)
-            except (json.JSONDecodeError, TypeError):
-                pass
             if not score_breakdown:
                 try:
                     from explore_v2 import compute_score_breakdown, is_enabled as _ev2
@@ -5891,6 +9886,48 @@ def api_recommendations(
             # Scanner readiness enrichment (from cached setup if available)
             scanner_fields = _get_scanner_fields_for_item(sym, item_market, metrics)
 
+            # Confidence band from score
+            _cb = "NONE"
+            if score >= 82:
+                _cb = "HIGH"
+            elif score >= 70:
+                _cb = "MEDIUM"
+            elif score >= 62:
+                _cb = "LOW"
+
+            # Signal age in seconds
+            _created_ts = int(r.get("created_ts") or 0)
+            _signal_age_sec = now - _created_ts if _created_ts > 0 else None
+
+            # RSI and volume ratio from metrics
+            _rsi_val = metrics.get("rsi_value") or r.get("rsi_value")
+            _vol_ratio = metrics.get("volume_ratio") or r.get("volume_ratio")
+            _regime_label = (regime.get("1d") or {}).get("label") or metrics.get("regime") or ""
+            _entry_quality = r.get("entry_quality") or metrics.get("entry_quality") or "C"
+            _change_24h = r.get("change_24h") or metrics.get("change_24h")
+
+            # Global score cap: ensure no score > 95 ever reaches the frontend
+            score = max(0.0, min(95.0, score))
+
+            # Re-evaluate signal against FINAL adjusted score (after all penalties/bonuses).
+            # An item initially labeled "watch" from the raw DB score could have been penalized
+            # down to score=26 — that should become "wait" and be excluded, not shown as "watch".
+            _final_buy_thresh = _reco_buy_threshold_stocks() if item_market == "stocks" else _reco_buy_threshold_crypto()
+            _final_watch_thresh = _reco_watch_threshold()
+            if item_signal == "buy" and score < _final_buy_thresh:
+                item_signal = "watch"  # score fell below buy threshold after adjustments
+            if item_signal in ("buy", "watch") and score < _final_watch_thresh:
+                item_signal = "wait"  # score fell below watch threshold — exclude from explore
+            # Re-apply signal filter against corrected signal
+            if signal_filter == "buy" and item_signal != "buy":
+                continue
+            if signal_filter == "watch" and item_signal not in ("buy", "watch"):
+                continue
+            # Buy+Watch: hide stale session watches (>8h) — use signal=all to see them
+            if signal_filter == "watch" and item_signal == "watch":
+                if _signal_age_minutes is not None and _signal_age_minutes > 480:
+                    continue
+
             items.append(
                 {
                     "symbol": sym,
@@ -5900,21 +9937,26 @@ def api_recommendations(
                     "horizon": h,
                     "market_type": item_market,
                     "price": price,
-                    "change_pct": None,
-                    "volume": None,
+                    "change_pct": _change_pct,
+                    "volume": float(metrics.get("volume_24h_quote") or metrics.get("volume_24h") or 0) or None,
                     "market_cap": None,
                     "rating": rating,
                     "confidence": scanner_fields.get("confidence") or float(metrics.get("confidence_score") or 0.0),
+                    "confidence_band": _cb,
                     "sparkline": sparkline,
                     "regime_1d": (regime.get("1d") or {}).get("label"),
                     "regime_4h": (regime.get("4h") or {}).get("label"),
+                    "regime_label": _regime_label,
                     "weekly_trend": metrics.get("weekly_trend"),
-                    "strategy_mode": metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy") or "smart_dca",
-                    "suggested_strategy": _strategy_display_name(metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy")),
-                    "recommended_strategy": _strategy_display_name(metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy")),
+                    "strategy_mode": metrics.get("detected_strategy") or metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy") or "smart_dca",
+                    "suggested_strategy": metrics.get("detected_strategy") or _strategy_display_name(metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy")),
+                    "recommended_strategy": metrics.get("detected_strategy") or _strategy_display_name(metrics.get("strategy") or metrics.get("recommended_strategy") or metrics.get("suggested_strategy")),
                     "volatility": metrics.get("atr_pct"),
                     "risk_flags": risk_flags,
-                    "updated_ts": int(r.get("created_ts") or 0),
+                    "updated_ts": _created_ts,
+                    "signal_age_sec": _signal_age_sec,
+                    "rsi_value": float(_rsi_val) if _rsi_val is not None else None,
+                    "volume_ratio": float(_vol_ratio) if _vol_ratio is not None else None,
                     "eligible": eligible,
                     "research_only": research_only or (item_market == "stocks" and not _alpaca_any_ready()),
                     "reasons": reasons,
@@ -5935,6 +9977,29 @@ def api_recommendations(
                     "funding_rate_warning": (float(metrics.get("funding_rate") or 0) > 0.001) if item_market == "crypto" else None,
                     "earnings_warning": (isinstance(metrics.get("earnings_days"), (int, float)) and 0 <= metrics.get("earnings_days", 99) <= 5) if item_market == "stocks" else None,
                     "earnings_days": metrics.get("earnings_days"),
+                    "earnings_flag": metrics.get("earnings_flag"),
+                    "entry_quality": _entry_quality,
+                    "change_24h": float(_change_24h) if _change_24h is not None else None,
+                    "suggested_entry": _compute_suggested_entry(score_breakdown, price, item_signal),
+                    "fear_greed_adj": round(_fear_greed_adj, 1) if _fear_greed_adj != 0 else None,
+                    "btc_regime_adj": _btc_adj_applied if _btc_adj_applied != 0 else None,
+                    "sector": STOCK_SECTORS.get(sym.replace("/USD", "").upper(), "") if item_market == "stocks" else "",
+                    "volume_anomaly": bool(metrics.get("volume_anomaly")),
+                    "signal_age_minutes": round(_signal_age_minutes, 0) if _signal_age_minutes is not None else None,
+                    "score_breakdown_audit": _score_breakdown_audit,
+                    "composite_score": float(_db_composite) if _db_composite is not None else None,
+                    "confidence_score": float(_db_confidence) if _db_confidence is not None else None,
+                    "conviction_grade": _db_conviction or None,
+                    "factor_scores": _db_factor_scores or None,
+                    "hybrid_flags": _db_signal_flags or None,
+                    "strategy_reason": metrics.get("strategy_reason") or "",
+                    "strategy_win_rate": ((_strategy_perf.get(metrics.get("detected_strategy") or "") or {}).get("win_rate")),
+                    "strategy_signal_count": ((_strategy_perf.get(metrics.get("detected_strategy") or "") or {}).get("signals", 0)),
+                    "rsi_2": metrics.get("rsi_2"),
+                    "price_to_52wk_high": metrics.get("price_to_52wk_high"),
+                    "cardwell_regime": metrics.get("cardwell_regime"),
+                    "rsi2_entry_signal": metrics.get("rsi2_entry_signal"),
+                    "macd_combo_entry": metrics.get("macd_combo_entry"),
                     **scanner_fields,
                 }
             )
@@ -5942,8 +10007,13 @@ def api_recommendations(
         except Exception:
             continue
             
-    # Sort: eligible first, then by sort_key (score) descending for stability
-    items.sort(key=lambda x: (0 if x.get("eligible") else 1, -float(x.get("sort_key", x.get("score", 0)))), reverse=False)
+    # Sort (Problem 6): score desc, signal_age asc (fresher first), volume desc
+    items.sort(key=lambda x: (
+        0 if x.get("eligible") else 1,
+        -float(x.get("sort_key", x.get("score", 0))),
+        float(x.get("signal_age_minutes") or 999999),
+        -float(x.get("volume") or 0),
+    ))
 
     # Diversify top N by sector (stocks) / crypto so list isn't all one sector
     try:
@@ -5954,9 +10024,126 @@ def api_recommendations(
     except ImportError:
         pass
 
+    # Enrich crypto BUY signals with news sentiment (cached, non-blocking)
+    for item in items:
+        if item.get("signal") == "buy" and item.get("market_type") == "crypto":
+            try:
+                ns = _fetch_news_sentiment(item.get("symbol", ""))
+                item["news_sentiment"] = ns.get("sentiment", "Neutral")
+                item["news_score_adj"] = ns.get("score_adj", 0)
+                if ns.get("score_adj", 0) != 0:
+                    item["score"] = max(0, min(95, item["score"] + ns["score_adj"]))
+            except Exception:
+                item["news_sentiment"] = "Neutral"
+                item["news_score_adj"] = 0
+        else:
+            item["news_sentiment"] = None
+            item["news_score_adj"] = 0
+
+    # Apply sector momentum to stock items
+    _update_sector_momentum(items)
+    for item in items:
+        if item.get("market_type") == "stocks":
+            _sec = item.get("sector") or ""
+            _sm = _SECTOR_MOMENTUM.get(_sec)
+            if _sm:
+                item["sector_momentum"] = _sm
+                _tier = _sm.get("tier", "middle")
+                _sector_adj = 4.0 if _tier == "top" else (-4.0 if _tier == "bottom" else 0.0)
+                if _sector_adj != 0:
+                    item["score"] = max(0, min(95, item["score"] + _sector_adj))
+                    item["sector_score_adj"] = _sector_adj
+                    # Re-check buy threshold
+                    if _sector_adj < 0 and item.get("signal") == "buy" and item["score"] < 62:
+                        item["signal"] = "watch"
+                else:
+                    item["sector_score_adj"] = 0
+            else:
+                item["sector_momentum"] = None
+                item["sector_score_adj"] = 0
+            # Liquidity participation indicator
+            _vol_ratio = item.get("volume_ratio")
+            if _vol_ratio is not None:
+                item["volume_pct_avg"] = round(float(_vol_ratio) * 100, 0)
+                if float(_vol_ratio) < 0.30:
+                    if item.get("signal") == "buy":
+                        item["signal"] = "watch"
+                    item["low_volume_warning"] = True
+                else:
+                    item["low_volume_warning"] = False
+            else:
+                item["volume_pct_avg"] = None
+                item["low_volume_warning"] = False
+
+    # Relative strength boost — before feed filtering
+    # Assets outperforming BTC get a score lift so they reach the feed threshold
+    import re as _re2
+    for item in items:
+        _rs_boost_applied = 0.0
+        _rs_pct_found = None
+        for _rsn in (item.get("reasons") or []):
+            _rsn_str = str(_rsn).lower()
+            if "outperform" in _rsn_str and "btc" in _rsn_str:
+                try:
+                    _rsm = _re2.search(r'\+(\d+\.?\d*)%', str(_rsn))
+                    if _rsm:
+                        _rs_pct_found = float(_rsm.group(1))
+                        if _rs_pct_found >= 50:
+                            _rs_boost_applied = 15.0
+                        elif _rs_pct_found >= 30:
+                            _rs_boost_applied = 10.0
+                        elif _rs_pct_found >= 15:
+                            _rs_boost_applied = 5.0
+                except Exception:
+                    pass
+                break
+
+        if _rs_boost_applied > 0:
+            item["score"] = min(95, float(item.get("score") or 0)
+                                + _rs_boost_applied)
+            item["relative_strength_pct"] = _rs_pct_found
+            item["relative_strength_boost"] = _rs_boost_applied
+            _new_score = item["score"]
+            if item.get("signal") == "wait" and _new_score >= 48:
+                item["signal"] = "watch"
+            if item.get("signal") == "watch" and _new_score >= 65:
+                item["signal"] = "buy"
+
+    # Fallback reason text for items with empty strategy_reason
+    for item in items:
+        _has_reason = bool(item.get("strategy_reason"))
+        if not _has_reason and item.get("signal") in ("buy", "watch"):
+            _strat_id = item.get("strategy_mode") or ""
+            _sym = item.get("symbol", "")
+            _score = item.get("score", 0)
+            _24h = item.get("change_pct") or 0
+            _regime = item.get("regime_label", "")
+
+            if "oversold_bounce" in _strat_id:
+                item["strategy_reason"] = (
+                    f"Oversold bounce setup — RSI recovering from "
+                    f"oversold levels, down trend losing momentum. "
+                    f"24h: {float(_24h):+.1f}%, regime: {_regime}"
+                )
+            elif "trend_continuation" in _strat_id:
+                item["strategy_reason"] = (
+                    f"Trend continuation — strong uptrend with "
+                    f"pullback entry. 24h: {float(_24h):+.1f}%"
+                )
+            elif "momentum_breakout" in _strat_id:
+                item["strategy_reason"] = (
+                    f"Momentum breakout — price breaking above "
+                    f"resistance with volume. 24h: {float(_24h):+.1f}%"
+                )
+            elif not _strat_id:
+                item["strategy_reason"] = (
+                    f"Scanner signal — score {float(_score):.0f}, "
+                    f"24h: {float(_24h):+.1f}%, regime: {_regime}"
+                )
+
     # Apply pagination
     total_count = len(items)
-    paginated_items = items[offset:offset + limit]  # Apply offset and limit
+    paginated_items = items[offset:offset + limit]
     
     # If no items and include_all is set, try to return at least some data with lower threshold
     if len(items) == 0 and include_all:
@@ -5965,6 +10152,8 @@ def api_recommendations(
             try:
                 sym = str(r.get("symbol") or "")
                 if not sym:
+                    continue
+                if sym in explore_rejected_symbols:
                     continue
                 if "/" in sym and (sym.split("/")[0] or "").upper() in FIAT_BASES:
                     continue
@@ -6020,12 +10209,68 @@ def api_recommendations(
                 })
             except Exception:
                 continue
+        # Update consecutive buy tracker and apply conviction bonus
+        now_ts_conv = time.time()
+        seen_buy_syms = set()
+        for item in items:
+            sym_key = item.get("symbol", "").upper()
+            if item.get("signal") == "buy":
+                seen_buy_syms.add(sym_key)
+                tracker = _CONSECUTIVE_BUY_TRACKER.get(sym_key, {"count": 0, "last_scan_ts": 0})
+                if (now_ts_conv - tracker["last_scan_ts"]) < 7200:
+                    tracker["count"] = tracker["count"] + 1
+                else:
+                    tracker["count"] = 1
+                tracker["last_scan_ts"] = now_ts_conv
+                _CONSECUTIVE_BUY_TRACKER[sym_key] = tracker
+                consec = tracker["count"]
+                conv_bonus = 0
+                if consec >= 3:
+                    conv_bonus = 6
+                elif consec >= 2:
+                    conv_bonus = 3
+                if conv_bonus > 0:
+                    item["score"] = min(95, item["score"] + conv_bonus)
+                item["consecutive_buy_count"] = consec
+            else:
+                if sym_key in _CONSECUTIVE_BUY_TRACKER:
+                    _CONSECUTIVE_BUY_TRACKER[sym_key] = {"count": 0, "last_scan_ts": now_ts_conv}
+                item["consecutive_buy_count"] = 0
+        for sym_key in list(_CONSECUTIVE_BUY_TRACKER.keys()):
+            if sym_key not in seen_buy_syms and (now_ts_conv - _CONSECUTIVE_BUY_TRACKER[sym_key].get("last_scan_ts", 0)) > 7200:
+                del _CONSECUTIVE_BUY_TRACKER[sym_key]
+
         items.sort(key=lambda x: x["score"], reverse=True)
         items = items[:limit]
         total_count = len(items)
         paginated_items = items[offset:offset + limit]
-    
-    return _json({
+
+    _feed_fallback_used = False
+    if not paginated_items:
+        try:
+            feed_items = _get_explore_feed_items(
+                horizon=h, limit=limit, signal_filter=signal_filter, market_type=market_type,
+            )
+            if not feed_items and signal_filter == "buy":
+                feed_items = _get_explore_feed_items(
+                    horizon=h, limit=limit, signal_filter="all", market_type=market_type,
+                )
+            if not feed_items and market_type != "all":
+                feed_items = _get_explore_feed_items(
+                    horizon=h, limit=limit, signal_filter="all", market_type="all",
+                )
+            if feed_items:
+                paginated_items = feed_items[offset:offset + limit]
+                total_count = len(feed_items)
+                _feed_fallback_used = True
+                status = "ready"
+                reason = "explore_feed_fallback"
+                message = "Showing explore feed signals (recommendation scan pending)"
+                logger.info("recommendations fallback: returning %d items from explore_feed", len(paginated_items))
+        except Exception as _fb_err:
+            logger.debug("recommendations feed fallback error: %s", _fb_err)
+
+    _result = {
         "ok": status == "ready",
         "status": status,
         "reason": reason,
@@ -6041,7 +10286,20 @@ def api_recommendations(
         "last_scan_by_horizon": last_scan_by_horizon,
         "macro_risk_off": macro_risk_off,
         "top30_whitelist_active": RECO_CRYPTO_TOP_30_ONLY and market_type in ("crypto", "all"),
-    })
+        "cache_ts": int(time.time()),
+        "fear_greed": {"value": _FEAR_GREED_CACHE.get("value", 50), "label": _FEAR_GREED_CACHE.get("label", "Neutral")},
+        "btc_regime": _btc_regime_label if _btc_regime_label else None,
+        "btc_inter_market_adj": _btc_inter_market_adj if _btc_inter_market_adj != 0 else None,
+        "sector_momentum": _SECTOR_MOMENTUM if _SECTOR_MOMENTUM else None,
+        "explore_rejected": explore_rejected_payload,
+        "source": "explore_feed_fallback" if _feed_fallback_used else "recommendations",
+        "data_source": "explore_feed_fallback" if _feed_fallback_used else reco_data_source,
+    }
+    _RECO_RESULT_CACHE[_cache_key] = (time.time(), _result)
+    if len(_RECO_RESULT_CACHE) > 50:
+        oldest_key = min(_RECO_RESULT_CACHE, key=lambda k: _RECO_RESULT_CACHE[k][0])
+        _RECO_RESULT_CACHE.pop(oldest_key, None)
+    return _json(_result)
 
 
 @app.post("/api/recommendations/calibrate")
@@ -6180,6 +10438,42 @@ def api_ml_signal_scorer_retrain():
         return _json({"status": "error", "message": str(e)}, 500)
 
 
+@app.get("/api/ml/ensemble")
+def api_ml_ensemble(symbol: str = "TRX/USD", timeframe: str = "1h"):
+    """Ensemble signal scorer: combined ML + regime + tech + volume + pattern + momentum + screener."""
+    try:
+        from signal_ensemble import get_ensemble_report, get_weight_diagnostics
+        bm_ref = globals().get("bm")
+        candles_1h, candles_4h, candles_1d = [], [], []
+        if bm_ref and hasattr(bm_ref, "kc"):
+            try:
+                candles_1h = bm_ref.kc.fetch_ohlcv(symbol, "1h", limit=200) or []
+            except Exception:
+                pass
+            try:
+                candles_4h = bm_ref.kc.fetch_ohlcv(symbol, "4h", limit=100) or []
+            except Exception:
+                pass
+            try:
+                candles_1d = bm_ref.kc.fetch_ohlcv(symbol, "1d", limit=50) or []
+            except Exception:
+                pass
+        regime = "RANGE"
+        try:
+            from strategies import detect_regime
+            if candles_1h:
+                rr = detect_regime(candles_1h, candles_4h or candles_1h, candles_1d or candles_1h)
+                regime = str(rr.regime.value if hasattr(rr.regime, "value") else rr.regime)
+        except Exception:
+            pass
+        report = get_ensemble_report(candles_1h, regime=regime, candles_4h=candles_4h,
+                                     candles_1d=candles_1d, symbol=symbol)
+        return _json(report)
+    except Exception as e:
+        logger.exception("Ensemble API error: %s", e)
+        return _json({"error": str(e)}, 500)
+
+
 @app.get("/api/portfolio/capital")
 def api_portfolio_capital():
     """Portfolio-level capital management: total, reserve, allocation, heat map, CAGR, leverage."""
@@ -6262,6 +10556,85 @@ def api_execution_quality(days: int = 30):
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+@app.get("/explore/fear-greed")
+def explore_fear_greed():
+    """Return current Fear & Greed index value."""
+    fg = _FEAR_GREED_CACHE
+    return _json({"ok": True, "value": fg.get("value", 50), "label": fg.get("label", "Neutral"), "score_adj": _fear_greed_score_adjustment(), "updated_ts": int(fg.get("ts", 0)), "error": fg.get("error")})
+
+
+@app.get("/explore/signal_audit")
+def explore_signal_audit(symbol: str = "", grade: str = "", limit: int = 50, days: int = 7):
+    """Query hybrid screener signal audit trail."""
+    try:
+        from db import list_signal_audits
+        since_ts = int(time.time()) - (int(days) * 86400)
+        audits = list_signal_audits(
+            symbol=symbol.strip(),
+            conviction_grade=grade.strip().upper() if grade else "",
+            limit=min(200, int(limit)),
+            since_ts=since_ts,
+        )
+        for a in audits:
+            for json_key in ("factor_scores_json", "gate_results_json",
+                             "technical_signals_json", "metadata_json", "flags_json"):
+                raw = a.get(json_key)
+                if raw:
+                    try:
+                        a[json_key.replace("_json", "")] = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        return _json({"ok": True, "audits": audits, "count": len(audits)})
+    except Exception as e:
+        logger.exception("Signal audit query failed: %s", e)
+        return _json({"ok": False, "error": str(e)}, 500)
+
+
+@app.get("/explore/accuracy")
+def explore_accuracy(days: int = 30):
+    """Explore page accuracy stats: signal-level 24h/72h win rates + bot-based.
+
+    Wraps the DB calls so that transient SQLite lock contention surfaces as a
+    clean 503 (which the UI handles as "Accuracy data temporarily unavailable")
+    instead of a 500 with stack trace.
+    """
+    try:
+        from db import get_recommendation_performance_stats, get_signal_accuracy_stats
+        bot_stats = get_recommendation_performance_stats(days=int(max(7, min(365, days))))
+        sig_stats = get_signal_accuracy_stats(days=int(max(7, min(365, days))))
+        return _json({
+            "ok": True,
+            "total_signals": bot_stats["total_closed"],
+            "wins": bot_stats["wins"],
+            "losses": bot_stats["losses"],
+            "win_rate_pct": round(bot_stats["win_rate"], 1),
+            "by_score_range": bot_stats.get("by_score_range", []),
+            "enough_data": bot_stats["total_closed"] >= 10 or sig_stats["total_tracked"] >= 10,
+            "signal_accuracy": sig_stats,
+        })
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "locked" in msg or "busy" in msg:
+            logger.warning("/explore/accuracy: DB locked, returning 503: %s", exc)
+            return _json({"ok": False, "error": "database busy", "transient": True}, 503)
+        logger.exception("/explore/accuracy: DB error")
+        return _json({"ok": False, "error": str(exc)}, 503)
+    except Exception as exc:
+        logger.exception("/explore/accuracy failed")
+        return _json({"ok": False, "error": str(exc), "transient": True}, 503)
+
+
+@app.get("/explore/accuracy/symbols")
+def explore_accuracy_symbols(symbols: str = "", days: int = 90):
+    """Per-symbol win rates for explore cards."""
+    from db import get_per_symbol_accuracy
+    sym_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else []
+    if not sym_list:
+        return _json({"ok": True, "symbols": {}})
+    result = get_per_symbol_accuracy(sym_list[:100], days=int(max(7, min(365, days))))
+    return _json({"ok": True, "symbols": result})
+
+
 @app.get("/api/recommendations/performance")
 def api_recommendations_performance(days: int = 30):
     """Return recommendation accuracy metrics: win rate, avg profit, performance by score range, regime, and alpha by strategy."""
@@ -6301,7 +10674,12 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
         return _json({"ok": False, "error": "No recommendation found"}, 404)
     
     metrics = json.loads(row.get("metrics_json") or "{}")
-    regime = json.loads(row.get("regime_json") or "{}")
+    _regime_raw = json.loads(row.get("regime_json") or "{}")
+    # Normalize flat format {"label": "X"} → nested {"1d": {"label": "X"}, "4h": {"label": "X"}}
+    if isinstance(_regime_raw, dict) and "label" in _regime_raw and "1d" not in _regime_raw:
+        regime = {"1d": _regime_raw, "4h": _regime_raw}
+    else:
+        regime = _regime_raw
     reasons = json.loads(row.get("reasons_json") or "[]")
     risk_flags = json.loads(row.get("risk_flags_json") or "[]")
     
@@ -6322,11 +10700,26 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
             ticker = _ticker_cached(sym, ttl_sec=120) or {}
     
     score = float(row.get("score") or 0.0)
-    if score >= 75: rating = "Strong Buy"
+    _d_conv = row.get("conviction_grade") or metrics.get("conviction_grade")
+    if _d_conv == "A": rating = "Strong Buy"
+    elif _d_conv == "B": rating = "Buy"
+    elif _d_conv == "C": rating = "Watch"
+    elif _d_conv == "D": rating = "Avoid"
+    elif score >= 85: rating = "Strong Buy"
     elif score >= 55: rating = "Buy"
     elif score >= 40: rating = "Watch"
     else: rating = "Avoid"
-    
+
+    _d_factor_scores = {}
+    try:
+        _fs = row.get("factor_scores_json")
+        if _fs:
+            _d_factor_scores = json.loads(_fs)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if not _d_factor_scores:
+        _d_factor_scores = metrics.get("factor_scores") or {}
+
     return _json({
         "ok": True,
         "item": {
@@ -6338,7 +10731,11 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
             "change_pct": float(ticker.get("percentage") or 0.0),
             "volume": float(ticker.get("quoteVolume") or 0.0),
             "rating": rating,
-            "confidence": float(metrics.get("confidence_score") or 0.0),
+            "confidence": float(row.get("confidence_score") or metrics.get("confidence_score") or 0.0),
+            "composite_score": float(row.get("composite_score") or metrics.get("composite_score") or 0.0),
+            "confidence_score": float(row.get("confidence_score") or metrics.get("confidence_score") or 0.0),
+            "conviction_grade": _d_conv,
+            "factor_scores": _d_factor_scores,
             "regime_1d": (regime.get("1d") or {}).get("label"),
             "regime_4h": (regime.get("4h") or {}).get("label"),
             "weekly_trend": metrics.get("weekly_trend"),
@@ -6354,6 +10751,11 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
             "benchmark_vs": metrics.get("benchmark_vs") or None,
             "peer_rank": metrics.get("peer_rank") or None,
             "beta": metrics.get("beta"),
+            "rsi_2": metrics.get("rsi_2"),
+            "price_to_52wk_high": metrics.get("price_to_52wk_high"),
+            "rsi2_entry_signal": metrics.get("rsi2_entry_signal"),
+            "macd_combo_entry": metrics.get("macd_combo_entry"),
+            "hybrid_flags": metrics.get("hybrid_flags") or [],
         }
     })
 
@@ -6536,7 +10938,7 @@ async def api_recommendation_create_bot(symbol: str, request: Request):
     name = str(payload.get("name") or f"Reco {symbol} {horizon.upper()}")
     enabled = int(bool(payload.get("enabled", False)))
     dry_run = int(bool(payload.get("dry_run", True)))
-    auto_restart = int(bool(payload.get("auto_restart", False)))
+    auto_restart = int(bool(payload.get("auto_restart", True)))
     start_now = bool(payload.get("start_now", False))
 
     sym_resolved = str(row.get("symbol") or symbol)
@@ -6610,26 +11012,64 @@ async def api_recommendation_create_bot(symbol: str, request: Request):
 
 @app.post("/api/recommendations/scan")
 def api_recommendations_scan(horizon: str = "short"):
-    """Trigger a manual scan of recommendations. Returns immediately, scan runs in background."""
+    """Trigger a manual scan. Supports horizon=all for sequential multi-horizon."""
     import threading
     _h = str(horizon).lower().strip()
-    h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
+    logger.warning("[SCAN-DEBUG] scan requested for horizon=%s", _h)
+
+    if _h == "all":
+        horizon_list = ["short", "medium", "long"]
+    else:
+        horizon_list = ["long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")]
+
+    if not _RECO_SCAN_SEM.acquire(blocking=False):
+        return _json({"ok": False, "error": "Scan already in progress"}, status_code=409)
+
+    global _RECO_SCAN_ACTIVE
+    with _RECO_SCAN_ACTIVE_LOCK:
+        _RECO_SCAN_ACTIVE = True
 
     def _scan_async():
+        global _RECO_SCAN_ACTIVE
         try:
-            n = delete_recommendations_for_blocklist(list(CRYPTO_BLOCKLIST))
-            if n > 0:
-                logger.info("Purged %d blocklisted recommendation(s) before scan", n)
-            logger.info(f"Starting recommendation scan for {h} horizon")
-            _scan_recommendations(h)
-            with _globals_lock:
-                state = (_RECO_STATE.get(h) or {}).copy()
-            logger.info(f"Scan completed: {state.get('scanned', 0)} scanned, {state.get('eligible', 0)} eligible")
-        except Exception as e:
-            logger.error(f"Background scan failed: {e}", exc_info=True)
-    
+            for h in horizon_list:
+                try:
+                    n = delete_recommendations_for_blocklist(list(CRYPTO_BLOCKLIST))
+                    if n > 0:
+                        logger.warning("Purged %d blocklisted recommendation(s) before %s scan", n, h)
+                    logger.warning("[SCAN-DEBUG] starting %s horizon scan (manual/rescan)", h)
+                    _scan_recommendations_impl(h)
+                    with _globals_lock:
+                        state = (_RECO_STATE.get(h) or {}).copy()
+                    logger.warning(
+                        "[SCAN-DEBUG] %s horizon finished: scanned=%d eligible=%d",
+                        h, state.get("scanned", 0), state.get("eligible", 0),
+                    )
+                except BaseException as e:
+                    logger.error("[SCAN] %s scan failed: %s", h, e, exc_info=True)
+                    with _globals_lock:
+                        _RECO_STATE[h] = {
+                            "last_run_ts": int(time.time()), "error": str(e)[:200],
+                            "scanned": 0, "eligible": 0, "total": 0, "scanning": False,
+                        }
+                    if not isinstance(e, Exception):
+                        raise  # re-raise KeyboardInterrupt / SystemExit
+                time.sleep(2.0)
+            # After any scan, refresh backtests for scanned horizons in background
+            if horizon_list:
+                _bt_horizons = tuple(horizon_list)
+                threading.Thread(
+                    target=_run_missing_backtests,
+                    kwargs={"horizons": _bt_horizons, "force": True},
+                    daemon=True, name="postscan_backtest",
+                ).start()
+        finally:
+            with _RECO_SCAN_ACTIVE_LOCK:
+                _RECO_SCAN_ACTIVE = False
+            _RECO_SCAN_SEM.release()
+
     threading.Thread(target=_scan_async, daemon=True).start()
-    return _json({"ok": True, "message": f"Scan triggered for {h} horizon"})
+    return _json({"ok": True, "message": f"Scan triggered for {', '.join(horizon_list)} horizon(s)"})
 
 
 def _try_init_bot_manager() -> bool:
@@ -6688,6 +11128,28 @@ def api_bot_start(bot_id: int):
     return _json({"ok": True, "message": msg, "snap": snap})
 
 
+@app.post("/api/bots/{bot_id}/clear_risk_flag")
+def api_bot_clear_risk_flag(bot_id: int, request: Request):
+    """Clear a CRITICAL risk flag after user acknowledgment."""
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    if bm is None:
+        return _json({"ok": False, "error": "Worker not initialized"}, 503)
+    snap = bm.snapshot(int(bot_id))
+    if not snap or snap.get("risk_level") != "CRITICAL":
+        return _json({"ok": True, "message": "No CRITICAL risk flag to clear"})
+    runner = bm._bots.get(int(bot_id))
+    if runner:
+        with runner._lock:
+            runner.state.risk_state = None
+            runner.state.risk_level = "OK"
+            runner.state.risk_reason = None
+            runner.state.risk_since_ts = 0
+        logger.info("Risk flag cleared for bot %d by user", bot_id)
+    return _json({"ok": True, "message": "Risk flag cleared — bot will resume on next cycle"})
+
+
 @app.post("/api/bots/{bot_id}/stop")
 def api_bot_stop(bot_id: int):
     b = get_bot(int(bot_id))
@@ -6702,6 +11164,216 @@ def api_bot_stop(bot_id: int):
     return _json({"ok": True, "message": msg, "snap": snap})
 
 
+@app.get("/api/validate-keys")
+def api_validate_keys():
+    """Pre-live key validation. Calls fetch_balance() on Kraken (and Alpaca if
+    configured) so the UI can confirm the API keys are not just *present* but
+    actually authorised against the exchange.
+
+    Returns:
+        ok=True if at least one configured exchange returned a non-empty balance.
+        per-exchange: status (ok|error|not_configured), error message, sample
+                      balances (asset -> total) for the top 5 by total value.
+    """
+    out: Dict[str, Any] = {"ok": False, "checked_at": int(time.time()), "exchanges": {}}
+
+    # --- Kraken ---
+    if os.getenv("KRAKEN_API_KEY") and os.getenv("KRAKEN_API_SECRET"):
+        kr_info: Dict[str, Any] = {"configured": True}
+        if kc is None:
+            kr_info.update({"status": "error", "error": "KrakenClient not initialised. Check .env keys + restart."})
+        else:
+            try:
+                bal = kc.fetch_balance() or {}
+                totals = (bal.get("total") or {}) if isinstance(bal, dict) else {}
+                # Filter out zero balances; sort by amount descending; take top 5.
+                non_zero = {k: float(v) for k, v in totals.items()
+                            if v not in (None, 0) and isinstance(v, (int, float))}
+                top = dict(sorted(non_zero.items(), key=lambda kv: -kv[1])[:5])
+                kr_info.update({
+                    "status": "ok",
+                    "asset_count": len(non_zero),
+                    "top_balances": top,
+                })
+                out["ok"] = True
+            except Exception as e:
+                kr_info.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
+        out["exchanges"]["kraken"] = kr_info
+    else:
+        out["exchanges"]["kraken"] = {"configured": False, "status": "not_configured"}
+
+    # --- Alpaca paper ---
+    if os.getenv("ALPACA_API_KEY_PAPER") and os.getenv("ALPACA_API_SECRET_PAPER"):
+        ap_info: Dict[str, Any] = {"configured": True}
+        if alpaca_paper is None:
+            ap_info.update({"status": "error", "error": "AlpacaClient (paper) not initialised."})
+        else:
+            try:
+                acct = alpaca_paper.get_account() if hasattr(alpaca_paper, "get_account") else {}
+                if isinstance(acct, dict) and (acct.get("buying_power") is not None or acct.get("cash") is not None):
+                    ap_info.update({
+                        "status": "ok",
+                        "buying_power": float(acct.get("buying_power", 0) or 0),
+                        "cash": float(acct.get("cash", 0) or 0),
+                        "equity": float(acct.get("equity", 0) or 0),
+                    })
+                    out["ok"] = True
+                else:
+                    ap_info.update({"status": "error", "error": "Empty account response"})
+            except Exception as e:
+                ap_info.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
+        out["exchanges"]["alpaca_paper"] = ap_info
+    else:
+        out["exchanges"]["alpaca_paper"] = {"configured": False, "status": "not_configured"}
+
+    # --- Alpaca live ---
+    if os.getenv("ALPACA_API_KEY_LIVE") and os.getenv("ALPACA_API_SECRET_LIVE"):
+        al_info: Dict[str, Any] = {"configured": True}
+        if alpaca_live is None:
+            al_info.update({"status": "error", "error": "AlpacaClient (live) not initialised."})
+        else:
+            try:
+                acct = alpaca_live.get_account() if hasattr(alpaca_live, "get_account") else {}
+                if isinstance(acct, dict) and (acct.get("buying_power") is not None or acct.get("cash") is not None):
+                    al_info.update({
+                        "status": "ok",
+                        "buying_power": float(acct.get("buying_power", 0) or 0),
+                        "cash": float(acct.get("cash", 0) or 0),
+                        "equity": float(acct.get("equity", 0) or 0),
+                    })
+                    out["ok"] = True
+                else:
+                    al_info.update({"status": "error", "error": "Empty account response"})
+            except Exception as e:
+                al_info.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
+        out["exchanges"]["alpaca_live"] = al_info
+    else:
+        out["exchanges"]["alpaca_live"] = {"configured": False, "status": "not_configured"}
+
+    return _json(out)
+
+
+@app.post("/api/bots/{bot_id}/test-order")
+async def api_bot_test_order(bot_id: int, request: Request):
+    """Place a tiny limit order well below market and immediately cancel it.
+
+    This proves the full order-placement path works end-to-end without risking
+    an actual fill. The order is placed at 50 % below the current ask (limit
+    buy) so it cannot fill on a normal book; we then cancel it within seconds.
+
+    Body params (optional): {"quote_amount": 5.0, "symbol": "<override>"}
+    """
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    if bool(b.get("dry_run", 1)):
+        return _json({"ok": False, "error": "Bot is in dry-run mode; switch to live first."}, 400)
+    if not ALLOW_LIVE_TRADING:
+        return _json({"ok": False, "error": "Live trading disabled. Set ALLOW_LIVE_TRADING=1 in .env."}, 403)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    quote_amount = float(payload.get("quote_amount", 5.0) or 5.0)
+    sym_override = str(payload.get("symbol") or "").strip()
+
+    client, is_kraken = _get_bot_client(b)
+    if not client:
+        return _json({"ok": False, "error": "Trading client not available"}, 503)
+    if is_kraken and not _kraken_ready():
+        return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+
+    symbol = _resolve_symbol(sym_override or b.get("symbol", ""))
+    placed: Optional[Dict[str, Any]] = None
+    cancelled: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+    try:
+        tk = client.fetch_ticker(symbol) if hasattr(client, "fetch_ticker") else {}
+        last = float(tk.get("last") or tk.get("close") or 0)
+        bid = float(tk.get("bid") or 0)
+        if last <= 0 and bid <= 0:
+            return _json({"ok": False, "error": f"No reference price for {symbol}"}, 503)
+        ref = last or bid
+        # 50% below market — well outside the book, so it will rest unfilled.
+        limit_price = round(ref * 0.5, 8)
+        base_amount = max(quote_amount / max(ref, 1e-9), 0.0)
+        if base_amount <= 0:
+            return _json({"ok": False, "error": "computed zero base amount"}, 400)
+
+        if hasattr(client, "create_limit_buy_base"):
+            placed = client.create_limit_buy_base(symbol, float(base_amount), float(limit_price))
+        elif hasattr(client, "create_order"):
+            placed = client.create_order(symbol, "limit", "buy", float(base_amount), float(limit_price))
+        else:
+            return _json({"ok": False, "error": "Client does not support limit buy"}, 501)
+
+        order_id = str((placed or {}).get("id") or "")
+        # Brief pause then cancel — confirms cancel path also works.
+        time.sleep(1.0)
+        if order_id:
+            try:
+                cancelled = client.cancel_order(order_id, symbol)
+            except Exception as ce:
+                error = f"cancel failed: {type(ce).__name__}: {ce}"
+        else:
+            error = "no order id in placement response"
+
+        return _json({
+            "ok": error is None,
+            "symbol": symbol,
+            "ref_price": ref,
+            "limit_price": limit_price,
+            "base_amount": base_amount,
+            "quote_amount": quote_amount,
+            "placed": placed,
+            "cancelled": bool(cancelled is not None and not error),
+            "cancel_response": cancelled,
+            "error": error,
+        })
+    except Exception as e:
+        logger.exception("test-order failed bot=%s symbol=%s", bot_id, symbol)
+        return _json({
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "symbol": symbol,
+            "placed": placed,
+        }, 500)
+
+
+@app.post("/api/bots/{bot_id}/reset-error")
+def api_bot_reset_error(bot_id: int):
+    """Unstick a bot wedged on a fatal error (e.g. "database is locked").
+
+    Clears `last_event`, resets `last_tick_ts`, drops a BLOCKED/ERROR risk
+    flag, and re-spawns the runner thread if it died but the bot is still
+    enabled. No-op if the bot is healthy.
+    """
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+    if bm is None:
+        if not _try_init_bot_manager():
+            return _json({"ok": False, "error": "Worker not initialized."}, 503)
+    try:
+        result = bm.reset_error(int(bot_id))
+    except Exception as e:
+        logger.exception("reset-error failed for bot %s", bot_id)
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+    try:
+        add_log(int(bot_id), "INFO",
+                f"reset-error invoked: actions={result.get('actions')}", "SYSTEM")
+    except Exception:
+        pass
+    snap = {}
+    try:
+        snap = bm.snapshot(int(bot_id))
+    except Exception:
+        pass
+    return _json({**result, "snap": snap})
+
+
 # NOTE: _get_bot_client is defined once at line ~1410 with full AlpacaAdapter support
 
 
@@ -6710,15 +11382,23 @@ def api_bot_orders(bot_id: int):
     b = get_bot(int(bot_id))
     if not b:
         return _json({"ok": False, "error": "Bot not found"}, 404)
-        
+
+    # Bug 9: in dry run there are no real exchange orders to fetch. Return a
+    # success response with an empty orders list and a `dry_run` flag so the UI
+    # can render an informational box instead of an error toast.
+    if bool(b.get("dry_run", 1)):
+        return _json({
+            "ok": True,
+            "dry_run": True,
+            "orders": [],
+            "message": "This bot is running in dry-run mode. No real exchange orders are placed.",
+        })
+
     client, is_kraken = _get_bot_client(b)
     if not client:
          return _json({"ok": False, "error": "Trading client not available", "orders": []}, 503)
     if is_kraken and not _kraken_ready():
         return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready", "orders": []}, 503)
-        
-    if bool(b.get("dry_run", 1)):
-        return _json({"ok": False, "error": "Manual orders are disabled in dry run mode.", "orders": []}, 400)
 
     symbol = _resolve_symbol(b.get("symbol", ""))
     
@@ -6893,6 +11573,182 @@ async def api_bot_close_position(bot_id: int):
     except Exception as e:
         logger.exception("close_position failed bot_id=%s: %s", bot_id, e)
         return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
+# Bug 10: Manual close-deal endpoint. Works in dry run (simulated market sell at
+# the last tick price) and in live mode (sells the position). Records the deal
+# as CLOSED so the Journal / Analytics / Strategy stats start accumulating.
+@app.post("/api/bots/{bot_id}/deals/{deal_id}/close")
+async def api_bot_deal_close(bot_id: int, deal_id: int, request: Request):
+    b = get_bot(int(bot_id))
+    if not b:
+        return _json({"ok": False, "error": "Bot not found"}, 404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    requested_price = body.get("exit_price") if isinstance(body, dict) else None
+    note = (body.get("note") if isinstance(body, dict) else None) or ""
+
+    target_deal: Optional[Dict[str, Any]] = None
+    try:
+        target_deal = get_deal(int(deal_id), full=True)
+    except TypeError:
+        try:
+            target_deal = get_deal(int(deal_id))
+        except Exception:
+            target_deal = None
+    except Exception:
+        target_deal = None
+    if target_deal and int(target_deal.get("bot_id") or 0) != int(bot_id):
+        return _json({"ok": False, "error": f"Deal {deal_id} does not belong to bot {bot_id}"}, 400)
+
+    if not target_deal:
+        return _json({"ok": False, "error": f"Deal {deal_id} not found for bot {bot_id}"}, 404)
+
+    deal_state = str(target_deal.get("state") or "").upper()
+    if deal_state in ("CLOSED", "CANCELLED"):
+        return _json({"ok": False, "error": f"Deal {deal_id} already {deal_state}"}, 400)
+
+    snap: Dict[str, Any] = {}
+    try:
+        snap = bm.snapshot(int(bot_id)) if bm else {}
+    except Exception:
+        snap = {}
+
+    base_amount = float(target_deal.get("base_amount") or snap.get("base_pos") or 0.0)
+    entry_avg = float(target_deal.get("entry_avg") or snap.get("avg_entry") or 0.0)
+    if base_amount <= 0 or entry_avg <= 0:
+        return _json({
+            "ok": False,
+            "error": f"Cannot close deal {deal_id}: missing entry data (base_amount={base_amount}, entry_avg={entry_avg}).",
+        }, 400)
+
+    is_dry_run = bool(b.get("dry_run", 1))
+
+    # Determine exit price.
+    exit_price: Optional[float] = None
+    try:
+        if requested_price is not None and float(requested_price) > 0:
+            exit_price = float(requested_price)
+    except (TypeError, ValueError):
+        exit_price = None
+    if exit_price is None:
+        try:
+            lp = snap.get("last_price")
+            if lp is not None and float(lp) > 0:
+                exit_price = float(lp)
+        except Exception:
+            exit_price = None
+    if exit_price is None:
+        # Fall back to fetching a fresh ticker.
+        try:
+            client_pair = _get_bot_client(b)
+            if client_pair and client_pair[0] is not None:
+                _client = client_pair[0]
+                _sym = _resolve_symbol(b.get("symbol", ""))
+                tick = _client.fetch_ticker(_sym) if hasattr(_client, "fetch_ticker") else {}
+                if isinstance(tick, dict):
+                    for k in ("last", "close"):
+                        if tick.get(k) is not None:
+                            exit_price = float(tick.get(k))
+                            break
+        except Exception:
+            exit_price = None
+    if exit_price is None or exit_price <= 0:
+        return _json({"ok": False, "error": "No reference price available to close the deal."}, 400)
+
+    realized_pnl = (exit_price - entry_avg) * base_amount
+    realized_pnl_pct = ((exit_price - entry_avg) / entry_avg) * 100.0 if entry_avg > 0 else 0.0
+    hold_sec = int(time.time()) - int(target_deal.get("opened_at") or int(time.time()))
+
+    # In live mode, place the actual market sell first.
+    live_order: Optional[Dict[str, Any]] = None
+    if not is_dry_run:
+        if not ALLOW_LIVE_TRADING:
+            return _json({"ok": False, "error": "Live trading disabled. Set ALLOW_LIVE_TRADING=1 in .env."}, 403)
+        block = _check_trading_allowed(bot_id=int(bot_id))
+        if block:
+            return _json(block, 503)
+        try:
+            client, is_kraken = _get_bot_client(b)
+            if not client:
+                return _json({"ok": False, "error": "Trading client not available"}, 503)
+            if is_kraken and not _kraken_ready():
+                return _json({"ok": False, "error": KRAKEN_ERROR or "Kraken not ready"}, 503)
+            symbol = _resolve_symbol(b.get("symbol", ""))
+            live_order = client.create_market_sell_base(symbol, base_amount)
+        except Exception as e:
+            logger.exception("close_deal live order failed bot=%s deal=%s: %s", bot_id, deal_id, e)
+            return _json({"ok": False, "error": f"Live close failed: {type(e).__name__}: {e}"}, 500)
+
+    journal_note = note or ("Manual dry-run close at $%.4f" % exit_price if is_dry_run else "Manual live close")
+    try:
+        if bm:
+            result = bm.manual_close_open_deal(
+                int(bot_id),
+                int(deal_id),
+                entry_avg=float(entry_avg),
+                exit_avg=float(exit_price),
+                base_amount=float(base_amount),
+                realized_pnl_quote=float(realized_pnl),
+                entry_strategy=target_deal.get("entry_strategy"),
+                exit_strategy="manual_close" + ("_dry" if is_dry_run else ""),
+                hold_sec=int(hold_sec),
+                safety_count=int(target_deal.get("safety_count") or 0),
+                journal_exit_reason=journal_note,
+                entry_regime=target_deal.get("entry_regime"),
+                exit_regime=target_deal.get("exit_regime"),
+                mae=target_deal.get("mae"),
+                mfe=target_deal.get("mfe"),
+            )
+        else:
+            from db import manual_close_deal_and_journal as _mc
+
+            result = _mc(
+                int(deal_id),
+                int(bot_id),
+                float(entry_avg),
+                float(exit_price),
+                float(base_amount),
+                float(realized_pnl),
+                entry_strategy=target_deal.get("entry_strategy"),
+                exit_strategy="manual_close" + ("_dry" if is_dry_run else ""),
+                hold_sec=int(hold_sec),
+                safety_count=int(target_deal.get("safety_count") or 0),
+                journal_exit_reason=journal_note,
+                entry_regime=target_deal.get("entry_regime"),
+                exit_regime=target_deal.get("exit_regime"),
+                mae=target_deal.get("mae"),
+                mfe=target_deal.get("mfe"),
+            )
+    except ValueError as e:
+        return _json({"ok": False, "error": str(e)}, 400)
+    except Exception as e:
+        logger.exception("manual_close_open_deal failed bot=%s deal=%s: %s", bot_id, deal_id, e)
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+    add_log(
+        int(bot_id), "INFO",
+        f"Manual close deal #{deal_id} @ ${exit_price:.4f} — pnl={realized_pnl:+.2f} ({realized_pnl_pct:+.2f}%)",
+        "ORDER",
+    )
+
+    rp_pct = float(result.get("realized_pnl_pct", realized_pnl_pct))
+    return _json({
+        "ok": True,
+        "deal_id": int(deal_id),
+        "exit_price": float(exit_price),
+        "entry_avg": float(entry_avg),
+        "base_amount": float(base_amount),
+        "realized_pnl_quote": float(realized_pnl),
+        "realized_pnl": float(realized_pnl),
+        "realized_pnl_pct": rp_pct,
+        "hold_sec": int(hold_sec),
+        "dry_run": bool(is_dry_run),
+        "live_order": live_order,
+    })
 
 
 @app.delete("/api/bots/{bot_id}/orders/{order_id}")
@@ -7477,14 +12333,18 @@ def api_analytics_summary(days: int = 90):
     best_trade = [d for d in closed if float(d.get("realized_pnl_quote") or 0) == best_pnl]
     worst_trade = [d for d in closed if float(d.get("realized_pnl_quote") or 0) == worst_pnl]
 
-    # Streaks
+    # Streaks (count from most recent trade backward)
     win_streak = 0
     loss_streak = 0
     for p in reversed(pnls):
         if p > 0:
+            if loss_streak > 0:
+                break
             win_streak += 1
         elif p < 0:
-            loss_streak = 0
+            if win_streak > 0:
+                break
+            loss_streak += 1
         else:
             break
 
@@ -7814,11 +12674,15 @@ def _scan_stock_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Di
         from benchmark_analyzer import enrich_recommendation_with_benchmark
         from stock_metadata import get_sector
         if candles_1d and len(candles_1d) >= 30:
-            benchmark_candles = None
-            try:
-                benchmark_candles = client.get_ohlcv("SPY", "1d", 200)
-            except Exception:
-                pass
+            _bench_ttl = float(os.getenv("SCAN_BENCHMARK_CACHE_TTL_SEC", "120"))
+
+            def _fetch_spy_only():
+                try:
+                    return client.get_ohlcv("SPY", "1d", 200)
+                except Exception:
+                    return []
+
+            benchmark_candles = _benchmark_ohlcv_cached("SPY_1d_200", _bench_ttl, _fetch_spy_only)
             price = float(candles_1d[-1][4]) if candles_1d else 0.0
             enriched = enrich_recommendation_with_benchmark(
                 symbol, price, candles_1d=candles_1d, benchmark_candles=benchmark_candles, sector=get_sector(symbol)
@@ -7836,6 +12700,10 @@ def _scan_stock_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Di
                 res.setdefault("reasons", []).append(enriched["benchmark_vs"])
     except Exception as e:
         logger.debug("Benchmark enrichment failed for stock %s: %s", symbol, e)
+    try:
+        res["_candles_1d"] = [list(x) for x in (candles_1d or [])]
+    except Exception:
+        res["_candles_1d"] = []
     return res
 
 
@@ -7858,8 +12726,9 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
     universe += ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "NFLX", "INTC", "QCOM", "CRM", "ADBE", "AVGO", "TXN"]
     # Financials
     universe += ["JPM", "BAC", "V", "MA", "WFC", "GS", "MS", "BLK", "C", "AXP"]
-    # ETFs
-    universe += ["SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "GLD", "SLV", "TQQQ", "SQQQ", "SOXL", "ARKK"]
+    # ETFs (benchmark-only — scanned for data, not emitted as BUY signals)
+    _BENCHMARK_ONLY = {"SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "GLD", "SLV", "TQQQ", "SQQQ", "SOXL", "ARKK"}
+    universe += list(_BENCHMARK_ONLY)
     # Crypto proxies
     universe += ["COIN", "MSTR", "MARA", "RIOT", "CLSK", "HUT", "BITF", "HOOD"]
     # Retail / Meme / High Vol
@@ -7878,10 +12747,12 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
             all_assets = client.get_active_assets()
             # Filter somewhat for quality (e.g. marginable usually implies better liquidity/status)
             candidates = [
-                a["symbol"] for a in all_assets 
-                if a.get("symbol") not in universe 
+                a["symbol"] for a in all_assets
+                if a.get("symbol") not in universe
                 and a.get("marginable") # simplistic quality filter
-                and "." not in a.get("symbol") # avoid weird warrants/classes often
+                and "." not in a.get("symbol", "") # avoid weird warrants/classes
+                and "-" not in a.get("symbol", "") # BRK-B style tickers break Yahoo Finance
+                and len(a.get("symbol", "")) <= 5  # skip long symbols (ETNs, leveraged, etc.)
             ]
             
             needed = limit - len(universe)
@@ -7921,6 +12792,11 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
     except Exception as e:
         logger.debug("SPY regime check failed: %s", e)
 
+    try:
+        mark_explore_signals_pending(horizon, now_ts())
+    except Exception as _msp:
+        logger.warning("mark_explore_signals_pending (scan_stocks): %s", _msp)
+
     # Batch processing to avoid rate limits
     chunk_size = 50
     for i in range(0, min(len(universe), int(limit)), chunk_size):
@@ -7950,16 +12826,31 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
                     if price < 5.0 or vol < 500000: # Min $5 price, $500k volume
                         continue
 
+                # Benchmark-only: scan for data but cap score so they never appear as BUY
+                _is_benchmark = sym in _BENCHMARK_ONLY
                 res = _scan_stock_symbol(sym, horizon, spy_ctx)
                 
-                # Check eligibility
-                # We save ALL valid scans so user sees "Weak" stocks too, 
-                # but we can flag them.
+                if _is_benchmark and res.get("score") is not None:
+                    res["score"] = min(float(res.get("score", 0)), 30.0)
+                    res.setdefault("risk_flags", []).append("BENCHMARK_ONLY")
+                
                 if res.get("score") is not None:
-                     metrics = res.get("metrics") or {}
-                     metrics["market_type"] = "stocks" # TAG AS STOCKS
-                     
-                     save_recommendation_snapshot(
+                     metrics = dict(res.get("metrics") or {})
+                     metrics["market_type"] = "stocks"  # TAG AS STOCKS
+                     if res.get("change_24h") is not None:
+                         metrics["change_24h"] = res["change_24h"]
+                     # Persist top-level recommendation fields into metrics_json
+                     # so tiebreaker sorting works at API serve time.
+                     for _persist_key in ("entry_quality", "rsi_value", "volume_ratio",
+                                          "confidence_band", "volume_anomaly"):
+                         _val = res.get(_persist_key)
+                         if _val is not None:
+                             metrics[_persist_key] = _val
+                     res["metrics"] = metrics
+                     _merge_evaluate_signal_into_snap(res, horizon, spy_ctx)
+                     metrics = dict(res.get("metrics") or {})
+                     _c1d_st = res.get("_candles_1d") or []
+                     _sid_st = save_recommendation_snapshot(
                         symbol=sym,
                         horizon=horizon,
                         score=float(res.get("score") or 0.0),
@@ -7968,13 +12859,20 @@ def api_recommendations_scan_stocks(horizon: str = "short", limit: int = 150):
                         reasons_json=json.dumps(res.get("reasons") or []),
                         risk_flags_json=json.dumps(res.get("risk_flags") or []),
                         score_breakdown_json=res.get("score_breakdown_json") or json.dumps(res.get("score_breakdown") or {}),
+                        composite_score=None,
+                        confidence_score=None,
+                        conviction_grade=None,
+                        factor_scores_json="",
+                        signal_flags_json="",
                     )
+                     _persist_explore_feed_from_snap(sym, horizon, res, _c1d_st, spy_ctx)
                      processed += 1
                      results.append(res)
             except Exception:
                 errors += 1
                 continue
                 
+    _RECO_RESULT_CACHE.clear()  # Force fresh scoring on next Explore load
     return _json({
         "ok": True, 
         "message": f"Scanned {processed} stocks",
@@ -8068,8 +12966,33 @@ def _autopilot_loop() -> None:
             )
             logger.info("autopilot cycle complete: created=%s closed=%s skipped=%s",
                         res.get("created", 0), res.get("closed", 0), len(res.get("skipped", [])))
+
+            # Stale detection: alert if heartbeat >24h or capital mismatch >20%
+            try:
+                _hb_ts = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0)
+                _hb_age = now - _hb_ts if _hb_ts > 0 else None
+                _cfg_capital = float(cfg.get("total_capital", 0))
+                _actual = _get_portfolio_fn()
+                _stale_msgs = []
+                if _hb_age is not None and _hb_age > 86400:
+                    _stale_msgs.append(f"Heartbeat is {_hb_age / 86400:.1f}d old")
+                if _cfg_capital > 0 and _actual > 0 and abs(_cfg_capital - _actual) / _cfg_capital > 0.20:
+                    _stale_msgs.append(f"Capital mismatch: cfg ${_cfg_capital:.0f} vs actual ${_actual:.0f}")
+                if _stale_msgs and notify_fn:
+                    notify_fn(
+                        "autopilot_stale",
+                        f"Autopilot stale warning: {'; '.join(_stale_msgs)}. Review and re-configure if needed.",
+                        level="warning",
+                    )
+                    logger.warning("Autopilot stale: %s", "; ".join(_stale_msgs))
+            except Exception:
+                pass
+
         except Exception as e:
             logger.exception("autopilot loop error: %s", e)
+
+
+_AUTOPILOT_STALE_ALERTED = False  # one-shot flag to avoid spam
 
 
 @app.get("/api/autopilot/activity")
@@ -8174,17 +13097,40 @@ def api_autopilot_status():
     last_run_ts = int(_autopilot_last_run)
     if last_run_ts <= 0 and last_heartbeat > 0:
         last_run_ts = last_heartbeat
+    # Stale detection: heartbeat >24h or capital mismatch >20%
+    stale_warnings = []
+    is_stale = False
+    _heartbeat_age_sec = int(now - last_heartbeat) if last_heartbeat > 0 else None
+    if last_heartbeat > 0 and _heartbeat_age_sec > 86400:
+        is_stale = True
+        _stale_days = _heartbeat_age_sec / 86400
+        stale_warnings.append(f"Autopilot heartbeat is {_stale_days:.1f} days old (>24h)")
+
+    config_capital = float(cfg.get("total_capital", 0))
+    if config_capital > 0 and portfolio_value > 0:
+        _capital_pct_diff = abs(config_capital - portfolio_value) / config_capital * 100
+        if _capital_pct_diff > 20:
+            is_stale = True
+            stale_warnings.append(
+                f"Capital mismatch: configured ${config_capital:.0f} vs actual ${portfolio_value:.0f} ({_capital_pct_diff:.0f}% off)"
+            )
+
     return _json({
         "ok": True,
         "enabled": enabled,
         "config": cfg,
+        "total_capital": float(cfg.get("total_capital", 0)),
+        "capital_per_bot": float(cfg.get("capital_per_bot", 0)),
+        "max_positions": int(cfg.get("max_positions") or 6),
         "last_run_ts": last_run_ts,
         "next_scan_in_sec": next_sec,
         "last_autopilot_heartbeat_ts": last_heartbeat if last_heartbeat else None,
+        "heartbeat_age_sec": _heartbeat_age_sec,
         "portfolio_value": portfolio_value,
         "active_positions": active_positions,
-        "max_positions": int(cfg.get("max_positions") or 6),
         "total_pnl": total_pnl,
+        "is_stale": is_stale,
+        "stale_warnings": stale_warnings,
     })
 
 
@@ -8655,13 +13601,12 @@ def api_scanner_status():
     
     # Default scan interval (15 minutes for short horizon)
     scan_intervals = {
-        "short": 15 * 60,    # 15 minutes
-        "medium": 30 * 60,   # 30 minutes
-        "long": 60 * 60,     # 60 minutes
+        "short": RECO_SHORT_EVERY_SEC,   # 1800s (30 min)
+        "medium": RECO_MEDIUM_EVERY_SEC, # 3600s (60 min)
+        "long": RECO_LONG_EVERY_SEC,     # 7200s (120 min)
     }
     
-    # Use shortest interval as default
-    interval_sec = scan_intervals.get("short", 900)
+    interval_sec = scan_intervals.get("short", 1800)
     
     # Calculate next scan time
     next_scan_ts = last_scan_ts + interval_sec if last_scan_ts > 0 else now_t + interval_sec
@@ -8909,9 +13854,19 @@ async def api_backtest_run(request: Request):
 
     body = await request.json() or {}
     symbol = str(body.get("symbol", "BTC/USD")).strip()
-    strategy = str(body.get("strategy", "dca")).strip().lower()
+    # Accept strategy_mode as alias for strategy
+    strategy = str(body.get("strategy") or body.get("strategy_mode") or "dca").strip().lower()
     days = int(body.get("days", 90))
     params = dict(body.get("params", {}))
+
+    # Normalize param aliases from bot config format → backtest engine format
+    # hard_sl_pct (fraction) → sl_pct (percentage)
+    if "hard_sl_pct" in params and "sl_pct" not in params:
+        params["sl_pct"] = float(params.pop("hard_sl_pct"))
+    # tp (fraction like 0.015) → tp_pct (percentage like 1.5)
+    if "tp" in params and "tp_pct" not in params:
+        tp_raw = float(params.pop("tp"))
+        params["tp_pct"] = tp_raw * 100.0 if tp_raw < 1.0 else tp_raw
 
     if not symbol:
         return _json({"ok": False, "error": "symbol required"}, 400)
@@ -8928,10 +13883,10 @@ async def api_backtest_run(request: Request):
         if not candles_raw:
             return _json({"ok": False, "error": f"No candles fetched for {symbol}"}, 400)
 
-        # Convert to dict format
+        # Convert to dict format (c[0] is ms from CCXT; backtest_engine expects seconds)
         candles = [
             {
-                "time": int(c[0]),
+                "time": int(c[0]) // 1000,
                 "open": float(c[1]),
                 "high": float(c[2]),
                 "low": float(c[3]),
@@ -8982,7 +13937,7 @@ async def api_backtest_optimize(request: Request):
 
         candles = [
             {
-                "time": int(c[0]),
+                "time": int(c[0]) // 1000,
                 "open": float(c[1]),
                 "high": float(c[2]),
                 "low": float(c[3]),
@@ -9071,7 +14026,7 @@ async def api_backtest_walk_forward(request: Request):
 
     body = await request.json() or {}
     symbol = str(body.get("symbol", "BTC/USD")).strip()
-    strategy = str(body.get("strategy", "dca")).strip().lower()
+    strategy = str(body.get("strategy") or body.get("strategy_mode") or "dca").strip().lower()
     days = int(body.get("days", 90))
     initial_capital = float(body.get("initial_capital", 10000.0))
     n_windows = int(body.get("n_windows", 5))
@@ -9094,7 +14049,7 @@ async def api_backtest_walk_forward(request: Request):
 
         candles = [
             {
-                "time": int(c[0]),
+                "time": int(c[0]) // 1000,
                 "open": float(c[1]),
                 "high": float(c[2]),
                 "low": float(c[3]),
@@ -9125,7 +14080,7 @@ async def api_backtest_walk_forward(request: Request):
         return _json({"ok": False, "error": str(e)}, 500)
 
 
-@app.get("/api/patterns/{symbol}")
+@app.get("/api/patterns/{symbol:path}")
 async def get_patterns(symbol: str, timeframe: str = "1h", sensitivity: float = 1.0):
     """Detect candlestick patterns for a symbol."""
     if not _kraken_ready():
@@ -9150,7 +14105,7 @@ async def get_patterns(symbol: str, timeframe: str = "1h", sensitivity: float = 
         return _json({"ok": False, "error": str(e)}, 500)
 
 
-@app.get("/api/anomalies/{symbol}")
+@app.get("/api/anomalies/{symbol:path}")
 async def get_anomalies(symbol: str, timeframe: str = "1h"):
     """Detect market anomalies for a symbol."""
     if not _kraken_ready():
