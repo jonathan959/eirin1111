@@ -1720,28 +1720,41 @@ def _normalize_message(msg: str) -> str:
 
 
 def add_log(bot_id: int, level: str, message: str, category: str = "SYSTEM") -> None:
-    con = _conn()
+    """Append a bot log row, dedup-collapsing consecutive duplicates.
+
+    Migrated to write_txn(bot_id, ...) in Phase 1.2b: per-bot RLock + 5-retry
+    backoff means concurrent ticks no longer blow up with
+    OperationalError('database is locked'). The dedup SELECT and the
+    INSERT/UPDATE now run inside a single transaction so two parallel
+    ticks can't both INSERT a row that should have collapsed.
+    """
     norm = _normalize_message(message)
-    row = con.execute(
-        "SELECT id, level, category, message, count FROM bot_logs WHERE bot_id=? ORDER BY id DESC LIMIT 1",
-        (int(bot_id),),
-    ).fetchone()
-    if row:
-        last_norm = _normalize_message(row["message"])
-        if str(row["level"]) == str(level) and str(row["category"]) == str(category) and last_norm == norm:
-            con.execute(
-                "UPDATE bot_logs SET ts=?, count=? WHERE id=?",
-                (now_ts(), int(row["count"] or 1) + 1, int(row["id"])),
-            )
-            con.commit()
-            con.close()
-            return
-    con.execute(
-        "INSERT INTO bot_logs(bot_id, ts, level, category, message, count) VALUES (?,?,?,?,?,?)",
-        (int(bot_id), now_ts(), str(level), str(category), str(message), 1),
-    )
-    con.commit()
-    con.close()
+
+    def _do(con) -> None:
+        row = con.execute(
+            "SELECT id, level, category, message, count FROM bot_logs "
+            "WHERE bot_id=? ORDER BY id DESC LIMIT 1",
+            (int(bot_id),),
+        ).fetchone()
+        if row:
+            last_norm = _normalize_message(row["message"])
+            if (
+                str(row["level"]) == str(level)
+                and str(row["category"]) == str(category)
+                and last_norm == norm
+            ):
+                con.execute(
+                    "UPDATE bot_logs SET ts=?, count=? WHERE id=?",
+                    (now_ts(), int(row["count"] or 1) + 1, int(row["id"])),
+                )
+                return
+        con.execute(
+            "INSERT INTO bot_logs(bot_id, ts, level, category, message, count) "
+            "VALUES (?,?,?,?,?,?)",
+            (int(bot_id), now_ts(), str(level), str(category), str(message), 1),
+        )
+
+    write_txn(int(bot_id), _do, name="add_log")
 
 
 def list_logs(bot_id: int, limit: int = 200) -> List[Dict[str, Any]]:
