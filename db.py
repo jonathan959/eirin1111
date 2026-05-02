@@ -1985,12 +1985,17 @@ def patch_bot_risk_after_create(
     stop_loss_pct: Optional[float] = None,
     max_hold_hours: Optional[int] = None,
 ) -> None:
-    """Update risk columns not included in INSERT INTO bots (create_bot)."""
+    """Update risk columns not included in INSERT INTO bots (create_bot).
+
+    Phase 1.2c step 2: routed through write_txn(bot_id, ...). Called
+    immediately after create_bot so contention is unlikely, but
+    consistency matters more than perf here.
+    """
     if stop_loss_pct is None and max_hold_hours is None:
         return
     bid = int(bot_id)
-    con = _conn()
-    try:
+
+    def _do(con) -> None:
         if stop_loss_pct is not None and max_hold_hours is not None:
             con.execute(
                 "UPDATE bots SET stop_loss_pct=?, max_hold_hours=? WHERE id=?",
@@ -2006,116 +2011,95 @@ def patch_bot_risk_after_create(
                 "UPDATE bots SET max_hold_hours=? WHERE id=?",
                 (int(max_hold_hours or 0), bid),
             )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(bid, _do, name="patch_bot_risk_after_create")
 
 
 def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
-    con = _conn()
-    con.execute(
-        """
-        UPDATE bots SET
-            name=?,
-            symbol=?,
-            enabled=?,
-            dry_run=?,
-            base_quote=?,
-            safety_quote=?,
-            max_safety=?,
-            first_dev=?,
-            step_mult=?,
-            tp=?,
-            hard_sl_pct=?,
-            trend_filter=?,
-            trend_sma=?,
-            max_spend_quote=?,
-            poll_seconds=?,
-            strategy_mode=?,
-            forced_strategy=?,
-            max_open_orders=?,
-            vol_gap_mult=?,
-            tp_vol_mult=?,
-            min_gap_pct=?,
-            max_gap_pct=?,
-            regime_hold_candles=?,
-            regime_switch_ticks=?,
-            regime_switch_threshold=?,
-            max_total_exposure_pct=?,
-            per_symbol_exposure_pct=?,
-            min_free_cash_pct=?,
-            max_concurrent_deals=?,
-            spread_guard_pct=?,
-            limit_timeout_sec=?,
-            daily_loss_limit_pct=?,
-            pause_hours=?,
-            auto_restart=?,
-            market_type=?,
-            alpaca_mode=?,
-            max_drawdown_pct=?,
-            trading_mode=?,
-            intended_hold_days=?,
-            conviction_level=?,
-            auto_dip_buy=?,
-            fundamental_exit_only=?,
-            rebalance_enabled=?,
-            grid_lower=?,
-            grid_upper=?,
-            grid_levels=?
-        WHERE id=?
-        """,
-        (
-            str(data["name"]),
-            str(data["symbol"]),
-            int(data.get("enabled", 0)),
-            int(data.get("dry_run", 1)),
-            float(data["base_quote"]),
-            float(data["safety_quote"]),
-            int(data["max_safety"]),
-            float(data["first_dev"]),
-            float(data["step_mult"]),
-            float(data["tp"]),
-            float(data.get("hard_sl_pct", 0.0)),
-            int(data.get("trend_filter", 0)),
-            int(data.get("trend_sma", 200)),
-            float(data["max_spend_quote"]),
-            int(data.get("poll_seconds", 10)),
-            str(data.get("strategy_mode", "classic")),
-            str(data.get("forced_strategy", "")),
-            int(data.get("max_open_orders", 6)),
-            float(data.get("vol_gap_mult", 1.0)),
-            float(data.get("tp_vol_mult", 1.0)),
-            float(data.get("min_gap_pct", 0.003)),
-            float(data.get("max_gap_pct", 0.06)),
-            int(data.get("regime_hold_candles", 2)),
-            int(data.get("regime_switch_ticks", 2)),
-            float(data.get("regime_switch_threshold", 0.6)),
-            float(data.get("max_total_exposure_pct", 0.50)),
-            float(data.get("per_symbol_exposure_pct", 0.15)),
-            float(data.get("min_free_cash_pct", 0.1)),
-            int(data.get("max_concurrent_deals", 6)),
-            float(data.get("spread_guard_pct", 0.003)),
-            int(data.get("limit_timeout_sec", 8)),
-            float(data.get("daily_loss_limit_pct", 0.06)),
-            int(data.get("pause_hours", 6)),
-            int(data.get("auto_restart", 1)),
-            str(data.get("market_type", "crypto")),
-            str(data.get("alpaca_mode", "paper")),
-            float(data.get("max_drawdown_pct", 0.0)),
-            str(data.get("trading_mode", "swing_trade")),
-            int(data.get("intended_hold_days", 14)),
-            int(data.get("conviction_level", 5)),
-            int(data.get("auto_dip_buy", 0)),
-            int(data.get("fundamental_exit_only", 0)),
-            int(data.get("rebalance_enabled", 0)),
-            float(data.get("grid_lower", 0.0)),
-            float(data.get("grid_upper", 0.0)),
-            int(data.get("grid_levels", 10)),
-            int(bot_id),
-        ),
+    """Update an existing bot row.
+
+    Phase 1.2c step 2: routed through write_txn(bot_id, ...). The
+    bot-edit POST in worker_api.py calls this; if the runner thread is
+    mid-write, the per-bot RLock now serialises (was race #3 in the
+    Phase 1.1 lock-loop diagnosis).
+    """
+    bid = int(bot_id)
+
+    params = (
+        str(data["name"]),
+        str(data["symbol"]),
+        int(data.get("enabled", 0)),
+        int(data.get("dry_run", 1)),
+        float(data["base_quote"]),
+        float(data["safety_quote"]),
+        int(data["max_safety"]),
+        float(data["first_dev"]),
+        float(data["step_mult"]),
+        float(data["tp"]),
+        float(data.get("hard_sl_pct", 0.0)),
+        int(data.get("trend_filter", 0)),
+        int(data.get("trend_sma", 200)),
+        float(data["max_spend_quote"]),
+        int(data.get("poll_seconds", 10)),
+        str(data.get("strategy_mode", "classic")),
+        str(data.get("forced_strategy", "")),
+        int(data.get("max_open_orders", 6)),
+        float(data.get("vol_gap_mult", 1.0)),
+        float(data.get("tp_vol_mult", 1.0)),
+        float(data.get("min_gap_pct", 0.003)),
+        float(data.get("max_gap_pct", 0.06)),
+        int(data.get("regime_hold_candles", 2)),
+        int(data.get("regime_switch_ticks", 2)),
+        float(data.get("regime_switch_threshold", 0.6)),
+        float(data.get("max_total_exposure_pct", 0.50)),
+        float(data.get("per_symbol_exposure_pct", 0.15)),
+        float(data.get("min_free_cash_pct", 0.1)),
+        int(data.get("max_concurrent_deals", 6)),
+        float(data.get("spread_guard_pct", 0.003)),
+        int(data.get("limit_timeout_sec", 8)),
+        float(data.get("daily_loss_limit_pct", 0.06)),
+        int(data.get("pause_hours", 6)),
+        int(data.get("auto_restart", 1)),
+        str(data.get("market_type", "crypto")),
+        str(data.get("alpaca_mode", "paper")),
+        float(data.get("max_drawdown_pct", 0.0)),
+        str(data.get("trading_mode", "swing_trade")),
+        int(data.get("intended_hold_days", 14)),
+        int(data.get("conviction_level", 5)),
+        int(data.get("auto_dip_buy", 0)),
+        int(data.get("fundamental_exit_only", 0)),
+        int(data.get("rebalance_enabled", 0)),
+        float(data.get("grid_lower", 0.0)),
+        float(data.get("grid_upper", 0.0)),
+        int(data.get("grid_levels", 10)),
+        bid,
     )
-    con.commit()
-    con.close()
+
+    def _do(con) -> None:
+        con.execute(
+            """
+            UPDATE bots SET
+                name=?, symbol=?, enabled=?, dry_run=?, base_quote=?,
+                safety_quote=?, max_safety=?, first_dev=?, step_mult=?, tp=?,
+                hard_sl_pct=?, trend_filter=?, trend_sma=?, max_spend_quote=?,
+                poll_seconds=?, strategy_mode=?, forced_strategy=?,
+                max_open_orders=?, vol_gap_mult=?, tp_vol_mult=?,
+                min_gap_pct=?, max_gap_pct=?, regime_hold_candles=?,
+                regime_switch_ticks=?, regime_switch_threshold=?,
+                max_total_exposure_pct=?, per_symbol_exposure_pct=?,
+                min_free_cash_pct=?, max_concurrent_deals=?,
+                spread_guard_pct=?, limit_timeout_sec=?,
+                daily_loss_limit_pct=?, pause_hours=?, auto_restart=?,
+                market_type=?, alpaca_mode=?, max_drawdown_pct=?,
+                trading_mode=?, intended_hold_days=?, conviction_level=?,
+                auto_dip_buy=?, fundamental_exit_only=?, rebalance_enabled=?,
+                grid_lower=?, grid_upper=?, grid_levels=?
+            WHERE id=?
+            """,
+            params,
+        )
+
+    write_txn(bid, _do, name="update_bot")
 
 
 def update_bots_by_type(bot_type: str, enabled: int) -> int:
@@ -2133,12 +2117,18 @@ def update_bots_by_type(bot_type: str, enabled: int) -> int:
 
 
 def delete_bot(bot_id: int) -> None:
-    """Delete bot and all related rows. Child tables first, then bots."""
-    import logging
-    logger = logging.getLogger(__name__)
+    """Delete bot and all related rows. Child tables first, then bots.
+
+    Phase 1.2c step 2: routed through write_txn(bot_id, ...) so all
+    cascaded DELETEs commit atomically. Without this, a crash between
+    child-table DELETEs and the bots-row DELETE could leave orphan rows
+    referencing a missing bot.
+    """
+    import logging as _delete_bot_logging
+    _del_logger = _delete_bot_logging.getLogger(__name__)
     bid = int(bot_id)
-    con = _conn()
-    try:
+
+    def _do(con) -> None:
         allowed_pairs = [
             ("order_events", "bot_id"),
             ("strategy_decisions", "bot_id"),
@@ -2154,33 +2144,38 @@ def delete_bot(bot_id: int) -> None:
                     con.execute(f"DELETE FROM {table} WHERE {col}=?", (bid,))
                 except sqlite3.OperationalError as e:
                     if "no such table" in str(e).lower():
-                        logger.debug("delete_bot: skip %s (no such table)", table)
+                        _del_logger.debug("delete_bot: skip %s (no such table)", table)
                     else:
                         raise
         con.execute("DELETE FROM bots WHERE id=?", (bid,))
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(bid, _do, name="delete_bot")
 
 
 def set_bot_enabled(bot_id: int, enabled: bool) -> None:
-    con = _conn()
-    con.execute(
-        "UPDATE bots SET enabled=? WHERE id=?",
-        (1 if enabled else 0, int(bot_id)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...)."""
+    bid = int(bot_id)
+    val = 1 if enabled else 0
+
+    def _do(con) -> None:
+        con.execute("UPDATE bots SET enabled=? WHERE id=?", (val, bid))
+
+    write_txn(bid, _do, name="set_bot_enabled")
 
 
 def set_bot_running(bot_id: int, running: bool) -> None:
-    con = _conn()
-    con.execute(
-        "UPDATE bots SET last_running=? WHERE id=?",
-        (1 if running else 0, int(bot_id)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...).
+
+    last_running is updated by the runner loop on every supervisor
+    transition; serialising via per-bot RLock prevents the same
+    SQLITE_BUSY race that hit add_log."""
+    bid = int(bot_id)
+    val = 1 if running else 0
+
+    def _do(con) -> None:
+        con.execute("UPDATE bots SET last_running=? WHERE id=?", (val, bid))
+
+    write_txn(bid, _do, name="set_bot_running")
 
 
 def get_bot(bot_id: int) -> Optional[Dict[str, Any]]:
@@ -2523,13 +2518,23 @@ def manual_close_deal_and_journal(
     mfe: Optional[float] = None,
     entry_avg_estimated: bool = False,
 ) -> Dict[str, Any]:
+    """Manual close from API: closes the deal, journals the exit reason,
+    records trade_feedback for ML, and updates recommendation_performance —
+    all atomically.
+
+    Phase 1.2c step 2: routed through write_txn(bot_id, ...). Previously
+    used _make_real_conn() + a single commit because the per-thread
+    _conn() cache was unsafe under contention; write_txn now acquires
+    the per-bot RLock and gives us atomic commit/rollback + retry on
+    SQLITE_BUSY for free. ValueError raised inside the body propagates
+    out of write_txn (after rollback) so the API caller can convert it
+    to a 4xx exactly as before.
     """
-    Manual close from API: one dedicated SQLite connection + single commit so we do not
-    race the per-thread _conn() cache used elsewhere. Caller must serialize with BotManager.bot_db_lock.
-    """
-    con = _make_real_conn()
-    try:
-        row = con.execute("SELECT * FROM deals WHERE id=?", (int(deal_id),)).fetchone()
+    bid = int(bot_id)
+    did = int(deal_id)
+
+    def _do(con):
+        row = con.execute("SELECT * FROM deals WHERE id=?", (did,)).fetchone()
         if not row:
             raise ValueError("Deal not found")
         drow = dict(row)
@@ -2606,12 +2611,10 @@ def manual_close_deal_and_journal(
             ),
         )
         if int(cur.rowcount or 0) == 0:
-            # Lost the race — another writer closed it first. Roll back so
-            # we do not double-write the trade_journal / trade_feedback below.
-            try:
-                con.rollback()
-            except Exception:
-                pass
+            # Lost the race — another writer closed it first. Raising
+            # propagates out of write_txn, which rolls back the
+            # transaction so we do not double-write the trade_journal /
+            # trade_feedback below.
             raise ValueError(f"Deal {deal_id} not open or not found")
 
         jr = con.execute("SELECT * FROM trade_journal WHERE deal_id=?", (int(deal_id),)).fetchone()
@@ -2661,9 +2664,15 @@ def manual_close_deal_and_journal(
                     closed_ts, opened_ts,
                 )
             except Exception:
-                pass
+                # Recommendation-performance update is best-effort; a
+                # failure here must NOT abort the deal close. Logged at
+                # exception level rather than swallowed so the operator
+                # can see persistent failures.
+                logger.exception(
+                    "manual_close_deal_and_journal: _record_recommendation_outcome failed (deal=%d)",
+                    int(deal_id),
+                )
 
-        con.commit()
         rp = float(realized_pnl_quote)
         rp_pct = ((float(exit_avg) - float(entry_avg)) / float(entry_avg)) * 100.0 if entry_avg and float(entry_avg) > 0 else 0.0
         return {
@@ -2674,17 +2683,8 @@ def manual_close_deal_and_journal(
             "realized_pnl_pct": float(rp_pct),
             "closed_at": closed_ts,
         }
-    except Exception:
-        try:
-            con.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+
+    return write_txn(bid, _do, name="manual_close_deal_and_journal")
 
 
 def _safe_float_db(val: Any, default: float = 0.0) -> float:
@@ -3428,13 +3428,18 @@ def pnl_summary(since_ts: int) -> Dict[str, Any]:
 # Strategy/regime persistence
 # =========================================================
 def add_regime_snapshot(bot_id: int, symbol: str, regime: str, confidence: float, why: str, snapshot: str) -> None:
-    con = _conn()
-    con.execute(
-        "INSERT INTO regime_snapshots(bot_id, ts, symbol, regime, confidence, why, snapshot) VALUES (?,?,?,?,?,?,?)",
-        (int(bot_id), now_ts(), str(symbol), str(regime), float(confidence), str(why), str(snapshot)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...). Per-bot
+    regime updates collide with the bot's own writes; this serialises."""
+    bid = int(bot_id)
+    params = (bid, now_ts(), str(symbol), str(regime), float(confidence), str(why), str(snapshot))
+
+    def _do(con) -> None:
+        con.execute(
+            "INSERT INTO regime_snapshots(bot_id, ts, symbol, regime, confidence, why, snapshot) VALUES (?,?,?,?,?,?,?)",
+            params,
+        )
+
+    write_txn(bid, _do, name="add_regime_snapshot")
 
 
 def get_latest_regime_for_symbols(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -3468,16 +3473,20 @@ def get_latest_regime_for_symbols(symbols: List[str]) -> Dict[str, Dict[str, Any
 
 
 def add_strategy_decision(bot_id: int, strategy: str, action: str, reason: str, regime: str, confidence: float, payload: str) -> None:
-    con = _conn()
-    con.execute(
-        """
-        INSERT INTO strategy_decisions(bot_id, ts, strategy, action, reason, regime, confidence, payload)
-        VALUES (?,?,?,?,?,?,?,?)
-        """,
-        (int(bot_id), now_ts(), str(strategy), str(action), str(reason), str(regime), float(confidence), str(payload)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...)."""
+    bid = int(bot_id)
+    params = (bid, now_ts(), str(strategy), str(action), str(reason), str(regime), float(confidence), str(payload))
+
+    def _do(con) -> None:
+        con.execute(
+            """
+            INSERT INTO strategy_decisions(bot_id, ts, strategy, action, reason, regime, confidence, payload)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            params,
+        )
+
+    write_txn(bid, _do, name="add_strategy_decision")
 
 
 def add_strategy_trade(
@@ -3489,13 +3498,20 @@ def add_strategy_trade(
     pnl_pct: Optional[float] = None,
     ts: Optional[int] = None,
 ) -> None:
-    con = _conn()
-    con.execute(
-        "INSERT INTO strategy_perf_trades(bot_id, symbol, regime, strategy, pnl, pnl_pct, ts) VALUES (?,?,?,?,?,?,?)",
-        (int(bot_id), str(symbol or ""), str(regime or ""), str(strategy), float(pnl), float(pnl_pct) if pnl_pct is not None else None, int(ts or now_ts())),
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...)."""
+    bid = int(bot_id)
+    params = (
+        bid, str(symbol or ""), str(regime or ""), str(strategy), float(pnl),
+        float(pnl_pct) if pnl_pct is not None else None, int(ts or now_ts()),
     )
-    con.commit()
-    con.close()
+
+    def _do(con) -> None:
+        con.execute(
+            "INSERT INTO strategy_perf_trades(bot_id, symbol, regime, strategy, pnl, pnl_pct, ts) VALUES (?,?,?,?,?,?,?)",
+            params,
+        )
+
+    write_txn(bid, _do, name="add_strategy_trade")
 
 
 def get_strategy_perf(bot_id: int, strategy: str, window: int = 30) -> Dict[str, Any]:
@@ -3809,13 +3825,17 @@ def add_order_event(
 
 
 def save_perf_metrics(bot_id: int, strategy: str, payload: str) -> None:
-    con = _conn()
-    con.execute(
-        "INSERT INTO perf_metrics(bot_id, ts, strategy, payload) VALUES (?,?,?,?)",
-        (int(bot_id), now_ts(), str(strategy), str(payload)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 2: routed through write_txn(bot_id, ...)."""
+    bid = int(bot_id)
+    params = (bid, now_ts(), str(strategy), str(payload))
+
+    def _do(con) -> None:
+        con.execute(
+            "INSERT INTO perf_metrics(bot_id, ts, strategy, payload) VALUES (?,?,?,?)",
+            params,
+        )
+
+    write_txn(bid, _do, name="save_perf_metrics")
 
 
 def save_backtest_run(symbol: str, strategy: str, params: str, metrics: str, equity: str) -> None:
@@ -4626,9 +4646,25 @@ def link_recommendation_to_bot(
     reasons_json: str = "",
     snapshot_id: Optional[int] = None,
 ) -> None:
-    """Record that a bot was created from a recommendation. Creates recommendation_performance row with outcome='active'."""
-    con = _conn()
-    try:
+    """Record that a bot was created from a recommendation. Creates recommendation_performance row with outcome='active'.
+
+    Phase 1.2c step 2: routed through write_txn(bot_id, ...).
+    """
+    bid = int(bot_id)
+    params = (
+        str(symbol),
+        int(recommendation_date),
+        float(score_at_recommendation),
+        str(regime_at_recommendation or ""),
+        bid,
+        "active",
+        "",
+        str(reasons_json or ""),
+        int(snapshot_id) if snapshot_id else None,
+        now_ts(),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO recommendation_performance(
@@ -4636,22 +4672,10 @@ def link_recommendation_to_bot(
                 bot_id, outcome, notes, technical_patterns_json, snapshot_id, created_at
             ) VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
-            (
-                str(symbol),
-                int(recommendation_date),
-                float(score_at_recommendation),
-                str(regime_at_recommendation or ""),
-                int(bot_id),
-                "active",
-                "",
-                str(reasons_json or ""),
-                int(snapshot_id) if snapshot_id else None,
-                now_ts(),
-            ),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(bid, _do, name="link_recommendation_to_bot")
 
 
 def _record_recommendation_outcome(
@@ -5086,18 +5110,34 @@ def save_ml_prediction(
 
 
 def update_ml_prediction_outcome(prediction_id: int, actual_outcome_7d: Optional[float] = None, actual_outcome_30d: Optional[float] = None) -> None:
-    """Update prediction with actual outcome after 7/30 days."""
-    con = _conn()
-    try:
+    """Update prediction with actual outcome after 7/30 days.
+
+    Phase 1.2c step 2: routed through write_txn(None, ...). ml_predictions
+    has a bot_id column but the audit classifies this writer as L-risk
+    (off-tick path); no need to acquire the per-bot lock.
+    """
+    if actual_outcome_7d is None and actual_outcome_30d is None:
+        return
+    pid = int(prediction_id)
+
+    def _do(con) -> None:
         if actual_outcome_7d is not None and actual_outcome_30d is not None:
-            con.execute("UPDATE ml_predictions SET actual_outcome_7d=?, actual_outcome_30d=? WHERE id=?", (actual_outcome_7d, actual_outcome_30d, prediction_id))
+            con.execute(
+                "UPDATE ml_predictions SET actual_outcome_7d=?, actual_outcome_30d=? WHERE id=?",
+                (actual_outcome_7d, actual_outcome_30d, pid),
+            )
         elif actual_outcome_7d is not None:
-            con.execute("UPDATE ml_predictions SET actual_outcome_7d=? WHERE id=?", (actual_outcome_7d, prediction_id))
-        elif actual_outcome_30d is not None:
-            con.execute("UPDATE ml_predictions SET actual_outcome_30d=? WHERE id=?", (actual_outcome_30d, prediction_id))
-        con.commit()
-    finally:
-        con.close()
+            con.execute(
+                "UPDATE ml_predictions SET actual_outcome_7d=? WHERE id=?",
+                (actual_outcome_7d, pid),
+            )
+        else:
+            con.execute(
+                "UPDATE ml_predictions SET actual_outcome_30d=? WHERE id=?",
+                (actual_outcome_30d, pid),
+            )
+
+    write_txn(None, _do, name="update_ml_prediction_outcome")
 
 
 def get_ml_predictions(symbol: Optional[str] = None, limit: int = 100, days_back: int = 0) -> List[Dict[str, Any]]:

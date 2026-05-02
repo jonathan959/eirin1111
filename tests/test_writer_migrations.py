@@ -1096,6 +1096,364 @@ def test_delete_recommendations_for_blocklist_empty_input_noop(temp_db):
     assert dbmod.delete_recommendations_for_blocklist(["", "  ", ""]) == 0
 
 
+# ===========================================================================
+# 1.2c step 2: bot-id-scoped writers — update_bot, set_bot_*, delete_bot,
+#              add_regime_snapshot, add_strategy_decision, add_strategy_trade,
+#              save_perf_metrics, link_recommendation_to_bot,
+#              update_ml_prediction_outcome, patch_bot_risk_after_create,
+#              manual_close_deal_and_journal
+# ===========================================================================
+
+
+def _seed_min_bot(temp_db: str, name: str = "T1", symbol: str = "BTC/USD") -> int:
+    """Create a bot row via the public API and return its id."""
+    bot_id = dbmod.create_bot({
+        "name": name,
+        "symbol": symbol,
+        "enabled": 0,
+        "dry_run": 1,
+        "base_quote": 10.0,
+        "safety_quote": 5.0,
+        "max_safety": 3,
+        "first_dev": 0.01,
+        "step_mult": 1.0,
+        "tp": 0.02,
+        "max_spend_quote": 100.0,
+    })
+    return int(bot_id)
+
+
+def test_update_bot_routes_through_per_bot_lock(temp_db, monkeypatch):
+    """update_bot must run inside write_txn with bot_id=<that bot> so it
+    serialises with the runner's other writes for the same bot.
+    Race #3 in the Phase 1.1 lock-loop diagnosis."""
+    bid = _seed_min_bot(temp_db, "B-update")
+
+    captured: list = []
+    real_write_txn = dbmod.write_txn
+
+    def tracking_write_txn(bot_id, fn, *, name=None):
+        captured.append((bot_id, name))
+        return real_write_txn(bot_id, fn, name=name)
+
+    monkeypatch.setattr(dbmod, "write_txn", tracking_write_txn, raising=True)
+
+    dbmod.update_bot(bid, {
+        "name": "B-update-v2", "symbol": "ETH/USD",
+        "base_quote": 5.0, "safety_quote": 2.5, "max_safety": 2,
+        "first_dev": 0.005, "step_mult": 1.5, "tp": 0.01,
+        "max_spend_quote": 50.0,
+    })
+
+    assert (bid, "update_bot") in captured
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        row = fresh.execute(
+            "SELECT name, symbol, max_spend_quote FROM bots WHERE id=?", (bid,),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert row == ("B-update-v2", "ETH/USD", 50.0)
+
+
+def test_set_bot_enabled_routes_through_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-enabled")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.set_bot_enabled(bid, True)
+    assert (bid, "set_bot_enabled") in captured
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        v = fresh.execute("SELECT enabled FROM bots WHERE id=?", (bid,)).fetchone()[0]
+    finally:
+        fresh.close()
+    assert v == 1
+
+
+def test_set_bot_running_routes_through_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-running")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.set_bot_running(bid, True)
+    assert (bid, "set_bot_running") in captured
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        v = fresh.execute("SELECT last_running FROM bots WHERE id=?", (bid,)).fetchone()[0]
+    finally:
+        fresh.close()
+    assert v == 1
+
+
+def test_delete_bot_atomic_cascade(temp_db, monkeypatch):
+    """delete_bot must remove all child-table rows AND the bots row in
+    a single transaction. If write_txn raises mid-cascade everything
+    rolls back together."""
+    bid = _seed_min_bot(temp_db, "B-del")
+    # Seed some children
+    dbmod.add_log(bid, "INFO", "before delete")
+    dbmod.add_strategy_decision(bid, "rsi", "BUY", "test", "trending", 0.7, "{}")
+
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+
+    dbmod.delete_bot(bid)
+    assert (bid, "delete_bot") in captured
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        bots = fresh.execute("SELECT COUNT(*) FROM bots WHERE id=?", (bid,)).fetchone()[0]
+        logs = fresh.execute("SELECT COUNT(*) FROM bot_logs WHERE bot_id=?", (bid,)).fetchone()[0]
+        decs = fresh.execute("SELECT COUNT(*) FROM strategy_decisions WHERE bot_id=?", (bid,)).fetchone()[0]
+    finally:
+        fresh.close()
+    assert bots == 0 and logs == 0 and decs == 0
+
+
+def test_add_regime_snapshot_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-regime")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.add_regime_snapshot(bid, "BTC/USD", "trending", 0.85, "ema-up", "{}")
+    assert (bid, "add_regime_snapshot") in captured
+
+
+def test_add_strategy_decision_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-strat")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.add_strategy_decision(bid, "rsi", "BUY", "rsi<30", "trending", 0.6, "{}")
+    assert (bid, "add_strategy_decision") in captured
+
+
+def test_add_strategy_trade_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-trade")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.add_strategy_trade(bid, "rsi", 12.5, symbol="BTC/USD", regime="trending", pnl_pct=1.25)
+    assert (bid, "add_strategy_trade") in captured
+
+
+def test_save_perf_metrics_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-perf")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.save_perf_metrics(bid, "rsi", "{}")
+    assert (bid, "save_perf_metrics") in captured
+
+
+def test_patch_bot_risk_after_create(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-risk")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+
+    dbmod.patch_bot_risk_after_create(bid, stop_loss_pct=0.08, max_hold_hours=48)
+    assert (bid, "patch_bot_risk_after_create") in captured
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        sl, mh = fresh.execute(
+            "SELECT stop_loss_pct, max_hold_hours FROM bots WHERE id=?", (bid,),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert sl == 0.08 and mh == 48
+
+    # No-op when both Nones — must not call write_txn.
+    captured.clear()
+    dbmod.patch_bot_risk_after_create(bid)
+    assert captured == []
+
+
+def test_link_recommendation_to_bot_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-rec")
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    dbmod.link_recommendation_to_bot(
+        bid, "ETH/USD", int(time.time()), 75.0, "trending",
+        metrics_json="{}", reasons_json="[]",
+    )
+    assert (bid, "link_recommendation_to_bot") in captured
+
+
+def test_update_ml_prediction_outcome_global_lock(temp_db, monkeypatch):
+    """update_ml_prediction_outcome uses bot_id=None per the audit
+    (L-risk, off-tick path)."""
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        # ml_predictions schema varies — synthesise a row that satisfies
+        # every NOT NULL column by inspecting the table.
+        cols_info = fresh.execute("PRAGMA table_info(ml_predictions)").fetchall()
+        # Each row: (cid, name, type, notnull, dflt_value, pk)
+        seed_cols: List[str] = []
+        seed_vals: List[Any] = []
+        for cid, name, ctype, notnull, dflt, pk in cols_info:
+            if pk:
+                continue  # AUTOINCREMENT id
+            if not notnull and dflt is not None:
+                continue
+            seed_cols.append(name)
+            t = (ctype or "").upper()
+            if "INT" in t:
+                seed_vals.append(0)
+            elif "REAL" in t or "FLOA" in t or "DOUB" in t:
+                seed_vals.append(0.0)
+            else:
+                seed_vals.append("test")
+        if not seed_cols:
+            # Edge case: id-only table → use NULL row.
+            sql = "INSERT INTO ml_predictions DEFAULT VALUES"
+            fresh.execute(sql)
+        else:
+            placeholders = ",".join(["?"] * len(seed_cols))
+            sql = f"INSERT INTO ml_predictions({','.join(seed_cols)}) VALUES ({placeholders})"
+            fresh.execute(sql, seed_vals)
+        fresh.commit()
+        pid = int(fresh.execute("SELECT last_insert_rowid()").fetchone()[0])
+    finally:
+        fresh.close()
+
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+
+    dbmod.update_ml_prediction_outcome(pid, actual_outcome_7d=0.05)
+    dbmod.update_ml_prediction_outcome(pid, actual_outcome_30d=0.12)
+    dbmod.update_ml_prediction_outcome(pid, actual_outcome_7d=0.05, actual_outcome_30d=0.12)
+
+    # All three branches go through write_txn(None, ...).
+    assert all(b is None and n == "update_ml_prediction_outcome" for b, n in captured)
+    # No-op call (both None) must not call write_txn.
+    before = list(captured)
+    dbmod.update_ml_prediction_outcome(pid)
+    assert captured == before
+
+
+def test_concurrent_per_bot_writers_serialise(temp_db):
+    """4 threads each writing different per-bot writers (add_log,
+    set_bot_enabled, add_regime_snapshot, add_strategy_decision) for
+    the SAME bot, for 1.5s. Zero OperationalError leaks."""
+    bid = _seed_min_bot(temp_db, "B-concurrent")
+    DURATION_SEC = 1.5
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {"log": 0, "ena": 0, "reg": 0, "dec": 0}
+    cnt_lock = threading.Lock()
+
+    def _writer(label: str):
+        deadline = time.monotonic() + DURATION_SEC
+        i = 0
+        toggle = False
+        while time.monotonic() < deadline:
+            try:
+                if label == "log":
+                    dbmod.add_log(bid, "INFO", f"hot-{i}")
+                elif label == "ena":
+                    toggle = not toggle
+                    dbmod.set_bot_enabled(bid, toggle)
+                elif label == "reg":
+                    dbmod.add_regime_snapshot(bid, "BTC/USD", "trending", 0.5, "x", "{}")
+                else:
+                    dbmod.add_strategy_decision(bid, "s", "BUY", "r", "trending", 0.5, "{}")
+                with cnt_lock:
+                    counts[label] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((label, repr(e)))
+                return
+            i += 1
+
+    threads = [threading.Thread(target=_writer, args=(label,))
+               for label in ("log", "ena", "reg", "dec")]
+    for t in threads: t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive()
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for label, n in counts.items():
+        assert n > 0, f"{label} made no forward progress"
+
+
+def test_manual_close_deal_and_journal_atomic(temp_db, monkeypatch):
+    """manual_close_deal_and_journal must run atomically through
+    write_txn(bot_id, ...). On race-loss (rowcount=0) it must raise
+    ValueError without persisting trade_journal/trade_feedback rows."""
+    bid = _seed_min_bot(temp_db, "B-mcdj")
+    deal_id = dbmod.open_deal(bid, "BTC/USD")
+    dbmod.update_open_deal_entry(deal_id, 30000.0, 0.001)
+
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+
+    out = dbmod.manual_close_deal_and_journal(
+        deal_id=deal_id, bot_id=bid,
+        entry_avg=30000.0, exit_avg=31000.0, base_amount=0.001,
+        realized_pnl_quote=1.0, exit_strategy="manual",
+        journal_exit_reason="user manual close",
+    )
+    assert out["ok"] is True and out["realized_pnl_quote"] == 1.0
+    assert (bid, "manual_close_deal_and_journal") in captured
+
+    # Second close on the same deal — must raise ValueError (caught by
+    # either the early state-check 'Deal already CLOSED' or the
+    # rowcount=0 'not open' race-loss branch — both are correct
+    # short-circuits and prove that no second trade_journal row is
+    # added).
+    with pytest.raises(ValueError, match="(not open|already CLOSED)"):
+        dbmod.manual_close_deal_and_journal(
+            deal_id=deal_id, bot_id=bid,
+            entry_avg=30000.0, exit_avg=32000.0, base_amount=0.001,
+            realized_pnl_quote=2.0, journal_exit_reason="dup",
+        )
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        n_journal = fresh.execute(
+            "SELECT COUNT(*) FROM trade_journal WHERE deal_id=?", (deal_id,),
+        ).fetchone()[0]
+        n_feedback = fresh.execute(
+            "SELECT COUNT(*) FROM trade_feedback WHERE features_json LIKE ?",
+            ("%32000%",),
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    assert n_journal == 1, f"expected exactly 1 trade_journal row, got {n_journal}"
+    assert n_feedback == 0, "race-loss must not insert trade_feedback"
+
+
 def test_cleanup_old_signal_audits_chunked(temp_db):
     """Smoke test for cleanup_old_signal_audits chunked migration."""
     fresh = sqlite3.connect(temp_db, timeout=5.0)
