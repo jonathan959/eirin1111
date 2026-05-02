@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import logging
-from db import _conn, now_ts
+from db import _conn, now_ts, write_txn
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +31,24 @@ def save_tax_harvest_suggestion(
     wash_sale_until_ts: int,
     alternate_symbol: Optional[str] = None,
 ) -> None:
-    """Record a tax-loss harvesting suggestion."""
-    con = _conn()
-    try:
+    """Record a tax-loss harvesting suggestion.
+
+    Phase 1.2b step 7: write_txn(None, ...). Errors raise (no silent
+    swallow); the caller decides whether to surface.
+    """
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO tax_harvest_suggestions(symbol, unrealized_loss_pct, suggest_sell_ts, wash_sale_until_ts, alternate_symbol, recorded_at)
             VALUES (?,?,?,?,?,?)
             """,
-            (str(symbol), float(unrealized_loss_pct), now_ts(), int(wash_sale_until_ts), str(alternate_symbol or ""), now_ts()),
+            (
+                str(symbol), float(unrealized_loss_pct), now_ts(),
+                int(wash_sale_until_ts), str(alternate_symbol or ""), now_ts(),
+            ),
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_tax_harvest_suggestion")
 
 
 def get_recent_sales(symbol: str, since_ts: int) -> List[Dict[str, Any]]:

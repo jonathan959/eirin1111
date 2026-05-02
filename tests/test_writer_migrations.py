@@ -654,6 +654,67 @@ def test_notification_writers_under_concurrent_load(temp_db, monkeypatch):
         assert n > 0
 
 
+# ===========================================================================
+# 1.2b step 7: small modules — execution_quality_tracker, tax_optimizer,
+#                              sector_rotation
+# ===========================================================================
+
+def test_record_execution_inserts_row(temp_db, monkeypatch):
+    monkeypatch.setenv("TRACK_EXECUTION_QUALITY", "1")
+    # Re-import to pick up the env var.
+    import importlib
+    import execution_quality_tracker as eqt
+    importlib.reload(eqt)
+
+    ok = eqt.record_execution(
+        order_id="o-1", bot_id=99, symbol="BTC/USD", side="buy",
+        intended_price=100.0, executed_price=100.5, strategy="t",
+    )
+    assert ok is True
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        row = fresh.execute(
+            "SELECT bot_id, symbol, executed_price FROM execution_quality WHERE order_id=?",
+            ("o-1",),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert row == (99, "BTC/USD", 100.5)
+
+
+def test_save_tax_harvest_suggestion(temp_db):
+    import tax_optimizer
+    tax_optimizer.save_tax_harvest_suggestion(
+        symbol="BTC/USD", unrealized_loss_pct=-7.5,
+        wash_sale_until_ts=int(time.time()) + 86400, alternate_symbol="ETH/USD",
+    )
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        rows = fresh.execute(
+            "SELECT symbol, alternate_symbol FROM tax_harvest_suggestions"
+        ).fetchall()
+    finally:
+        fresh.close()
+    assert rows == [("BTC/USD", "ETH/USD")]
+
+
+def test_record_sector_performance(temp_db):
+    import sector_rotation
+    sector_rotation.record_sector_performance(
+        sector="Technology", quarter_ts=int(time.time()),
+        return_pct=8.5, momentum_score=72.0, rank=1,
+    )
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        rows = fresh.execute(
+            "SELECT sector, rank FROM sector_performance_history"
+        ).fetchall()
+    finally:
+        fresh.close()
+    assert rows == [("Technology", 1)]
+
+
 def test_explore_writers_under_concurrent_load(temp_db):
     """4 threads each calling a mix of save_signal_outcome /
     upsert_explore_feed_row / mark_explore_signals_pending for 1.5s; assert

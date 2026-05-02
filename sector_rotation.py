@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from db import _conn, now_ts
+from db import _conn, now_ts, write_txn
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +37,11 @@ def _parse_target_allocations() -> Dict[str, float]:
 
 
 def record_sector_performance(sector: str, quarter_ts: int, return_pct: float, momentum_score: float, rank: int) -> None:
-    """Store sector performance for rotation analysis."""
-    con = _conn()
-    try:
+    """Store sector performance for rotation analysis.
+
+    Phase 1.2b step 7: write_txn(None, ...). Errors raise.
+    """
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO sector_performance_history(sector, quarter_ts, return_pct, momentum_score, rank)
@@ -47,9 +49,8 @@ def record_sector_performance(sector: str, quarter_ts: int, return_pct: float, m
             """,
             (str(sector), int(quarter_ts), float(return_pct), float(momentum_score), int(rank)),
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="record_sector_performance")
 
 
 def get_sector_momentum(days: int = 90) -> List[Dict[str, Any]]:

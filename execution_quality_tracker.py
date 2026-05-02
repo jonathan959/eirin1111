@@ -22,34 +22,48 @@ def record_execution(
     vwap_at_execution: Optional[float] = None,
     twap_at_execution: Optional[float] = None,
 ) -> bool:
-    """Record execution quality for post-trade analysis."""
+    """Record execution quality for post-trade analysis.
+
+    Phase 1.2b step 7: write_txn(int(bot_id), ...) — per-bot RLock
+    serialises with the bot's other deal/order_event writes; 5-retry on
+    'database is locked'. Returns False on retry exhaustion (logged via
+    logger.exception); the caller's order placement still succeeded — only
+    the post-trade analytics row is missed.
+    """
     if not TRACK_EXECUTION_QUALITY or intended_price <= 0:
         return False
-    try:
-        from db import _conn, now_ts
-        exec_price = executed_price or intended_price
-        slippage_pct = ((exec_price - intended_price) / intended_price) * 100 if intended_price > 0 else 0
-        # For sells: positive slippage = got more; for buys: negative = paid more
-        if side.lower() == "buy":
-            slippage_dollars = (intended_price - exec_price)  # negative = paid more
-        else:
-            slippage_dollars = exec_price - intended_price
-        score = _compute_quality_score(
-            intended_price, exec_price, vwap_at_execution, twap_at_execution, side
-        )
-        con = _conn()
+    from db import write_txn, now_ts
+    exec_price = executed_price or intended_price
+    slippage_pct = ((exec_price - intended_price) / intended_price) * 100 if intended_price > 0 else 0
+    if side.lower() == "buy":
+        slippage_dollars = (intended_price - exec_price)
+    else:
+        slippage_dollars = exec_price - intended_price
+    score = _compute_quality_score(
+        intended_price, exec_price, vwap_at_execution, twap_at_execution, side
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO execution_quality (order_id, bot_id, symbol, side, strategy, intended_price, executed_price, slippage_pct, slippage_dollars, vwap_at_execution, twap_at_execution, execution_quality_score, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (order_id, bot_id, symbol, side, strategy or "", intended_price, exec_price, slippage_pct, slippage_dollars, vwap_at_execution, twap_at_execution, score, now_ts()),
+            (
+                order_id, int(bot_id), symbol, side, strategy or "",
+                intended_price, exec_price, slippage_pct, slippage_dollars,
+                vwap_at_execution, twap_at_execution, score, now_ts(),
+            ),
         )
-        con.commit()
-        con.close()
+
+    try:
+        write_txn(int(bot_id), _do, name="record_execution")
         return True
-    except Exception as e:
-        logger.debug("record_execution failed: %s", e)
+    except Exception:
+        logger.exception(
+            "record_execution failed (order_id=%s bot_id=%s symbol=%s)",
+            order_id, bot_id, symbol,
+        )
         return False
 
 
