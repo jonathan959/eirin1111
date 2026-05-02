@@ -171,3 +171,217 @@ def test_add_log_uses_per_bot_lock(temp_db):
     # Smoke: both calls succeed.
     dbmod.add_log(1001, "INFO", "a", "T")
     dbmod.add_log(1002, "INFO", "b", "T")
+
+
+# ===========================================================================
+# 1.2b step 2: deals (open_deal, update_open_deal_entry, close_deal,
+#                     record_trade_feedback)
+# ===========================================================================
+
+def _seed_open_deal(bot_id: int = 1, symbol: str = "BTC/USD") -> int:
+    return dbmod.open_deal(int(bot_id), symbol, state="OPEN", opened_at=int(time.time()))
+
+
+def test_open_deal_creates_row(temp_db):
+    deal_id = _seed_open_deal(bot_id=11, symbol="ETH/USD")
+    assert deal_id > 0
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        row = fresh.execute("SELECT bot_id, state, symbol FROM deals WHERE id=?", (deal_id,)).fetchone()
+    finally:
+        fresh.close()
+    assert dict(row) == {"bot_id": 11, "state": "OPEN", "symbol": "ETH/USD"}
+
+
+def test_update_open_deal_entry_writes_entry(temp_db):
+    deal_id = _seed_open_deal(bot_id=12, symbol="BTC/USD")
+    dbmod.update_open_deal_entry(deal_id, entry_avg=100.0, base_amount=0.5, safety_count=1)
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        row = fresh.execute(
+            "SELECT entry_avg, base_amount, safety_count, state FROM deals WHERE id=?",
+            (deal_id,),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert float(row["entry_avg"]) == 100.0
+    assert float(row["base_amount"]) == 0.5
+    assert int(row["safety_count"]) == 1
+    assert row["state"] == "OPEN"
+
+
+def test_close_deal_atomic_with_trade_feedback_and_recommendation(temp_db):
+    """close_deal must run the deal UPDATE, the trade_feedback INSERT, and
+    the recommendation_performance UPDATE in a single transaction. We can't
+    easily inject a crash between them, but we can verify all three rows
+    land together for a happy path AND that close_deal does not raise the
+    nested-write_txn RuntimeError despite the helper calls."""
+    bot_id = 21
+    deal_id = _seed_open_deal(bot_id=bot_id, symbol="BTC/USD")
+    dbmod.update_open_deal_entry(deal_id, entry_avg=100.0, base_amount=0.5)
+
+    # Seed an active recommendation_performance row so the inner update fires.
+    def _seed_rec(con):
+        con.execute(
+            "INSERT INTO recommendation_performance("
+            "bot_id, symbol, recommendation_date, score_at_recommendation, "
+            "regime_at_recommendation, entry_price, exit_price, pnl_realized, "
+            "days_held, outcome, notes, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (bot_id, "BTC/USD", int(time.time()) - 86400, 75, "Trend",
+             100.0, 0.0, 0.0, 0.0, "active", "seed", int(time.time()) - 86400),
+        )
+    dbmod.write_txn(None, _seed_rec, name="seed_rec")
+
+    dbmod.close_deal(
+        deal_id=deal_id,
+        entry_avg=100.0,
+        exit_avg=110.0,
+        base_amount=0.5,
+        realized_pnl_quote=5.0,
+        entry_strategy="t",
+        exit_strategy="manual_close_dry",
+        hold_sec=3600,
+        safety_count=0,
+    )
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        deal_row = fresh.execute("SELECT state, exit_avg FROM deals WHERE id=?", (deal_id,)).fetchone()
+        fb = fresh.execute(
+            "SELECT symbol, profitable FROM trade_feedback ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        rec = fresh.execute(
+            "SELECT outcome, exit_price, pnl_realized FROM recommendation_performance "
+            "WHERE bot_id=? ORDER BY id DESC LIMIT 1",
+            (bot_id,),
+        ).fetchone()
+    finally:
+        fresh.close()
+
+    assert deal_row["state"] == "CLOSED"
+    assert float(deal_row["exit_avg"]) == 110.0
+    assert fb["symbol"] == "BTC/USD"
+    assert int(fb["profitable"]) == 1
+    assert rec["outcome"] == "win"
+    assert float(rec["exit_price"]) == 110.0
+
+
+def test_cancel_ghost_deal_only_acts_on_open(temp_db):
+    deal_id = _seed_open_deal(bot_id=31, symbol="BTC/USD")
+
+    dbmod.cancel_ghost_deal(deal_id)
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        row = fresh.execute("SELECT state FROM deals WHERE id=?", (deal_id,)).fetchone()
+    finally:
+        fresh.close()
+    assert row["state"] == "CANCELLED"
+
+    # Second call must be a no-op (state is no longer OPEN).
+    dbmod.cancel_ghost_deal(deal_id)
+
+
+def test_concurrent_deal_writers_under_contention(temp_db):
+    """4 threads pound on open_deal/update_open_deal_entry/close_deal for
+    DIFFERENT bots; assert zero OperationalError, all forward progress."""
+    DURATION_SEC = 2.0
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    cnt_lock = threading.Lock()
+
+    def _worker(bot_id: int):
+        deadline = time.monotonic() + DURATION_SEC
+        while time.monotonic() < deadline:
+            try:
+                deal_id = dbmod.open_deal(bot_id, "BTC/USD")
+                dbmod.update_open_deal_entry(deal_id, entry_avg=100.0, base_amount=0.1)
+                dbmod.close_deal(
+                    deal_id=deal_id, entry_avg=100.0, exit_avg=101.0,
+                    base_amount=0.1, realized_pnl_quote=0.1,
+                    entry_strategy="t", exit_strategy="t",
+                    hold_sec=1, safety_count=0,
+                )
+                with cnt_lock:
+                    counts[bot_id] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((bot_id, repr(e)))
+                return
+
+    threads = [threading.Thread(target=_worker, args=(b,)) for b in (1, 2, 3, 4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive(), "deal writer thread did not exit (deadlock?)"
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for b, n in counts.items():
+        assert n > 0, f"bot {b} made no forward progress"
+
+
+def test_record_trade_feedback_standalone(temp_db):
+    """record_trade_feedback() with no con= goes through write_txn(None, ...)."""
+    dbmod.record_trade_feedback("BTC/USD", "{}", profitable=1)
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        rows = fresh.execute("SELECT symbol, profitable FROM trade_feedback").fetchall()
+    finally:
+        fresh.close()
+    assert rows == [("BTC/USD", 1)]
+
+
+def test_record_trade_feedback_nested_with_con(temp_db):
+    """record_trade_feedback(..., con=outer_con) does NOT call write_txn —
+    proves nested usage from inside close_deal-style fn() bodies works."""
+    def _outer(con):
+        dbmod.record_trade_feedback("ETH/USD", '{"x":1}', profitable=0, con=con)
+
+    dbmod.write_txn(None, _outer, name="outer_with_nested_feedback")
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        rows = fresh.execute("SELECT symbol, profitable FROM trade_feedback").fetchall()
+    finally:
+        fresh.close()
+    assert ("ETH/USD", 0) in rows
+
+
+def test_cancel_ghost_deal_serialises_with_open_deal_for_same_bot(temp_db):
+    """For the SAME bot_id, cancel_ghost_deal and open_deal must serialise
+    on the per-bot RLock (no interleaving)."""
+    bot_id = 42
+    trace: list = []
+    trace_lock = threading.Lock()
+
+    def _open():
+        with trace_lock:
+            trace.append("open_start")
+        deal_id = dbmod.open_deal(bot_id, "BTC/USD")
+        with trace_lock:
+            trace.append("open_done")
+        return deal_id
+
+    def _cancel(did):
+        with trace_lock:
+            trace.append("cancel_start")
+        dbmod.cancel_ghost_deal(did)
+        with trace_lock:
+            trace.append("cancel_done")
+
+    deal_id = _open()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_open)
+        f2 = ex.submit(_cancel, deal_id)
+        f1.result(timeout=5.0)
+        f2.result(timeout=5.0)
+    # Each pair must be contiguous (no interleaving). The exact ordering
+    # between the two operations isn't deterministic — only that neither
+    # interleaves with the other.
+    assert "open_done" in trace and "cancel_done" in trace

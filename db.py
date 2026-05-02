@@ -2255,18 +2255,39 @@ def save_autopilot_config(data: Dict[str, Any]) -> None:
 # =========================================================
 # Deals
 # =========================================================
+def _bot_id_for_deal(deal_id: int) -> Optional[int]:
+    """Read-only lookup of a deal's bot_id. Used to pick the right per-bot
+    lock before entering write_txn for deal-row writers."""
+    try:
+        con = _conn()
+        row = con.execute("SELECT bot_id FROM deals WHERE id=?", (int(deal_id),)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except sqlite3.OperationalError:
+        # Read failure is rare under WAL; fall back to global lock so we still
+        # serialise correctly with cross-bot writers.
+        return None
+
+
 def open_deal(bot_id: int, symbol: str, state: str = "OPEN", opened_at: Optional[int] = None) -> int:
-    con = _conn()
-    cur = con.cursor()
+    """Insert a fresh deal row for ``bot_id`` and return its id.
+
+    Migrated to write_txn(bot_id, ...) in Phase 1.2b: per-bot RLock
+    serialises open_deal against the runner's other deal/log writes for the
+    same bot, retries on transient 'database is locked'.
+    """
     _opened = int(opened_at) if opened_at is not None else now_ts()
-    cur.execute(
-        "INSERT INTO deals(bot_id, state, opened_at, symbol) VALUES (?,?,?,?)",
-        (int(bot_id), str(state), _opened, str(symbol)),
-    )
-    con.commit()
-    deal_id = int(cur.lastrowid)
-    con.close()
-    return deal_id
+    holder: Dict[str, int] = {}
+
+    def _do(con) -> None:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO deals(bot_id, state, opened_at, symbol) VALUES (?,?,?,?)",
+            (int(bot_id), str(state), _opened, str(symbol)),
+        )
+        holder["id"] = int(cur.lastrowid)
+
+    write_txn(int(bot_id), _do, name="open_deal")
+    return holder["id"]
 
 
 def update_open_deal_entry(
@@ -2275,16 +2296,18 @@ def update_open_deal_entry(
     base_amount: float,
     safety_count: int = 0,
 ) -> None:
-    """
-    Update an OPEN deal with real entry price and size.
-    Called after a buy executes so the DB reflects the
-    actual position. Without this, entry_avg stays NULL
-    on open deals even when a real position exists.
+    """Update an OPEN deal with the real entry price and size after a buy fills.
+
+    Without this, entry_avg stays NULL on open deals even when a real
+    position exists. Migrated to write_txn(bot_id, ...) in Phase 1.2b — per-bot
+    RLock serialises against open_deal/close_deal for the same bot.
     """
     if not deal_id or not entry_avg or entry_avg <= 0:
         return
-    con = _conn()
-    try:
+
+    bot_id = _bot_id_for_deal(int(deal_id))
+
+    def _do(con) -> None:
         con.execute(
             """UPDATE deals SET
                 entry_avg = ?,
@@ -2298,9 +2321,8 @@ def update_open_deal_entry(
                 int(deal_id),
             ),
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(bot_id, _do, name="update_open_deal_entry")
 
 
 def close_deal(
@@ -2319,15 +2341,15 @@ def close_deal(
     safety_count: Optional[int] = None,
     entry_avg_estimated: bool = False,
 ) -> None:
-    con = _conn()
-    # Fetch bot_id and opened_at before update (for recommendation_performance)
-    row = con.execute(
-        "SELECT bot_id, opened_at FROM deals WHERE id=?",
-        (int(deal_id),),
-    ).fetchone()
+    """Mark a deal CLOSED, write the trade-feedback row, and update the
+    recommendation_performance row if any — all in a single per-bot
+    transaction so a crash mid-close cannot leave inconsistent rows.
+
+    Migrated to write_txn(bot_id, ...) in Phase 1.2b. record_trade_feedback
+    and _record_recommendation_outcome both run on the same conn (no nested
+    write_txn).
+    """
     closed_ts = now_ts()
-    opened_ts = int(row["opened_at"] or 0) if row else 0
-    bot_id_val = int(row["bot_id"]) if row else None
 
     realized_pnl_pct_val: Optional[float] = None
     try:
@@ -2347,80 +2369,98 @@ def close_deal(
     except (TypeError, ValueError):
         realized_pnl_pct_val = None
 
-    con.execute(
-        """
-        UPDATE deals SET
-            state=?,
-            closed_at=?,
-            entry_avg=?,
-            exit_avg=?,
-            base_amount=?,
-            realized_pnl_quote=?,
-            realized_pnl_pct=?,
-            entry_avg_estimated=?,
-            entry_regime=?,
-            exit_regime=?,
-            entry_strategy=?,
-            exit_strategy=?,
-            mae=?,
-            mfe=?,
-            hold_sec=?,
-            safety_count=?
-        WHERE id=?
-        """,
-        (
-            "CLOSED",
-            closed_ts,
-            float(entry_avg) if entry_avg is not None else None,
-            float(exit_avg) if exit_avg is not None else None,
-            float(base_amount) if base_amount is not None else None,
-            float(realized_pnl_quote) if realized_pnl_quote is not None else None,
-            float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
-            1 if entry_avg_estimated else 0,
-            str(entry_regime) if entry_regime is not None else None,
-            str(exit_regime) if exit_regime is not None else None,
-            str(entry_strategy) if entry_strategy is not None else None,
-            str(exit_strategy) if exit_strategy is not None else None,
-            float(mae) if mae is not None else None,
-            float(mfe) if mfe is not None else None,
-            int(hold_sec) if hold_sec is not None else None,
-            int(safety_count) if safety_count is not None else None,
-            int(deal_id),
-        ),
-    )
-    con.commit()
+    bot_id_for_lock = _bot_id_for_deal(int(deal_id))
 
-    # Record trade feedback for ML learning
-    try:
-        profitable_flag = 1 if (realized_pnl_quote or 0) > 0 else 0
-        # Fetch symbol from deal
-        deal_row = con.execute("SELECT symbol FROM deals WHERE id=?", (int(deal_id),)).fetchone()
-        deal_symbol = deal_row["symbol"] if deal_row else ""
-        import json as _json
-        features = _json.dumps({
-            "entry_avg": float(entry_avg) if entry_avg else 0,
-            "exit_avg": float(exit_avg) if exit_avg else 0,
-            "pnl": float(realized_pnl_quote) if realized_pnl_quote else 0,
-            "exit_strategy": str(exit_strategy or ""),
-            "entry_regime": str(entry_regime or ""),
-            "hold_sec": int(hold_sec) if hold_sec else 0,
-        })
-        record_trade_feedback(deal_symbol, features, profitable_flag)
-    except Exception as fb_err:
-        logger.warning("Failed to record trade feedback on deal close: %s", fb_err)
+    def _do(con) -> None:
+        # Re-fetch inside the txn so bot_id/opened_at are consistent with the
+        # row we're about to UPDATE (cheap; no extra lock).
+        row = con.execute(
+            "SELECT bot_id, opened_at FROM deals WHERE id=?",
+            (int(deal_id),),
+        ).fetchone()
+        opened_ts = int(row["opened_at"] or 0) if row else 0
+        bot_id_val = int(row["bot_id"]) if row else None
 
-    # Record outcome for recommendation performance tracking (if bot was created from recommendation)
-    if bot_id_val and entry_avg is not None and exit_avg is not None and realized_pnl_quote is not None:
+        con.execute(
+            """
+            UPDATE deals SET
+                state=?,
+                closed_at=?,
+                entry_avg=?,
+                exit_avg=?,
+                base_amount=?,
+                realized_pnl_quote=?,
+                realized_pnl_pct=?,
+                entry_avg_estimated=?,
+                entry_regime=?,
+                exit_regime=?,
+                entry_strategy=?,
+                exit_strategy=?,
+                mae=?,
+                mfe=?,
+                hold_sec=?,
+                safety_count=?
+            WHERE id=?
+            """,
+            (
+                "CLOSED",
+                closed_ts,
+                float(entry_avg) if entry_avg is not None else None,
+                float(exit_avg) if exit_avg is not None else None,
+                float(base_amount) if base_amount is not None else None,
+                float(realized_pnl_quote) if realized_pnl_quote is not None else None,
+                float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
+                1 if entry_avg_estimated else 0,
+                str(entry_regime) if entry_regime is not None else None,
+                str(exit_regime) if exit_regime is not None else None,
+                str(entry_strategy) if entry_strategy is not None else None,
+                str(exit_strategy) if exit_strategy is not None else None,
+                float(mae) if mae is not None else None,
+                float(mfe) if mfe is not None else None,
+                int(hold_sec) if hold_sec is not None else None,
+                int(safety_count) if safety_count is not None else None,
+                int(deal_id),
+            ),
+        )
+
+        # Trade feedback row — non-fatal, runs on the same conn (no nested write_txn).
         try:
-            _record_recommendation_outcome(
-                con, bot_id_val, deal_id,
-                float(entry_avg), float(exit_avg), float(realized_pnl_quote),
-                closed_ts, opened_ts,
-            )
-            con.commit()
+            profitable_flag = 1 if (realized_pnl_quote or 0) > 0 else 0
+            deal_row = con.execute(
+                "SELECT symbol FROM deals WHERE id=?", (int(deal_id),)
+            ).fetchone()
+            deal_symbol = deal_row["symbol"] if deal_row else ""
+            features = json.dumps({
+                "entry_avg": float(entry_avg) if entry_avg else 0,
+                "exit_avg": float(exit_avg) if exit_avg else 0,
+                "pnl": float(realized_pnl_quote) if realized_pnl_quote else 0,
+                "exit_strategy": str(exit_strategy or ""),
+                "entry_regime": str(entry_regime or ""),
+                "hold_sec": int(hold_sec) if hold_sec else 0,
+            })
+            record_trade_feedback(deal_symbol, features, profitable_flag, con=con)
         except Exception:
-            pass  # Do not fail deal close if performance tracking fails
-    con.close()
+            logger.exception("close_deal: trade_feedback write failed (non-fatal)")
+
+        # Recommendation outcome update — also non-fatal, same conn.
+        if (
+            bot_id_val
+            and entry_avg is not None
+            and exit_avg is not None
+            and realized_pnl_quote is not None
+        ):
+            try:
+                _record_recommendation_outcome(
+                    con, bot_id_val, int(deal_id),
+                    float(entry_avg), float(exit_avg), float(realized_pnl_quote),
+                    closed_ts, opened_ts,
+                )
+            except Exception:
+                logger.exception(
+                    "close_deal: _record_recommendation_outcome failed (non-fatal)"
+                )
+
+    write_txn(bot_id_for_lock, _do, name="close_deal")
 
 
 def manual_close_deal_and_journal(
@@ -2920,14 +2960,20 @@ def find_stale_ghost_deals(max_age_sec: int = 7200) -> List[Dict[str, Any]]:
 
 
 def cancel_ghost_deal(deal_id: int) -> None:
-    """Cancel a ghost deal (OPEN with no entry). Sets state=CANCELLED."""
-    con = _conn()
-    con.execute(
-        "UPDATE deals SET state='CANCELLED', closed_at=? WHERE id=? AND state='OPEN'",
-        (now_ts(), int(deal_id)),
-    )
-    con.commit()
-    con.close()
+    """Cancel a ghost deal (OPEN with no entry). Sets state=CANCELLED.
+
+    Migrated to write_txn(bot_id, ...) in Phase 1.2b. Per-bot RLock prevents
+    a race with the runner's close_deal/open_deal on the same bot.
+    """
+    bot_id = _bot_id_for_deal(int(deal_id))
+
+    def _do(con) -> None:
+        con.execute(
+            "UPDATE deals SET state='CANCELLED', closed_at=? WHERE id=? AND state='OPEN'",
+            (now_ts(), int(deal_id)),
+        )
+
+    write_txn(bot_id, _do, name="cancel_ghost_deal")
 
 
 def list_deals(bot_id: int, limit: int = 50) -> List[Dict[str, Any]]:
@@ -5472,18 +5518,42 @@ def log_audit(action: str, details: str = "", ip: str = "") -> None:
         logger.warning(f"Failed to log audit event: {e}")
 
 
-def record_trade_feedback(symbol: str, features_json: str = "", profitable: int = 0) -> None:
-    """Record trade outcome for ML model feedback and learning."""
+def record_trade_feedback(
+    symbol: str,
+    features_json: str = "",
+    profitable: int = 0,
+    *,
+    con: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Record trade outcome for ML model feedback and learning.
+
+    When ``con`` is provided (e.g. from inside another write_txn fn body),
+    executes on that connection and lets the outer caller commit. When
+    omitted, runs through write_txn(None, ...) on its own. Either path is
+    safe under contention.
+    """
+    sql = (
+        "INSERT INTO trade_feedback(symbol, timestamp, features_json, profitable) "
+        "VALUES (?, ?, ?, ?)"
+    )
+    params = (
+        str(symbol),
+        time.time(),
+        str(features_json) if features_json else None,
+        int(profitable),
+    )
+    if con is not None:
+        try:
+            con.execute(sql, params)
+        except Exception as e:
+            logger.warning("Failed to record trade feedback (nested): %s", e)
+        return
     try:
-        con = _conn()
-        con.execute(
-            "INSERT INTO trade_feedback(symbol, timestamp, features_json, profitable) VALUES (?, ?, ?, ?)",
-            (str(symbol), time.time(), str(features_json) if features_json else None, int(profitable)),
-        )
-        con.commit()
-        con.close()
+        def _do(c) -> None:
+            c.execute(sql, params)
+        write_txn(None, _do, name="record_trade_feedback")
     except Exception as e:
-        logger.warning(f"Failed to record trade feedback: {e}")
+        logger.warning("Failed to record trade feedback: %s", e)
 
 
 def get_trade_feedback(symbol: str = "", profitable: Optional[int] = None, limit: int = 1000) -> List[Dict[str, Any]]:
