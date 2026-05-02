@@ -45,6 +45,7 @@ os.environ.setdefault("BOT_DB_PATH", str(_THIS_DIR / "botdb.sqlite3"))
 
 # Import the existing bot engine + API (this defines `app` + all /api/* routes)
 import worker_api  # noqa: E402
+import db  # noqa: E402  # canonical DB layer (Phase 1.2e — replaces local _conn)
 
 # Re-export the SAME FastAPI instance => ONE server.
 app = worker_api.app
@@ -92,9 +93,18 @@ def _db_path() -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(_db_path())
-    con.row_factory = sqlite3.Row
-    return con
+    """Phase 1.2e: delegate to ``db._conn()`` so this fallback entrypoint shares
+    the canonical per-thread cached connection (WAL, ``busy_timeout=30000``,
+    ``foreign_keys=ON``, 64 MB page cache, mmap, etc.) instead of opening a
+    raw ``sqlite3.connect`` with a weaker pragma set.
+
+    The previous local implementation set ``busy_timeout=5000`` (vs the canonical
+    30 s) and was missing ``foreign_keys`` / cache pragmas, so any future write
+    routed through this file would have been a contention landmine — exactly
+    the pattern the audit flagged. ``one_server_v2`` is currently the documented
+    fallback in ``deploy_restart.sh`` / ``quick_fix_502.sh`` / ``ai-bot.service``,
+    so deletion was rejected (would silently break 3am rollbacks)."""
+    return db._conn()
 
 
 def _list_bots() -> list[dict]:

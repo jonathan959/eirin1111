@@ -1797,6 +1797,57 @@ def test_ml_signal_scorer_log_version_to_db_does_not_silently_swallow(
     assert any(r.exc_info is not None for r in matched)
 
 
+# ===========================================================================
+# 1.2e: one_server_v2.py:94 — neutralise dormant raw sqlite3.connect
+# ===========================================================================
+#
+# The local _conn() in one_server_v2.py opened a raw connection with
+# busy_timeout=5000 (vs the canonical 30000) and no foreign_keys/cache
+# pragmas. The file is dormant on the live host (tradingserver runs
+# one_server.py) but it is the documented fallback in deploy_restart.sh,
+# quick_fix_502.sh, and ai-bot.service — so deletion was rejected.
+
+def test_one_server_v2_conn_delegates_to_db(temp_db, monkeypatch):
+    """one_server_v2._conn() must return the canonical db connection
+    (per-thread cached, WAL + busy_timeout=30s). We assert by patching
+    db._conn to a sentinel and confirming the wrapper forwards through."""
+    import importlib
+
+    osv2 = importlib.import_module("one_server_v2")
+
+    sentinel = object()
+    calls = []
+
+    def _fake_conn():
+        calls.append(1)
+        return sentinel
+
+    monkeypatch.setattr(osv2.db, "_conn", _fake_conn, raising=True)
+    result = osv2._conn()
+    assert result is sentinel, "one_server_v2._conn must delegate to db._conn"
+    assert calls == [1]
+
+
+def test_one_server_v2_no_raw_sqlite_connect():
+    """Source-level guard: one_server_v2.py must not open a raw sqlite
+    connection (the Phase 1.2e bug). Comments mentioning sqlite3.connect
+    are stripped before checking."""
+    import re
+
+    src_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "one_server_v2.py",
+    )
+    with open(src_path, "r", encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines()
+                 if not re.match(r"\s*#", ln)]
+    src_no_comments = "\n".join(lines)
+    assert "sqlite3.connect(" not in src_no_comments, (
+        "one_server_v2.py reintroduced a raw sqlite3.connect — "
+        "use db._conn() (Phase 1.2e regression)"
+    )
+
+
 def test_ml_signal_scorer_no_inline_db_get_db_import():
     """Source-level regression: the broken ``from db import get_db`` must not
     reappear, and ``conn = get_db()`` must not be used anywhere in
