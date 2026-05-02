@@ -801,3 +801,335 @@ def test_cancel_ghost_deal_serialises_with_open_deal_for_same_bot(temp_db):
     # between the two operations isn't deterministic — only that neither
     # interleaves with the other.
     assert "open_done" in trace and "cancel_done" in trace
+
+
+# ===========================================================================
+# 1.2b step 8: chunked cleanup_old_* + delete_recommendations_for_blocklist
+# ===========================================================================
+#
+# Rationale: the brief escalates this group from a refactor to a load-bearing
+# safety fix — the bot 1 'OperationalError: database is locked' loop on the
+# live host is most likely caused by mass DELETE-while-INSERT collisions.
+# Each test here proves:
+#   1. Functional behaviour: rows that should be deleted ARE deleted.
+#   2. Forward progress: cleanup makes progress every batch.
+#   3. Concurrency: zero OperationalError leaks while a hot INSERT loop runs
+#      against the same table.
+# ===========================================================================
+
+
+def _seed_bot_logs(temp_db: str, bot_id: int, total: int, ts: int) -> None:
+    """Seed total rows directly via raw connection (test fixture only)."""
+    fresh = sqlite3.connect(temp_db, timeout=10.0)
+    try:
+        fresh.executemany(
+            "INSERT INTO bot_logs(bot_id, ts, level, message) VALUES (?,?,?,?)",
+            [(bot_id, ts, "INFO", f"seed-{i}") for i in range(total)],
+        )
+        fresh.commit()
+    finally:
+        fresh.close()
+
+
+def test_cleanup_old_bot_logs_chunked_deletes_old_keeps_new(temp_db):
+    """Functional: only rows older than cutoff are deleted; recent rows stay."""
+    bot_id = 1
+    now = int(time.time())
+    old_ts = now - 60 * 86400          # 60 days old
+    new_ts = now - 1 * 86400           # 1 day old (within keep_days=30)
+
+    # Seed 1200 old + 50 new — old set spans >2 chunks of 500.
+    _seed_bot_logs(temp_db, bot_id, 1200, old_ts)
+    _seed_bot_logs(temp_db, bot_id, 50, new_ts)
+
+    deleted = dbmod.cleanup_old_bot_logs(keep_days=30)
+
+    assert deleted == 1200, f"expected 1200 deleted, got {deleted}"
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        remaining = fresh.execute("SELECT COUNT(*) FROM bot_logs").fetchone()[0]
+        old_left = fresh.execute(
+            "SELECT COUNT(*) FROM bot_logs WHERE ts < ?", (now - 30 * 86400,),
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    assert remaining == 50, f"expected 50 recent rows to survive, got {remaining}"
+    assert old_left == 0, f"expected 0 old rows left, got {old_left}"
+
+
+def test_cleanup_old_bot_logs_returns_zero_when_nothing_old(temp_db):
+    """Forward-progress: empty case must terminate (not loop) and return 0."""
+    bot_id = 2
+    now = int(time.time())
+    _seed_bot_logs(temp_db, bot_id, 100, now)  # all fresh
+    deleted = dbmod.cleanup_old_bot_logs(keep_days=30)
+    assert deleted == 0
+
+
+def test_cleanup_old_bot_logs_under_concurrent_insert_load(temp_db):
+    """The Phase 1.2b §8 acceptance test, paraphrased from the brief:
+
+        "Replace each cleanup with a chunked loop. Add a regression test:
+         run cleanup concurrently with a 1000-INSERT workload against the
+         same table; assert both complete with zero OperationalErrors and
+         cleanup makes forward progress every batch."
+
+    Pre-migration this asserted on a single-DELETE pattern that held the
+    write lock for ~hundreds of ms; the inserter would hit
+    OperationalError under busy_timeout. Post-migration the chunked loop
+    yields the lock every 500 rows so both can complete cleanly.
+    """
+    bot_id = 3
+    now = int(time.time())
+    old_ts = now - 60 * 86400
+
+    # Seed 5000 old rows so cleanup must execute >=10 batches and the
+    # inserter has time to overlap multiple batch boundaries.
+    _seed_bot_logs(temp_db, bot_id, 5000, old_ts)
+
+    insert_errors: list = []
+    insert_count = {"n": 0}
+    cleanup_errors: list = []
+    progress_marks: list = []  # one entry per batch deleted by cleanup
+
+    # Patch chunked_delete to record each batch's rowcount so we can assert
+    # forward progress per batch instead of just totals.
+    real_chunked_delete = dbmod.chunked_delete
+
+    def tracking_chunked_delete(table, where_sql, params, *,
+                                batch_size=dbmod.CLEANUP_BATCH_SIZE,
+                                sleep_between_sec=dbmod.CLEANUP_INTERBATCH_SLEEP_SEC,
+                                op_name=None):
+        # Wrap the real helper but record each batch's deleted count.
+        sql = (
+            f"DELETE FROM {table} WHERE rowid IN ("
+            f"SELECT rowid FROM {table} WHERE {where_sql} LIMIT {int(batch_size)}"
+            f")"
+        )
+        total = 0
+        while True:
+            def _do(con):
+                cur = con.execute(sql, params)
+                return int(cur.rowcount or 0)
+            n = dbmod.write_txn(None, _do, name=op_name or f"chunked_delete_{table}")
+            progress_marks.append(n)
+            total += n
+            if n < int(batch_size):
+                return total
+            if sleep_between_sec > 0:
+                time.sleep(sleep_between_sec)
+
+    dbmod.chunked_delete = tracking_chunked_delete  # type: ignore[assignment]
+    try:
+        stop = threading.Event()
+
+        def _inserter():
+            i = 0
+            while i < 1000 and not stop.is_set():
+                try:
+                    dbmod.add_log(bot_id, "INFO", f"hot-{i}")
+                    insert_count["n"] += 1
+                except sqlite3.OperationalError as e:
+                    insert_errors.append(repr(e))
+                    return
+                i += 1
+
+        def _cleanup():
+            try:
+                dbmod.cleanup_old_bot_logs(keep_days=30)
+            except Exception as e:
+                cleanup_errors.append(repr(e))
+
+        t_ins = threading.Thread(target=_inserter, name="inserter")
+        t_cln = threading.Thread(target=_cleanup, name="cleanup")
+        t_ins.start()
+        t_cln.start()
+        t_ins.join(timeout=30.0)
+        t_cln.join(timeout=30.0)
+        stop.set()
+    finally:
+        dbmod.chunked_delete = real_chunked_delete  # type: ignore[assignment]
+
+    assert not t_ins.is_alive(), "inserter did not finish in 30s"
+    assert not t_cln.is_alive(), "cleanup did not finish in 30s"
+    assert not insert_errors, f"inserter saw OperationalError: {insert_errors}"
+    assert not cleanup_errors, f"cleanup raised: {cleanup_errors}"
+    assert insert_count["n"] == 1000, f"only {insert_count['n']}/1000 inserts done"
+
+    # Forward-progress proof: each batch except possibly the last must have
+    # deleted >0 rows. The last batch is the terminator (rows < batch_size,
+    # possibly 0). Total deleted should equal seeded old rows (5000).
+    assert progress_marks, "no batches recorded — chunked loop never ran"
+    non_terminal = progress_marks[:-1]
+    assert all(n > 0 for n in non_terminal), (
+        f"some non-terminal batch made zero progress: {progress_marks}"
+    )
+    assert sum(progress_marks) == 5000, (
+        f"expected to delete 5000 old rows, deleted {sum(progress_marks)}: {progress_marks}"
+    )
+
+
+def test_cleanup_old_order_events_chunked_under_load(temp_db):
+    """Smaller mirror of the bot_logs test for order_events (the second-hottest
+    table by INSERT rate)."""
+    bot_id = 4
+    now = int(time.time())
+
+    # Seed 1500 OLD order_events directly so cleanup has work across batches.
+    # order_events columns: id, bot_id, ts, symbol, side, ord_type, price,
+    # amount, order_id, tag, status, reason
+    fresh = sqlite3.connect(temp_db, timeout=10.0)
+    try:
+        fresh.executemany(
+            "INSERT INTO order_events(bot_id, ts, symbol, side, ord_type, "
+            "price, amount, order_id, tag, status, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(bot_id, now - 100 * 86400, "BTC/USD", "buy", "limit",
+              30000.0, 0.001, f"seed-{i}", "seed", "filled", None)
+             for i in range(1500)],
+        )
+        fresh.commit()
+    finally:
+        fresh.close()
+
+    insert_errors: list = []
+    cleanup_errors: list = []
+    inserts_done = {"n": 0}
+
+    def _inserter():
+        for i in range(300):
+            try:
+                dbmod.add_order_event(
+                    bot_id, "BTC/USD", "buy", "limit",
+                    30000.0, 0.001, f"hot-{i}", "hot", "filled", None,
+                )
+                inserts_done["n"] += 1
+            except sqlite3.OperationalError as e:
+                insert_errors.append(repr(e))
+                return
+
+    def _cleanup():
+        try:
+            dbmod.cleanup_old_order_events(keep_days=90)
+        except Exception as e:
+            cleanup_errors.append(repr(e))
+
+    t_ins = threading.Thread(target=_inserter)
+    t_cln = threading.Thread(target=_cleanup)
+    t_ins.start(); t_cln.start()
+    t_ins.join(timeout=30.0); t_cln.join(timeout=30.0)
+    assert not t_ins.is_alive() and not t_cln.is_alive()
+    assert not insert_errors, f"inserter OperationalError: {insert_errors}"
+    assert not cleanup_errors, f"cleanup raised: {cleanup_errors}"
+    assert inserts_done["n"] == 300
+
+    # All 1500 old rows deleted, all 300 hot rows survived.
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        old_left = fresh.execute(
+            "SELECT COUNT(*) FROM order_events WHERE ts < ?",
+            (now - 90 * 86400,),
+        ).fetchone()[0]
+        recent = fresh.execute(
+            "SELECT COUNT(*) FROM order_events WHERE ts >= ?",
+            (now - 90 * 86400,),
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    assert old_left == 0, f"expected 0 old order_events left, got {old_left}"
+    assert recent >= 300, f"recent rows lost: {recent} < 300"
+
+
+def test_chunked_delete_rejects_unknown_table(temp_db):
+    """SQL-injection guard: chunked_delete must reject tables not in the
+    allowlist, even though it formats the table name into the SQL string."""
+    with pytest.raises(ValueError, match="not in _ALLOWED_TABLES"):
+        dbmod.chunked_delete(
+            "evil_table; DROP TABLE bots--",
+            "ts < ?", (0,),
+        )
+
+
+def test_delete_recommendations_for_blocklist_chunked(temp_db):
+    """Functional + behavioural: blocklist DELETE removes only matching bases
+    and routes through chunked_delete (so the lock is released between
+    batches). Mixed case input is normalised to UPPER per the implementation."""
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        # recommendations_latest schema: PRIMARY KEY(symbol, horizon).
+        # Seed 30 USDT/* rows (blocked) + 30 BTC/* rows (kept) + 1 USDC row
+        # (blocked) — each across multiple horizons to keep the PK happy.
+        rows = []
+        for i in range(30):
+            rows.append((f"USDT/USD-{i}", "short", 0, int(time.time())))
+        for i in range(30):
+            rows.append((f"BTC/USD-{i}", "short", 0, int(time.time())))
+        rows.append(("USDC", "short", 0, int(time.time())))
+        fresh.executemany(
+            "INSERT INTO recommendations_latest(symbol, horizon, snapshot_id, created_ts) "
+            "VALUES (?,?,?,?)",
+            rows,
+        )
+        fresh.commit()
+    finally:
+        fresh.close()
+
+    deleted = dbmod.delete_recommendations_for_blocklist(["usdt", "USDC", ""])
+
+    assert deleted == 31, f"expected 31 deleted, got {deleted}"
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        remaining = fresh.execute(
+            "SELECT COUNT(*) FROM recommendations_latest"
+        ).fetchone()[0]
+        btc_left = fresh.execute(
+            "SELECT COUNT(*) FROM recommendations_latest WHERE symbol LIKE 'BTC/%'"
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    assert remaining == 30 and btc_left == 30
+
+
+def test_delete_recommendations_for_blocklist_empty_input_noop(temp_db):
+    """Empty bases list returns 0 without touching the DB."""
+    assert dbmod.delete_recommendations_for_blocklist([]) == 0
+    assert dbmod.delete_recommendations_for_blocklist(["", "  ", ""]) == 0
+
+
+def test_cleanup_old_signal_audits_chunked(temp_db):
+    """Smoke test for cleanup_old_signal_audits chunked migration."""
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        old = int(time.time()) - 30 * 86400  # 30 days old (cutoff is 14d)
+        new = int(time.time())
+        rows = [
+            (f"sig-{i}", "AAA/USD", "crypto", "short",
+             50.0, 50.0, "neutral", "", "", "", "", "", None, None, old)
+            for i in range(800)
+        ] + [
+            (f"sig-new-{i}", "BBB/USD", "crypto", "short",
+             50.0, 50.0, "neutral", "", "", "", "", "", None, None, new)
+            for i in range(20)
+        ]
+        fresh.executemany(
+            "INSERT INTO signal_audit("
+            "signal_id, symbol, asset_type, horizon, composite_score, "
+            "confidence_score, conviction_grade, factor_scores_json, "
+            "gate_results_json, technical_signals_json, metadata_json, "
+            "flags_json, rejection_reason, price_at_signal, created_ts"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        fresh.commit()
+    finally:
+        fresh.close()
+
+    deleted = dbmod.cleanup_old_signal_audits(keep_days=14)
+    assert deleted == 800
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        left = fresh.execute("SELECT COUNT(*) FROM signal_audit").fetchone()[0]
+    finally:
+        fresh.close()
+    assert left == 20

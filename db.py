@@ -412,6 +412,66 @@ def write_txn(
         _write_txn_state.active = False
 
 
+# ----------------------------------------------------------------------------
+# Chunked DELETE helper (Phase 1.2b step 8)
+# ----------------------------------------------------------------------------
+
+# Default batch size for cleanup_old_*. SQLite can hold the global write lock
+# for seconds on a multi-100k-row DELETE — fatal under our hot-path INSERT
+# load (the bot 1 lock loop). 500 rows is small enough to release the lock
+# every few ms, big enough to avoid per-batch overhead. Tunable per-call.
+CLEANUP_BATCH_SIZE = 500
+CLEANUP_INTERBATCH_SLEEP_SEC = 0.05
+
+
+def chunked_delete(
+    table: str,
+    where_sql: str,
+    params: Tuple[Any, ...],
+    *,
+    batch_size: int = CLEANUP_BATCH_SIZE,
+    sleep_between_sec: float = CLEANUP_INTERBATCH_SLEEP_SEC,
+    op_name: Optional[str] = None,
+) -> int:
+    """DELETE rows in batches, releasing the write lock between batches.
+
+    Each batch runs in its own ``write_txn(None, ...)`` transaction (so the
+    global write lock is released and re-acquired between batches), with
+    ``sleep_between_sec`` of yielding to give hot-path writers a slot.
+
+    ``where_sql`` is the predicate body (NOT including the LIMIT). The
+    function constructs::
+
+        DELETE FROM <table> WHERE rowid IN
+          (SELECT rowid FROM <table> WHERE <where_sql> LIMIT <batch_size>)
+
+    The rowid IN (SELECT … LIMIT N) form is used in case the SQLite build
+    was compiled without SQLITE_ENABLE_UPDATE_DELETE_LIMIT.
+
+    Returns the total number of rows deleted across all batches. Caller is
+    responsible for whitelisting ``table`` and trusting ``where_sql``.
+    """
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(f"chunked_delete: table {table!r} not in _ALLOWED_TABLES")
+    name = op_name or f"chunked_delete_{table}"
+    sql = (
+        f"DELETE FROM {table} WHERE rowid IN ("
+        f"SELECT rowid FROM {table} WHERE {where_sql} LIMIT {int(batch_size)}"
+        f")"
+    )
+    total = 0
+    while True:
+        def _do(con) -> int:
+            cur = con.execute(sql, params)
+            return int(cur.rowcount or 0)
+        n = write_txn(None, _do, name=name)
+        total += n
+        if n < int(batch_size):
+            return total
+        if sleep_between_sec > 0:
+            time.sleep(sleep_between_sec)
+
+
 def open_migration_conn() -> sqlite3.Connection:
     """Public alias for the canonical fresh-connection factory.
 
@@ -4475,61 +4535,66 @@ def list_recommendations(
 
 def delete_recommendations_for_blocklist(bases: List[str]) -> int:
     """Remove recommendations for crypto symbols whose base is in the blocklist.
-    Call on startup to purge STABLE and other blocked tokens from Explore.
-    Returns count of symbols removed."""
+
+    Phase 1.2b step 8: each base purges through chunked_delete so a long
+    blocklist of 50+ stables doesn't hold the global write lock during
+    startup, when the Explore feed and bot tickers are also writing.
+    """
     if not bases:
         return 0
+    deleted = 0
     try:
-        con = _conn()
-        cur = con.cursor()
-        deleted = 0
         for base in bases:
             b = str(base).strip().upper()
             if not b:
                 continue
-            # Match STABLE/USD, stable/usd, etc. (case-insensitive via UPPER)
-            cur.execute(
-                "DELETE FROM recommendations_latest WHERE UPPER(symbol) LIKE ? OR UPPER(symbol) = ?",
+            deleted += chunked_delete(
+                "recommendations_latest",
+                "UPPER(symbol) LIKE ? OR UPPER(symbol) = ?",
                 (b + "/%", b),
+                op_name="delete_recommendations_for_blocklist",
             )
-            deleted += cur.rowcount
-        con.commit()
-        con.close()
         return deleted
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("delete_recommendations_for_blocklist: %s", e)
-        return 0
+    except Exception:
+        logger.exception("delete_recommendations_for_blocklist failed (deleted=%d so far)", deleted)
+        return deleted
 
 
 def cleanup_invalid_scores() -> int:
-    """Remove recommendations with score >= 98 and empty/null reasons (data artifacts).
-    Also remove stock recommendations older than 24h with no valid metrics."""
+    """Remove recommendation artifacts (perfect scores w/ empty reasons, stale rows).
+
+    Phase 1.2b step 8: routed through write_txn so it serialises with hot-path
+    writers and inherits retry/contention handling. The 48h staleness DELETE
+    is chunked separately because it can cover thousands of rows after a
+    multi-day downtime.
+    """
+    deleted = 0
     try:
-        con = _conn()
-        cur = con.cursor()
-        # Remove perfect scores with no reasons (artifacts)
-        # Note: recommendations_latest doesn't have a score column — join to snapshots
-        cur.execute(
-            """DELETE FROM recommendations_latest WHERE snapshot_id IN (
-                SELECT id FROM recommendations_snapshots
-                WHERE score >= 98 AND (reasons_json IS NULL OR reasons_json = '[]' OR reasons_json = '')
-            )"""
+        # Pass 1: remove perfect-score artifacts (single, bounded subquery —
+        # cardinality is naturally tiny so a single transaction is fine).
+        def _purge_perfect(con) -> int:
+            cur = con.execute(
+                """DELETE FROM recommendations_latest WHERE snapshot_id IN (
+                    SELECT id FROM recommendations_snapshots
+                    WHERE score >= 98 AND (reasons_json IS NULL OR reasons_json = '[]' OR reasons_json = '')
+                )"""
+            )
+            return int(cur.rowcount or 0)
+
+        deleted += write_txn(None, _purge_perfect, name="cleanup_invalid_scores_perfect")
+
+        # Pass 2: remove rows older than 48h, chunked.
+        cutoff = int(time.time()) - 48 * 3600
+        deleted += chunked_delete(
+            "recommendations_latest",
+            "created_ts < ? AND created_ts > 0",
+            (cutoff,),
+            op_name="cleanup_invalid_scores_stale",
         )
-        deleted = cur.rowcount
-        # Remove very old recommendations (>48h) to prevent stale data
-        cur.execute(
-            "DELETE FROM recommendations_latest WHERE created_ts < ? AND created_ts > 0",
-            (int(time.time()) - 48 * 3600,),
-        )
-        deleted += cur.rowcount
-        con.commit()
-        con.close()
         return deleted
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("cleanup_invalid_scores: %s", e)
-        return 0
+    except Exception:
+        logger.exception("cleanup_invalid_scores failed (deleted=%d so far)", deleted)
+        return deleted
 
 
 def get_recommendation(symbol: str, horizon: str) -> Optional[Dict[str, Any]]:
@@ -5348,66 +5413,75 @@ def remove_watchlist_entry(symbol: str) -> None:
 
 
 def cleanup_old_watchlist(max_age_hours: int = 72) -> int:
-    """Expire watchlist entries older than max_age_hours. Returns count expired."""
-    con = _conn()
+    """Expire watchlist entries older than max_age_hours. Returns count expired.
+
+    Phase 1.2b step 8: chunked UPDATE rather than chunked DELETE — same lock
+    pattern (release/re-acquire global write lock between batches).
+    """
     cutoff = now_ts() - (max_age_hours * 3600)
-    cur = con.cursor()
-    cur.execute(
-        "UPDATE scanner_watchlist SET status='expired', updated_at=? WHERE status='watching' AND created_at < ?",
-        (now_ts(), cutoff),
+    batch = CLEANUP_BATCH_SIZE
+    sql = (
+        "UPDATE scanner_watchlist SET status='expired', updated_at=? "
+        "WHERE rowid IN ("
+        "  SELECT rowid FROM scanner_watchlist "
+        "  WHERE status='watching' AND created_at < ? LIMIT " + str(int(batch)) +
+        ")"
     )
-    count = cur.rowcount
-    con.commit()
-    con.close()
-    return count
+    total = 0
+    try:
+        while True:
+            now = now_ts()
+            def _do(con) -> int:
+                cur = con.execute(sql, (now, cutoff))
+                return int(cur.rowcount or 0)
+            n = write_txn(None, _do, name="cleanup_old_watchlist")
+            total += n
+            if n < batch:
+                return total
+            time.sleep(CLEANUP_INTERBATCH_SLEEP_SEC)
+    except Exception:
+        logger.exception("cleanup_old_watchlist failed (expired=%d so far)", total)
+        return total
 
 
 def cleanup_old_portfolio_snapshots(keep_days: int = 90) -> int:
-    """Delete portfolio_snapshots older than keep_days. Returns count deleted."""
+    """Delete portfolio_snapshots older than keep_days. Chunked."""
     if keep_days < 1 or keep_days > 3650:
         keep_days = 90
-    con = _conn()
+    cutoff_dt_modifier = '-' + str(int(keep_days)) + ' days'
     try:
-        cur = con.cursor()
-        # Modifier must be literal; keep_days is code-controlled, not user input
-        cur.execute(
-            "DELETE FROM portfolio_snapshots WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')",
-            (keep_days,),
+        # portfolio_snapshots.timestamp is stored as ISO text — use datetime()
+        # for the comparison. The modifier is code-controlled, not user input.
+        return chunked_delete(
+            "portfolio_snapshots",
+            "datetime(timestamp) < datetime('now', ?)",
+            (cutoff_dt_modifier,),
+            op_name="cleanup_old_portfolio_snapshots",
         )
-        count = cur.rowcount
-        con.commit()
-        return count
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("cleanup_old_portfolio_snapshots: %s", e)
+    except Exception:
+        logger.exception("cleanup_old_portfolio_snapshots failed")
         return 0
-    finally:
-        con.close()
 
 
 def cleanup_old_recommendation_snapshots(keep_days: int = 7) -> int:
     """Delete recommendation snapshots older than keep_days, except those still referenced by recommendations_latest.
     Keeps at least 7 days of history for 24h/72h outcome tracking.
-    Returns number of rows deleted."""
+    Returns number of rows deleted.
+
+    Phase 1.2b step 8: chunked DELETE that re-evaluates the
+    recommendations_latest subquery each batch (NOT IN can be expensive on
+    large snapshot tables; chunking caps the wall-clock the lock is held).
+    """
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        # Delete old snapshots NOT referenced by recommendations_latest
-        cur = con.execute(
-            """DELETE FROM recommendations_snapshots
-               WHERE created_ts < ?
-               AND id NOT IN (SELECT snapshot_id FROM recommendations_latest)""",
-            (cutoff,)
+        return chunked_delete(
+            "recommendations_snapshots",
+            "created_ts < ? AND id NOT IN (SELECT snapshot_id FROM recommendations_latest)",
+            (cutoff,),
+            op_name="cleanup_old_recommendation_snapshots",
         )
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("cleanup_old_recommendation_snapshots: %s", e)
+    except Exception:
+        logger.exception("cleanup_old_recommendation_snapshots failed")
         return 0
 
 
@@ -5486,17 +5560,15 @@ def list_signal_audits(
 
 
 def cleanup_old_signal_audits(keep_days: int = 14) -> int:
-    """Delete signal audit records older than keep_days."""
+    """Delete signal audit records older than keep_days. Chunked."""
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM signal_audit WHERE created_ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_signal_audits: %s", e)
+        return chunked_delete(
+            "signal_audit", "created_ts < ?", (cutoff,),
+            op_name="cleanup_old_signal_audits",
+        )
+    except Exception:
+        logger.exception("cleanup_old_signal_audits failed")
         return 0
 
 
@@ -5579,104 +5651,95 @@ def get_trade_feedback(symbol: str = "", profitable: Optional[int] = None, limit
 # ──────────────────────────────────────────────────────────────────────────────
 
 def cleanup_old_bot_logs(keep_days: int = 30) -> int:
-    """Delete bot_logs entries older than keep_days. Returns count deleted."""
+    """Delete bot_logs entries older than keep_days. Returns count deleted.
+
+    Phase 1.2b step 8: chunked DELETE LIMIT 500 with 50ms inter-batch sleep
+    so hot-path writers (add_log, add_order_event) keep making forward
+    progress while we prune. The single-DELETE-with-WAL-checkpoint pattern
+    that lived here before was the strongest mechanical explanation for
+    bot 1's 'Fatal error: OperationalError: database is locked' loop on
+    the live host.
+    """
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM bot_logs WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
+        deleted = chunked_delete(
+            "bot_logs", "ts < ?", (cutoff,), op_name="cleanup_old_bot_logs",
+        )
+        # Background WAL checkpoint thread handles TRUNCATE; no explicit
+        # PRAGMA wal_checkpoint needed here.
         return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_bot_logs: %s", e)
+    except Exception:
+        logger.exception("cleanup_old_bot_logs failed")
         return 0
 
 
 def cleanup_old_strategy_decisions(keep_days: int = 30) -> int:
-    """Delete strategy_decisions entries older than keep_days. Returns count deleted."""
+    """Delete strategy_decisions entries older than keep_days. Chunked."""
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM strategy_decisions WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_strategy_decisions: %s", e)
+        return chunked_delete(
+            "strategy_decisions", "ts < ?", (cutoff,),
+            op_name="cleanup_old_strategy_decisions",
+        )
+    except Exception:
+        logger.exception("cleanup_old_strategy_decisions failed")
         return 0
 
 
 def cleanup_old_explore_signal_outcomes(keep_days: int = 90) -> int:
-    """Delete explore_signal_outcomes entries older than keep_days. Returns count deleted."""
+    """Delete explore_signal_outcomes entries older than keep_days. Chunked."""
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM explore_signal_outcomes WHERE signal_ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_explore_signal_outcomes: %s", e)
+        return chunked_delete(
+            "explore_signal_outcomes", "signal_ts < ?", (cutoff,),
+            op_name="cleanup_old_explore_signal_outcomes",
+        )
+    except Exception:
+        logger.exception("cleanup_old_explore_signal_outcomes failed")
         return 0
 
 
 def cleanup_old_order_events(keep_days: int = 90) -> int:
-    """Delete order_events entries older than keep_days. Returns count deleted."""
+    """Delete order_events entries older than keep_days. Chunked.
+
+    Phase 1.2b step 8: same chunked pattern as cleanup_old_bot_logs.
+    order_events is the second-hottest table by INSERT rate, so the same
+    mass-DELETE-while-INSERT collision risk applies.
+    """
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM order_events WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_order_events: %s", e)
+        return chunked_delete(
+            "order_events", "ts < ?", (cutoff,),
+            op_name="cleanup_old_order_events",
+        )
+    except Exception:
+        logger.exception("cleanup_old_order_events failed")
         return 0
 
 
 def cleanup_old_regime_snapshots(keep_days: int = 30) -> int:
-    """Delete regime_snapshots entries older than keep_days. Returns count deleted."""
+    """Delete regime_snapshots entries older than keep_days. Chunked."""
     try:
-        con = _conn()
         cutoff = int(time.time()) - (keep_days * 86400)
-        cur = con.execute("DELETE FROM regime_snapshots WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_regime_snapshots: %s", e)
+        return chunked_delete(
+            "regime_snapshots", "ts < ?", (cutoff,),
+            op_name="cleanup_old_regime_snapshots",
+        )
+    except Exception:
+        logger.exception("cleanup_old_regime_snapshots failed")
         return 0
 
 
 def cleanup_old_trade_feedback(keep_days: int = 180) -> int:
-    """Delete trade_feedback entries older than keep_days (keep for ML). Returns count deleted."""
+    """Delete trade_feedback entries older than keep_days. Chunked."""
     try:
-        con = _conn()
         cutoff = time.time() - (keep_days * 86400)
-        cur = con.execute("DELETE FROM trade_feedback WHERE timestamp < ?", (cutoff,))
-        deleted = cur.rowcount
-        if deleted > 0:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        return deleted
-    except Exception as e:
-        logger.warning("cleanup_old_trade_feedback: %s", e)
+        return chunked_delete(
+            "trade_feedback", "timestamp < ?", (cutoff,),
+            op_name="cleanup_old_trade_feedback",
+        )
+    except Exception:
+        logger.exception("cleanup_old_trade_feedback failed")
         return 0
 
 
