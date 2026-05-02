@@ -1729,3 +1729,86 @@ def test_cleanup_old_signal_audits_chunked(temp_db):
     finally:
         fresh.close()
     assert left == 20
+
+
+# ===========================================================================
+# 1.2d: ml_signal_scorer._log_version_to_db — fix the silent-no-op
+# ===========================================================================
+#
+# Bug (audit §4.5 / db_writers.md:215): the function imported a non-existent
+# ``db.get_db`` symbol; ImportError was caught by ``except Exception`` and
+# silently swallowed. Net effect: ml_model_versions never received any rows.
+# After the fix, the function calls ``db.save_ml_model_version`` which routes
+# through ``write_txn(None, ...)`` and surfaces failures via ``logger.exception``.
+
+def test_ml_signal_scorer_log_version_to_db_inserts_row(temp_db):
+    """Acceptance test for Phase 1.2d. Pre-fix the call was a silent no-op
+    (raised ImportError on ``from db import get_db``, hidden by outer except).
+    Post-fix it must insert a real row through ``write_txn``."""
+    import importlib
+
+    mss = importlib.import_module("ml_signal_scorer")
+    importlib.reload(mss)  # pick up the post-fix top-level ``import db``
+
+    scorer = mss.MLSignalScorer.__new__(mss.MLSignalScorer)  # bypass __init__
+    meta = {"model_type": "LightGBM", "auc": 0.812, "accuracy": 0.71}
+    scorer._log_version_to_db(meta)
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        rows = fresh.execute(
+            "SELECT model_type, validation_accuracy, deployed FROM ml_model_versions"
+        ).fetchall()
+    finally:
+        fresh.close()
+
+    assert len(rows) == 1
+    assert rows[0][0] == "LightGBM"
+    assert abs(rows[0][1] - 0.812) < 1e-6
+    assert rows[0][2] == 1
+
+
+def test_ml_signal_scorer_log_version_to_db_does_not_silently_swallow(
+    temp_db, monkeypatch, caplog
+):
+    """Failures during version logging must surface via logger.exception, not
+    be swallowed silently (brief rule #4)."""
+    import importlib
+    import logging
+
+    mss = importlib.import_module("ml_signal_scorer")
+    importlib.reload(mss)
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated db failure")
+
+    monkeypatch.setattr(mss.db, "save_ml_model_version", _boom, raising=True)
+
+    scorer = mss.MLSignalScorer.__new__(mss.MLSignalScorer)
+    with caplog.at_level(logging.ERROR, logger="ml_signal_scorer"):
+        scorer._log_version_to_db({"model_type": "LightGBM", "auc": 0.5})
+
+    matched = [r for r in caplog.records
+               if "failed to log model version" in r.getMessage()]
+    assert matched, f"expected logger.exception, got: {[r.getMessage() for r in caplog.records]}"
+    # Must be ERROR-level (logger.exception), not DEBUG silent-swallow.
+    assert all(r.levelno >= logging.ERROR for r in matched)
+    # Must include traceback context from logger.exception.
+    assert any(r.exc_info is not None for r in matched)
+
+
+def test_ml_signal_scorer_no_inline_db_get_db_import():
+    """Source-level regression: the broken ``from db import get_db`` must not
+    reappear, and ``conn = get_db()`` must not be used anywhere in
+    ml_signal_scorer.py. A single grep keeps a stale-import revert from
+    silently re-introducing the bug."""
+    src_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "ml_signal_scorer.py",
+    )
+    with open(src_path, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "from db import get_db" not in src, \
+        "ml_signal_scorer.py still imports the non-existent db.get_db (Phase 1.2d regression)"
+    assert "get_db(" not in src, \
+        "ml_signal_scorer.py still calls get_db() (Phase 1.2d regression)"
