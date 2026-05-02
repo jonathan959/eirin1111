@@ -4881,6 +4881,12 @@ def shutdown():
     logger.info("Shutdown event triggered - waiting up to 30 seconds for operations to complete...")
     _shutdown_event.set()
 
+    try:
+        from db import stop_wal_checkpoint_thread
+        stop_wal_checkpoint_thread(timeout_sec=5.0)
+    except Exception:
+        logger.exception("shutdown: stop_wal_checkpoint_thread failed")
+
     # Stop all running bots
     if bm:
         try:
@@ -5193,6 +5199,15 @@ def _startup_impl():
     from db import DB_NAME
     _STARTUP_STATUS["db_path"] = DB_NAME
     _STARTUP_STATUS["timestamp"] = int(time.time())
+    try:
+        from db import start_wal_checkpoint_thread
+        start_wal_checkpoint_thread()
+        logger.info(
+            "startup: WAL checkpoint daemon started (interval BOT_WAL_CHECKPOINT_INTERVAL_SEC)"
+        )
+    except Exception:
+        logger.exception("startup: WAL checkpoint daemon failed to start")
+
     try:
         env_res = get_last_load_result()
         _STARTUP_STATUS["env_loaded_paths"] = env_res.get("loaded_paths") or []

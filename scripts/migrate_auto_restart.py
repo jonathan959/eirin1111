@@ -70,8 +70,9 @@ def main() -> int:
         print(f"[migrate_auto_restart] FATAL: could not import db module: {e}")
         return 0  # best-effort migration
 
-    conn = db.open_migration_conn()
+    conn: sqlite3.Connection | None = None
     try:
+        conn = db.open_migration_conn()
         if not _table_exists(conn, "bots"):
             print("[migrate_auto_restart] 'bots' table does not exist yet (fresh DB?). Nothing to do.")
             return 0
@@ -110,10 +111,11 @@ def main() -> int:
         # Migration is best-effort: do not fail the deploy on transient SQLite issues.
         return 0
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -307,9 +307,12 @@ def write_txn(
     Contract (see audit/write_txn_design.md §1.1):
       * ``fn`` receives a connection-like object with WAL+busy_timeout PRAGMAs.
       * ``fn`` MUST NOT call ``write_txn`` recursively (raises RuntimeError).
-      * ``fn`` MUST NOT close the conn or call ``commit()`` itself; this function
-        commits exactly once on success and rolls back on exception.
+      * ``fn`` MUST NOT close the connection. Prefer not to call ``commit()``
+        inside ``fn`` — ``write_txn`` commits once after ``fn`` returns; an
+        extra mid-body ``commit`` is discouraged but tolerated (see tests).
       * Per-bot lock when ``bot_id`` is set; global write lock otherwise.
+        The lock is acquired **per attempt only** and released before the
+        inter-attempt sleep so other writers are not starved during backoff.
       * Up to 6 attempts (initial + 5 retries) on "database is locked"; sleeps
         between retries follow ``_RETRY_SCHEDULE_MS`` with +/-20% jitter.
       * On final failure raises ``DBLockedError`` (subclass of OperationalError)
@@ -328,30 +331,54 @@ def write_txn(
     started_at = time.monotonic()
     last_exc: Optional[BaseException] = None
     attempts_made = 0
+    max_retries = len(_RETRY_SCHEDULE_MS)
 
     _write_txn_state.active = True
     try:
-        with lock:
-            for attempt in range(len(_RETRY_SCHEDULE_MS) + 1):  # 0..5 → up to 6 tries
-                if attempt > 0:
-                    sleep_sec = _next_sleep_sec(attempt - 1)
-                    elapsed_ms = int((time.monotonic() - started_at) * 1000)
-                    logger.warning(
-                        "write_txn retry %d/%d op=%s bot_id=%s sleep=%.3fs elapsed_ms=%d",
-                        attempt,
-                        len(_RETRY_SCHEDULE_MS),
-                        op_name,
-                        "None" if bid is None else bid,
-                        sleep_sec,
-                        elapsed_ms,
-                    )
-                    time.sleep(sleep_sec)
+        for attempt in range(max_retries + 1):
+            attempts_made = attempt + 1
+            if attempt > 0:
+                sleep_sec = _next_sleep_sec(attempt - 1)
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                jitter_ms = sleep_sec * 1000.0
+                logger.warning(
+                    "write_txn retry %d/%d op=%s bot_id=%s sleep_sec=%.3f elapsed_ms=%d jitter_ms=%.0f",
+                    attempt,
+                    max_retries,
+                    op_name,
+                    "None" if bid is None else bid,
+                    sleep_sec,
+                    elapsed_ms,
+                    jitter_ms,
+                )
+                time.sleep(sleep_sec)
 
-                attempts_made = attempt + 1
-                noclose = _conn()  # per-thread cached _NoCloseConn over a real conn
-                tracking = _TrackingConn(noclose, state)
+            noclose = _conn()  # per-thread cached _NoCloseConn over a real conn
+            tracking = _TrackingConn(noclose, state)
+
+            retry_for_lock = False
+            ret: Any = None
+
+            with lock:
                 try:
                     ret = fn(tracking)
+                    try:
+                        noclose.commit()
+                    except sqlite3.OperationalError as exc:
+                        # COMMIT itself can fail with "database is locked" under WAL contention.
+                        last_exc = exc
+                        try:
+                            noclose.rollback()
+                        except Exception:
+                            logger.exception(
+                                "write_txn: rollback after commit-failure failed (op=%s bot_id=%s)",
+                                op_name, bid,
+                            )
+                        if _is_database_locked(exc):
+                            retry_for_lock = True
+                        else:
+                            raise
+
                 except sqlite3.OperationalError as exc:
                     last_exc = exc
                     try:
@@ -362,8 +389,10 @@ def write_txn(
                             op_name, bid,
                         )
                     if _is_database_locked(exc):
-                        continue  # retry
-                    raise
+                        retry_for_lock = True
+                    else:
+                        raise
+
                 except BaseException:
                     try:
                         noclose.rollback()
@@ -374,40 +403,22 @@ def write_txn(
                         )
                     raise
 
-                # Success path: commit, return.
-                try:
-                    noclose.commit()
-                except sqlite3.OperationalError as exc:
-                    # COMMIT itself can fail with "database is locked" under heavy
-                    # WAL contention. Treat the same as fn failure: rollback & retry.
-                    last_exc = exc
-                    try:
-                        noclose.rollback()
-                    except Exception:
-                        logger.exception(
-                            "write_txn: rollback after commit-failure failed (op=%s bot_id=%s)",
-                            op_name, bid,
-                        )
-                    if _is_database_locked(exc):
-                        continue
-                    raise
-                return ret
+            if retry_for_lock:
+                continue
 
-            # Exhausted all attempts.
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            err = DBLockedError(
-                bot_id=bid,
-                op_name=op_name,
-                attempts=attempts_made,
-                elapsed_ms=elapsed_ms,
-                last_sql=state.get("last_sql"),
-                last_exc=last_exc,
-            )
-            logger.error(
-                "write_txn exhausted retries: %s",
-                err,
-            )
-            raise err from last_exc
+            return ret  # type: ignore[return-value]
+
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        err = DBLockedError(
+            bot_id=bid,
+            op_name=op_name,
+            attempts=attempts_made,
+            elapsed_ms=elapsed_ms,
+            last_sql=state.get("last_sql"),
+            last_exc=last_exc,
+        )
+        logger.error("write_txn exhausted retries: %s", err)
+        raise err from last_exc
     finally:
         _write_txn_state.active = False
 

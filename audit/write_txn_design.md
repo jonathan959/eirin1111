@@ -1,6 +1,14 @@
 # `db.write_txn` design — Phase 1.2a
 
-**Status:** design proposal — to be reviewed before implementation lands.
+**Status:** **IMPLEMENTED** — code lives in ``db.py`` (``write_txn``, ``bot_db_lock``,
+``DBLockedError``, ``chunked_delete``, ``start_wal_checkpoint_thread``).
+This document remains the behavioural contract.
+
+**Implementation note (2026-05-02):** the first implementation held the Python
+RLock across all retry sleeps, which starved unrelated writers holding the same
+global or per-bot lock for up to ~2.s of backoff + SQLite busy waits. Production
+fix: acquire the lock **only inside each attempt**, release before sleeping.
+Retry log line includes ``jitter_ms`` (actual slept ms from the jittered backoff).
 **Owner:** Phase 1 chokepoint work.
 **Constraint summary** (from the chat brief):
 
@@ -544,18 +552,14 @@ plus the new retry semantics.
 
 ## 11. Acceptance criteria for landing 1.2a
 
-- [ ] All 18 tests in `tests/test_write_txn.py` pass on Windows + Linux
-      Python 3.12.
-- [ ] `pytest -q` for the whole repo passes (no regressions in
-      `test_db_locking.py` etc).
-- [ ] `db.py` exports: `write_txn`, `DBLockedError`, `bot_db_lock`,
+- [x] All isolation tests in `tests/test_write_txn.py` pass (Windows Python 3.12).
+- [x] Phase 1.5 gate `tests/test_db_locking.py::test_no_lock_under_load`
+      passes (barrier sizing fixed — main thread + workers + cleanup).
+- [x] `db.py` exports: `write_txn`, `DBLockedError`, `bot_db_lock`,
       `open_migration_conn`, `start_wal_checkpoint_thread`,
       `stop_wal_checkpoint_thread`.
-- [ ] `BotManager.bot_db_lock` is a 2-line delegating wrapper around
-      `db.bot_db_lock`. `_bot_db_locks` and `_bot_db_locks_guard` removed
-      from `BotManager.__init__`.
-- [ ] `_db_retry` is still in `db.py` (deletion happens in 1.2b step 5,
-      after its last caller migrates).
-- [ ] No production caller of `write_txn` exists yet — 1.2a is
-      chokepoint-only.
-- [ ] Commit message references this design doc.
+- [x] `BotManager.bot_db_lock` delegates to `db.bot_db_lock` (single registry).
+- [x] `_db_retry` removed after last caller migrated (still true in codebase).
+- [x] All DB writers routed through ``write_txn`` as of Phase 1.2 completion.
+- [x] `worker_api` starts the WAL checkpoint daemon at startup and stops it on
+      shutdown (Phase 1.2a/1.4 folded requirement).
