@@ -1454,6 +1454,244 @@ def test_manual_close_deal_and_journal_atomic(temp_db, monkeypatch):
     assert n_feedback == 0, "race-loss must not insert trade_feedback"
 
 
+# ===========================================================================
+# 1.2c step 3: global writers (set_setting, log_*, save_*, watchlist,
+#              create_bot, save_autopilot_config, db_analyze, db_vacuum)
+# ===========================================================================
+
+
+def _track_write_txn(monkeypatch):
+    """Returns (captured_list, restore_callable). Pass ``captured`` to
+    assertions; pytest's monkeypatch automatically restores on exit."""
+    captured: list = []
+    real = dbmod.write_txn
+    monkeypatch.setattr(dbmod, "write_txn",
+                        lambda b, fn, *, name=None: (captured.append((b, name)), real(b, fn, name=name))[1],
+                        raising=True)
+    return captured
+
+
+def test_create_bot_routes_through_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    bid = _seed_min_bot(temp_db, "B-create")
+    assert (None, "create_bot") in captured
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        n = fresh.execute("SELECT COUNT(*) FROM bots WHERE id=?", (bid,)).fetchone()[0]
+    finally:
+        fresh.close()
+    assert n == 1
+
+
+def test_set_setting_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.set_setting("phase_1_2c_test", "abc")
+    dbmod.set_setting("phase_1_2c_test", "def")  # ON CONFLICT DO UPDATE
+    assert captured == [(None, "set_setting"), (None, "set_setting")]
+    assert dbmod.get_setting("phase_1_2c_test") == "def"
+
+
+def test_save_autopilot_config_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.save_autopilot_config({"enabled": 1, "max_positions": 5})
+    assert (None, "save_autopilot_config") in captured
+    row = dbmod.get_autopilot_config_row()
+    assert row is not None and row.get("enabled") == 1 and row.get("max_positions") == 5
+
+
+def test_log_data_quality_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.log_data_quality("scanner", "stale_price", "warning", details={"sym": "BTC"})
+    assert (None, "log_data_quality") in captured
+
+
+def test_log_error_uses_per_bot_when_bot_id_set(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-logerror")
+    captured = _track_write_txn(monkeypatch)
+    dbmod.log_error("runner", "tick_failed", message="hi", bot_id=bid)
+    dbmod.log_error("api", "global_failure")
+    # Per-bot lock when bot_id set; global when not.
+    assert (bid, "log_error") in captured
+    assert (None, "log_error") in captured
+
+
+def test_log_audit_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.log_audit("login", details="user=admin", ip="127.0.0.1")
+    assert (None, "log_audit") in captured
+
+
+def test_save_market_event_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.save_market_event(int(time.time()), "earnings", symbol="AAPL",
+                            impact_level=2, description="Q3")
+    assert (None, "save_market_event") in captured
+
+
+def test_save_dividend_event_uses_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.save_dividend_event("AAPL", int(time.time()), 0.24,
+                              payment_date=int(time.time()) + 86400,
+                              dividend_yield_pct=0.5)
+    assert (None, "save_dividend_event") in captured
+
+
+def test_upsert_trade_journal_routes_through_write_txn(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-journal")
+    deal_id = dbmod.open_deal(bid, "BTC/USD")
+    captured = _track_write_txn(monkeypatch)
+
+    dbmod.upsert_trade_journal(deal_id, entry_reason="rsi<30")
+    dbmod.upsert_trade_journal(deal_id, exit_reason="target hit")  # update path
+
+    # Per-bot lock when we resolve bot_id from the deal.
+    assert (bid, "upsert_trade_journal") in captured
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        row = fresh.execute(
+            "SELECT entry_reason, exit_reason FROM trade_journal WHERE deal_id=?",
+            (deal_id,),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert row == ("rsi<30", "target hit")
+
+
+def test_watchlist_writers_route_through_write_txn(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    rid = dbmod.upsert_watchlist_entry(
+        "BTC/USD", "crypto", "{}", "rsi<30", regime="trending",
+        entry_type="dip", confidence=0.8, edge_score=0.5,
+    )
+    rid2 = dbmod.upsert_watchlist_entry(
+        "BTC/USD", "crypto", "{}", "rsi<25", regime="trending",
+        entry_type="dip", confidence=0.85, edge_score=0.55,
+    )
+    assert rid == rid2  # second call updates the same row
+    dbmod.mark_watchlist_triggered("BTC/USD", bot_id=42)
+    dbmod.upsert_watchlist_entry("ETH/USD", "crypto", "{}", "rsi<30")
+    dbmod.remove_watchlist_entry("ETH/USD")
+
+    names = [n for _, n in captured]
+    assert "upsert_watchlist_entry" in names
+    assert "mark_watchlist_triggered" in names
+    assert "remove_watchlist_entry" in names
+
+
+def test_db_analyze_routes_through_write_txn_global(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.db_analyze()
+    assert (None, "db_analyze") in captured
+
+
+def test_db_vacuum_does_not_use_write_txn_but_holds_global_lock(temp_db):
+    """db_vacuum is the documented exception (VACUUM cannot run inside
+    a transaction). It must run cleanly without raising AND it must
+    serialise with concurrent writers — we verify the second by
+    sandwiching it between writes that all complete."""
+    bid = _seed_min_bot(temp_db, "B-vacuum")
+
+    errors: list = []
+    counts = {"log": 0, "vacuum": 0}
+
+    def _logger():
+        for i in range(50):
+            try:
+                dbmod.add_log(bid, "INFO", f"vacuum-test-{i}")
+                counts["log"] += 1
+            except sqlite3.OperationalError as e:
+                errors.append(repr(e))
+                return
+
+    def _vacuumer():
+        try:
+            dbmod.db_vacuum()
+            counts["vacuum"] += 1
+        except sqlite3.OperationalError as e:
+            errors.append(repr(e))
+
+    t1 = threading.Thread(target=_logger)
+    t2 = threading.Thread(target=_vacuumer)
+    t1.start(); t2.start()
+    t1.join(timeout=15.0); t2.join(timeout=15.0)
+
+    assert not t1.is_alive() and not t2.is_alive(), "thread did not finish"
+    assert not errors, f"OperationalError leaked: {errors}"
+    assert counts["vacuum"] == 1
+    assert counts["log"] == 50
+
+
+def test_save_ml_model_version_routes_through_write_txn(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.save_ml_model_version("regime", "v1.0", 0.78, deployed=True)
+    assert (None, "save_ml_model_version") in captured
+
+
+def test_save_intraday_pattern_routes_through_write_txn(temp_db, monkeypatch):
+    captured = _track_write_txn(monkeypatch)
+    dbmod.save_intraday_pattern("BTC/USD", "or_break", int(time.time()),
+                                price=30000.0, volume_spike_ratio=2.5)
+    assert (None, "save_intraday_pattern") in captured
+
+
+def test_add_intelligence_decision_uses_per_bot_lock(temp_db, monkeypatch):
+    bid = _seed_min_bot(temp_db, "B-intel")
+    captured = _track_write_txn(monkeypatch)
+    rid = dbmod.add_intelligence_decision(
+        bid, "BTC/USD", "buy,wait", "wait", "rsi neutral",
+        True, "ok", "yes", "ok", "trending", 0.5,
+        "classic", "limit", "tp_only", 1.0, "limit",
+        "[]", "[]", "{}",
+    )
+    assert (bid, "add_intelligence_decision") in captured
+    assert rid > 0
+
+
+def test_global_writers_under_concurrent_load(temp_db):
+    """4 threads × 1.5s — each calling a different global writer.
+    Zero OperationalError leaks proves write_txn(None, ...) serialises
+    across writer categories."""
+    DURATION_SEC = 1.5
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {"set": 0, "log_dq": 0, "audit": 0, "market": 0}
+    cnt_lock = threading.Lock()
+
+    def _writer(label: str):
+        deadline = time.monotonic() + DURATION_SEC
+        i = 0
+        while time.monotonic() < deadline:
+            try:
+                if label == "set":
+                    dbmod.set_setting(f"k_{i % 5}", f"v_{i}")
+                elif label == "log_dq":
+                    dbmod.log_data_quality("scan", "stale", "warning")
+                elif label == "audit":
+                    dbmod.log_audit("hot", details=f"i={i}")
+                else:  # market
+                    dbmod.save_market_event(int(time.time()), "earnings",
+                                            symbol=f"X{i % 7}", impact_level=2,
+                                            description="hot")
+                with cnt_lock:
+                    counts[label] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((label, repr(e)))
+                return
+            i += 1
+
+    threads = [threading.Thread(target=_writer, args=(label,))
+               for label in ("set", "log_dq", "audit", "market")]
+    for t in threads: t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive()
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for label, n in counts.items():
+        assert n > 0, f"{label} made no forward progress"
+
+
 def test_cleanup_old_signal_audits_chunked(temp_db):
     """Smoke test for cleanup_old_signal_audits chunked migration."""
     fresh = sqlite3.connect(temp_db, timeout=5.0)

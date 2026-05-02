@@ -1826,17 +1826,22 @@ def list_logs_window(bot_id: int, start_ts: int, end_ts: int, limit: int = 200) 
 
 
 def log_data_quality(source: str, issue_type: str, severity: str, details: Optional[Dict] = None) -> None:
-    """Log data quality issue to data_quality_log."""
-    con = _conn()
-    try:
+    """Log data quality issue to data_quality_log.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        now_ts(), str(source)[:64], str(issue_type)[:64], str(severity)[:32],
+        json.dumps(details) if details else None,
+    )
+
+    def _do(con) -> None:
         con.execute(
             "INSERT INTO data_quality_log(ts, source, issue_type, severity, details_json) VALUES (?,?,?,?,?)",
-            (now_ts(), str(source)[:64], str(issue_type)[:64], str(severity)[:32],
-             str(__import__("json").dumps(details)) if details else None),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="log_data_quality")
 
 
 def get_recent_data_quality_count(minutes: int = 15, min_severity: str = "warning") -> int:
@@ -1860,32 +1865,44 @@ def get_recent_data_quality_count(minutes: int = 15, min_severity: str = "warnin
 
 
 def log_error(source: str, error_type: str, message: Optional[str] = None, bot_id: Optional[int] = None, details: Optional[Dict] = None) -> None:
-    """Log error to error_log table."""
-    con = _conn()
-    try:
+    """Log error to error_log table.
+
+    Phase 1.2c step 3: routed through write_txn — uses bot-id lock when
+    bot_id is provided, global lock otherwise (per audit §3.2).
+    """
+    bid = int(bot_id) if bot_id else None
+    params = (
+        now_ts(), str(source)[:64], str(error_type)[:64], (message or "")[:1024],
+        bid,
+        json.dumps(details) if details else None,
+    )
+
+    def _do(con) -> None:
         con.execute(
             "INSERT INTO error_log(ts, source, error_type, message, bot_id, details_json) VALUES (?,?,?,?,?,?)",
-            (now_ts(), str(source)[:64], str(error_type)[:64], (message or "")[:1024],
-             int(bot_id) if bot_id else None,
-             str(__import__("json").dumps(details)) if details else None),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(bid, _do, name="log_error")
 
 
 def add_autopilot_audit_log(action: str, symbol: Optional[str] = None, reason: Optional[str] = None, details: Optional[Dict] = None) -> None:
-    """LIVE-HARDENED: Log every autopilot decision for traceability."""
-    con = _conn()
-    try:
+    """LIVE-HARDENED: Log every autopilot decision for traceability.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        now_ts(), str(action)[:64], (symbol or "")[:32], (reason or "")[:512],
+        json.dumps(details) if details else None,
+    )
+
+    def _do(con) -> None:
         con.execute(
             "INSERT INTO autopilot_audit_log(ts, action, symbol, reason, details_json) VALUES (?,?,?,?,?)",
-            (now_ts(), str(action)[:64], (symbol or "")[:32], (reason or "")[:512],
-             str(__import__("json").dumps(details)) if details else None),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="add_autopilot_audit_log")
 
 
 def list_autopilot_audit_log(limit: int = 50) -> List[Dict[str, Any]]:
@@ -1916,67 +1933,71 @@ def list_logs_since(bot_id: int, last_id: int, limit: int = 200) -> List[Dict[st
     return [dict(r) for r in rows]
 
 def create_bot(data: Dict[str, Any]) -> int:
-    con = _conn()
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO bots(
-            name, symbol, enabled, dry_run,
-            base_quote, safety_quote, max_safety, first_dev, step_mult, tp,
-            trend_filter, trend_sma,
-            max_spend_quote, poll_seconds, strategy_mode, forced_strategy, max_open_orders,
-            vol_gap_mult, tp_vol_mult, min_gap_pct, max_gap_pct,
-            regime_hold_candles, regime_switch_ticks, regime_switch_threshold,
-            max_total_exposure_pct, per_symbol_exposure_pct, min_free_cash_pct, max_concurrent_deals,
-            spread_guard_pct, limit_timeout_sec, daily_loss_limit_pct, pause_hours,
-            auto_restart, last_running, market_type, alpaca_mode, bot_type, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            str(data["name"]),
-            str(data["symbol"]),
-            int(data.get("enabled", 0)),
-            int(data.get("dry_run", 1)),
-            float(data["base_quote"]),
-            float(data["safety_quote"]),
-            int(data["max_safety"]),
-            float(data["first_dev"]),
-            float(data["step_mult"]),
-            float(data["tp"]),
-            int(data.get("trend_filter", 0)),
-            int(data.get("trend_sma", 200)),
-            float(data["max_spend_quote"]),
-            int(data.get("poll_seconds", 10)),
-            str(data.get("strategy_mode", "classic")),
-            str(data.get("forced_strategy", "")),
-            int(data.get("max_open_orders", 6)),
-            float(data.get("vol_gap_mult", 1.0)),
-            float(data.get("tp_vol_mult", 1.0)),
-            float(data.get("min_gap_pct", 0.003)),
-            float(data.get("max_gap_pct", 0.06)),
-            int(data.get("regime_hold_candles", 2)),
-            int(data.get("regime_switch_ticks", 2)),
-            float(data.get("regime_switch_threshold", 0.6)),
-            float(data.get("max_total_exposure_pct", 0.50)),
-            float(data.get("per_symbol_exposure_pct", 0.15)),
-            float(data.get("min_free_cash_pct", 0.1)),
-            int(data.get("max_concurrent_deals", 6)),
-            float(data.get("spread_guard_pct", 0.003)),
-            int(data.get("limit_timeout_sec", 8)),
-            float(data.get("daily_loss_limit_pct", 0.06)),
-            int(data.get("pause_hours", 6)),
-            int(data.get("auto_restart", 1)),
-            int(data.get("last_running", 0)),
-            str(data.get("market_type", "crypto")),
-            str(data.get("alpaca_mode", "paper")),
-            str(data.get("bot_type", "")),
-            now_ts(),
-        ),
+    """Phase 1.2c step 3: routed through write_txn(None, ...). New bot
+    has no runner yet, so global lock is sufficient and per-bot lock
+    is unnecessary (id doesn't exist before INSERT).
+    """
+    params = (
+        str(data["name"]),
+        str(data["symbol"]),
+        int(data.get("enabled", 0)),
+        int(data.get("dry_run", 1)),
+        float(data["base_quote"]),
+        float(data["safety_quote"]),
+        int(data["max_safety"]),
+        float(data["first_dev"]),
+        float(data["step_mult"]),
+        float(data["tp"]),
+        int(data.get("trend_filter", 0)),
+        int(data.get("trend_sma", 200)),
+        float(data["max_spend_quote"]),
+        int(data.get("poll_seconds", 10)),
+        str(data.get("strategy_mode", "classic")),
+        str(data.get("forced_strategy", "")),
+        int(data.get("max_open_orders", 6)),
+        float(data.get("vol_gap_mult", 1.0)),
+        float(data.get("tp_vol_mult", 1.0)),
+        float(data.get("min_gap_pct", 0.003)),
+        float(data.get("max_gap_pct", 0.06)),
+        int(data.get("regime_hold_candles", 2)),
+        int(data.get("regime_switch_ticks", 2)),
+        float(data.get("regime_switch_threshold", 0.6)),
+        float(data.get("max_total_exposure_pct", 0.50)),
+        float(data.get("per_symbol_exposure_pct", 0.15)),
+        float(data.get("min_free_cash_pct", 0.1)),
+        int(data.get("max_concurrent_deals", 6)),
+        float(data.get("spread_guard_pct", 0.003)),
+        int(data.get("limit_timeout_sec", 8)),
+        float(data.get("daily_loss_limit_pct", 0.06)),
+        int(data.get("pause_hours", 6)),
+        int(data.get("auto_restart", 1)),
+        int(data.get("last_running", 0)),
+        str(data.get("market_type", "crypto")),
+        str(data.get("alpaca_mode", "paper")),
+        str(data.get("bot_type", "")),
+        now_ts(),
     )
-    con.commit()
-    bot_id = int(cur.lastrowid)
-    con.close()
-    return bot_id
+
+    def _do(con) -> int:
+        cur = con.execute(
+            """
+            INSERT INTO bots(
+                name, symbol, enabled, dry_run,
+                base_quote, safety_quote, max_safety, first_dev, step_mult, tp,
+                trend_filter, trend_sma,
+                max_spend_quote, poll_seconds, strategy_mode, forced_strategy, max_open_orders,
+                vol_gap_mult, tp_vol_mult, min_gap_pct, max_gap_pct,
+                regime_hold_candles, regime_switch_ticks, regime_switch_threshold,
+                max_total_exposure_pct, per_symbol_exposure_pct, min_free_cash_pct, max_concurrent_deals,
+                spread_guard_pct, limit_timeout_sec, daily_loss_limit_pct, pause_hours,
+                auto_restart, last_running, market_type, alpaca_mode, bot_type, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            params,
+        )
+        return int(cur.lastrowid)
+
+    return write_txn(None, _do, name="create_bot")
 
 
 def patch_bot_risk_after_create(
@@ -2103,17 +2124,21 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
 
 
 def update_bots_by_type(bot_type: str, enabled: int) -> int:
-    """Update enabled status for all bots with given bot_type. Returns count updated."""
-    con = _conn()
-    try:
+    """Update enabled status for all bots with given bot_type. Returns count updated.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...). Touches all
+    bots → bypasses per-bot locking, uses global. (Per audit §3.2.)
+    """
+    params = (int(enabled), str(bot_type or "").strip())
+
+    def _do(con) -> int:
         cur = con.execute(
             "UPDATE bots SET enabled=? WHERE LOWER(TRIM(COALESCE(bot_type,''))) = LOWER(TRIM(?))",
-            (int(enabled), str(bot_type or "").strip()),
+            params,
         )
-        con.commit()
-        return cur.rowcount
-    finally:
-        con.close()
+        return int(cur.rowcount or 0)
+
+    return write_txn(None, _do, name="update_bots_by_type")
 
 
 def delete_bot(bot_id: int) -> None:
@@ -2193,13 +2218,16 @@ def list_bots() -> List[Dict[str, Any]]:
 
 
 def set_setting(key: str, value: Any) -> None:
-    con = _conn()
-    con.execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(key), str(value)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 3: routed through write_txn(None, ...)."""
+    params = (str(key), str(value))
+
+    def _do(con) -> None:
+        con.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params,
+        )
+
+    write_txn(None, _do, name="set_setting")
 
 
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -2230,9 +2258,34 @@ def get_autopilot_config_row() -> Optional[Dict[str, Any]]:
 
 
 def save_autopilot_config(data: Dict[str, Any]) -> None:
-    """Upsert autopilot_config row (id=1)."""
-    con = _conn()
-    try:
+    """Upsert autopilot_config row (id=1).
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        int(data.get("enabled", 0)),
+        float(data.get("total_capital_allocated", 10000)),
+        int(data.get("max_positions", 10)),
+        str(data.get("asset_types", "both")),
+        int(data.get("min_score_threshold", 75)),
+        int(data.get("min_conviction_threshold", 5)),
+        float(data.get("max_loss_per_day_pct", 5.0)),
+        float(data.get("max_loss_per_week_pct", 10.0)),
+        int(data.get("scan_frequency_hours", 4)),
+        int(data.get("auto_create_bots", 1)),
+        int(data.get("auto_start_bots", 1)),
+        int(data.get("auto_close_underperformers", 1)),
+        int(data.get("underperformer_threshold_score", 60)),
+        int(data.get("rebalance_enabled", 1)),
+        int(data.get("rebalance_frequency_days", 7)),
+        int(data.get("notify_on_new_bot", 1)),
+        int(data.get("notify_on_close", 1)),
+        int(data.get("notify_daily_summary", 1)),
+        data.get("last_scan"),
+        data.get("last_rebalance"),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO autopilot_config (id, enabled, total_capital_allocated, max_positions,
@@ -2261,32 +2314,10 @@ def save_autopilot_config(data: Dict[str, Any]) -> None:
                 notify_daily_summary=excluded.notify_daily_summary,
                 last_scan=excluded.last_scan, last_rebalance=excluded.last_rebalance
             """,
-            (
-                int(data.get("enabled", 0)),
-                float(data.get("total_capital_allocated", 10000)),
-                int(data.get("max_positions", 10)),
-                str(data.get("asset_types", "both")),
-                int(data.get("min_score_threshold", 75)),
-                int(data.get("min_conviction_threshold", 5)),
-                float(data.get("max_loss_per_day_pct", 5.0)),
-                float(data.get("max_loss_per_week_pct", 10.0)),
-                int(data.get("scan_frequency_hours", 4)),
-                int(data.get("auto_create_bots", 1)),
-                int(data.get("auto_start_bots", 1)),
-                int(data.get("auto_close_underperformers", 1)),
-                int(data.get("underperformer_threshold_score", 60)),
-                int(data.get("rebalance_enabled", 1)),
-                int(data.get("rebalance_frequency_days", 7)),
-                int(data.get("notify_on_new_bot", 1)),
-                int(data.get("notify_on_close", 1)),
-                int(data.get("notify_daily_summary", 1)),
-                data.get("last_scan"),
-                data.get("last_rebalance"),
-            ),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_autopilot_config")
 
 
 # =========================================================
@@ -3839,13 +3870,16 @@ def save_perf_metrics(bot_id: int, strategy: str, payload: str) -> None:
 
 
 def save_backtest_run(symbol: str, strategy: str, params: str, metrics: str, equity: str) -> None:
-    con = _conn()
-    con.execute(
-        "INSERT INTO backtest_runs(ts, symbol, strategy, params, metrics, equity) VALUES (?,?,?,?,?,?)",
-        (now_ts(), str(symbol), str(strategy), str(params), str(metrics), str(equity)),
-    )
-    con.commit()
-    con.close()
+    """Phase 1.2c step 3: routed through write_txn(None, ...)."""
+    row = (now_ts(), str(symbol), str(strategy), str(params), str(metrics), str(equity))
+
+    def _do(con) -> None:
+        con.execute(
+            "INSERT INTO backtest_runs(ts, symbol, strategy, params, metrics, equity) VALUES (?,?,?,?,?,?)",
+            row,
+        )
+
+    write_txn(None, _do, name="save_backtest_run")
 
 
 def latest_regime(bot_id: int) -> Optional[Dict[str, Any]]:
@@ -4186,23 +4220,26 @@ def list_portfolio_equity_curve(days: int = 30) -> List[Dict[str, Any]]:
 
 
 def save_explore_backtest_results(horizon: str, results: Dict[str, Any]) -> int:
-    """Persist full backtest JSON; returns row id."""
+    """Persist full backtest JSON; returns row id.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
     hor = str(horizon or "short").strip().lower()
     if hor not in ("short", "medium", "long"):
         hor = "short"
+    params = (hor, now_ts(), json.dumps(results))
+
     try:
-        con = _conn()
-        cur = con.cursor()
-        cur.execute(
-            "INSERT INTO explore_backtest_results(horizon, computed_ts, results_json) VALUES (?,?,?)",
-            (hor, now_ts(), json.dumps(results)),
-        )
-        rid = int(cur.lastrowid)
-        con.commit()
-        con.close()
-        return rid
-    except Exception as e:
-        logger.warning("save_explore_backtest_results failed: %s", e)
+        def _do(con) -> int:
+            cur = con.execute(
+                "INSERT INTO explore_backtest_results(horizon, computed_ts, results_json) VALUES (?,?,?)",
+                params,
+            )
+            return int(cur.lastrowid)
+
+        return write_txn(None, _do, name="save_explore_backtest_results")
+    except Exception:
+        logger.exception("save_explore_backtest_results failed")
         return 0
 
 
@@ -4832,30 +4869,36 @@ def get_open_signal_outcomes(limit: int = 100):
 
 
 def update_signal_outcome(snap_id: int, entry_price=None, price_24h=None, price_72h=None, outcome_24h=None, outcome_72h=None, outcome_checked=None):
-    """Update outcome tracking fields on a recommendations_snapshots row."""
-    con = _conn()
-    try:
-        sets = []
-        vals = []
-        if entry_price is not None:
-            sets.append("entry_price=?"); vals.append(entry_price)
-        if price_24h is not None:
-            sets.append("price_24h=?"); vals.append(price_24h)
-        if price_72h is not None:
-            sets.append("price_72h=?"); vals.append(price_72h)
-        if outcome_24h is not None:
-            sets.append("outcome_24h=?"); vals.append(outcome_24h)
-        if outcome_72h is not None:
-            sets.append("outcome_72h=?"); vals.append(outcome_72h)
-        if outcome_checked is not None:
-            sets.append("outcome_checked=?"); vals.append(outcome_checked)
-        if not sets:
-            return
-        vals.append(snap_id)
-        con.execute(f"UPDATE recommendations_snapshots SET {','.join(sets)} WHERE id=?", vals)
-        con.commit()
-    finally:
-        con.close()
+    """Update outcome tracking fields on a recommendations_snapshots row.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...). All column
+    names are code-controlled (not user input), so the f-string SQL
+    interpolation is safe.
+    """
+    sets: List[str] = []
+    vals: List[Any] = []
+    if entry_price is not None:
+        sets.append("entry_price=?"); vals.append(entry_price)
+    if price_24h is not None:
+        sets.append("price_24h=?"); vals.append(price_24h)
+    if price_72h is not None:
+        sets.append("price_72h=?"); vals.append(price_72h)
+    if outcome_24h is not None:
+        sets.append("outcome_24h=?"); vals.append(outcome_24h)
+    if outcome_72h is not None:
+        sets.append("outcome_72h=?"); vals.append(outcome_72h)
+    if outcome_checked is not None:
+        sets.append("outcome_checked=?"); vals.append(outcome_checked)
+    if not sets:
+        return
+    vals.append(snap_id)
+    sql = f"UPDATE recommendations_snapshots SET {','.join(sets)} WHERE id=?"
+    params = tuple(vals)
+
+    def _do(con) -> None:
+        con.execute(sql, params)
+
+    write_txn(None, _do, name="update_signal_outcome")
 
 
 def get_signal_accuracy_stats(days: int = 30) -> Dict[str, Any]:
@@ -4894,19 +4937,22 @@ def save_scoring_calibration_log(
     analysis_window_days: int,
     notes: str = "",
 ) -> None:
-    """Log a calibration run for audit trail."""
-    con = _conn()
-    try:
+    """Log a calibration run for audit trail.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (now_ts(), str(scoring_version), str(changes_json), int(analysis_window_days), str(notes))
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO scoring_calibration_log(ts, scoring_version, changes_json, analysis_window_days, notes)
             VALUES (?,?,?,?,?)
             """,
-            (now_ts(), str(scoring_version), str(changes_json), int(analysis_window_days), str(notes)),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_scoring_calibration_log")
 
 
 def save_dividend_event(
@@ -4916,19 +4962,26 @@ def save_dividend_event(
     payment_date: Optional[int] = None,
     dividend_yield_pct: Optional[float] = None,
 ) -> None:
-    """Record a dividend event for tracking."""
-    con = _conn()
-    try:
+    """Record a dividend event for tracking.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        str(symbol), int(ex_date),
+        int(payment_date) if payment_date else None,
+        float(amount), dividend_yield_pct, now_ts(),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO dividend_events(symbol, ex_date, payment_date, amount, dividend_yield_pct, recorded_at)
             VALUES (?,?,?,?,?,?)
             """,
-            (str(symbol), int(ex_date), int(payment_date) if payment_date else None, float(amount), dividend_yield_pct, now_ts()),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_dividend_event")
 
 
 def list_dividend_events(symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
@@ -4963,31 +5016,41 @@ def upsert_trade_journal(
     lessons_learned: Optional[str] = None,
     screenshot_data: Optional[str] = None,
 ) -> None:
-    """Create or update trade journal entry. Omit fields to leave unchanged on update."""
-    con = _conn()
-    now = now_ts()
-    cur = con.execute("SELECT * FROM trade_journal WHERE deal_id=?", (int(deal_id),))
-    existing = cur.fetchone()
-    if existing:
-        row = dict(existing)
-        er = entry_reason if entry_reason is not None else (row.get("entry_reason") or "")
-        xr = exit_reason if exit_reason is not None else (row.get("exit_reason") or "")
-        ll = lessons_learned if lessons_learned is not None else (row.get("lessons_learned") or "")
-        sc = screenshot_data if screenshot_data is not None else (row.get("screenshot_data") or "")
-        con.execute(
-            """UPDATE trade_journal SET entry_reason=?, exit_reason=?, lessons_learned=?, screenshot_data=?, updated_at=? WHERE deal_id=?""",
-            (er, xr, ll, sc, now, int(deal_id)),
-        )
-    else:
-        con.execute(
-            """
-            INSERT INTO trade_journal(deal_id, entry_reason, exit_reason, lessons_learned, screenshot_data, updated_at)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (int(deal_id), entry_reason or "", exit_reason or "", lessons_learned or "", screenshot_data or "", now),
-        )
-    con.commit()
-    con.close()
+    """Create or update trade journal entry. Omit fields to leave unchanged on update.
+
+    Phase 1.2c step 3: routed through write_txn. Per-deal/per-bot lock
+    if we can resolve the bot_id; otherwise global. SELECT-then-
+    UPDATE/INSERT happens inside the same transaction so a concurrent
+    upsert for the same deal_id can't race.
+    """
+    did = int(deal_id)
+    bid = _bot_id_for_deal(did)
+
+    def _do(con) -> None:
+        now = now_ts()
+        existing = con.execute(
+            "SELECT * FROM trade_journal WHERE deal_id=?", (did,),
+        ).fetchone()
+        if existing:
+            row = dict(existing)
+            er = entry_reason if entry_reason is not None else (row.get("entry_reason") or "")
+            xr = exit_reason if exit_reason is not None else (row.get("exit_reason") or "")
+            ll = lessons_learned if lessons_learned is not None else (row.get("lessons_learned") or "")
+            sc = screenshot_data if screenshot_data is not None else (row.get("screenshot_data") or "")
+            con.execute(
+                """UPDATE trade_journal SET entry_reason=?, exit_reason=?, lessons_learned=?, screenshot_data=?, updated_at=? WHERE deal_id=?""",
+                (er, xr, ll, sc, now, did),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO trade_journal(deal_id, entry_reason, exit_reason, lessons_learned, screenshot_data, updated_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (did, entry_reason or "", exit_reason or "", lessons_learned or "", screenshot_data or "", now),
+            )
+
+    write_txn(bid, _do, name="upsert_trade_journal")
 
 
 def list_trade_journals_for_deals(deal_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -5011,19 +5074,25 @@ def save_market_event(
     impact_level: int = 2,
     description: str = "",
 ) -> None:
-    """Record market event (earnings, Fed, etc.). event_date = Unix date midnight."""
-    con = _conn()
-    try:
+    """Record market event (earnings, Fed, etc.). event_date = Unix date midnight.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        int(event_date), str(event_type), str(symbol or ""),
+        int(impact_level), str(description or ""), now_ts(),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO market_events(event_date, event_type, symbol, impact_level, description, recorded_at)
             VALUES (?,?,?,?,?,?)
             """,
-            (int(event_date), str(event_type), str(symbol or ""), int(impact_level), str(description or ""), now_ts()),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_market_event")
 
 
 def get_events_for_dates(start_ts: int, end_ts: int, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -5052,19 +5121,25 @@ def save_insider_transaction(
     insider_title: Optional[str] = None,
     filing_url: Optional[str] = None,
 ) -> None:
-    """Record SEC Form 4 insider transaction."""
-    con = _conn()
-    try:
+    """Record SEC Form 4 insider transaction.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        str(symbol), int(transaction_date), str(transaction_type), float(shares),
+        value_usd, insider_title or "", filing_url or "", now_ts(),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO insider_transactions(symbol, transaction_date, transaction_type, shares, value_usd, insider_title, filing_url, recorded_at)
             VALUES (?,?,?,?,?,?,?,?)
             """,
-            (str(symbol), int(transaction_date), str(transaction_type), float(shares), value_usd, insider_title or "", filing_url or "", now_ts()),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_insider_transaction")
 
 
 def get_insider_transactions(symbol: str, days_back: int = 90) -> List[Dict[str, Any]]:
@@ -5091,22 +5166,27 @@ def save_ml_prediction(
     model_used: Optional[str] = None,
     regime_at_prediction: Optional[str] = None,
 ) -> int:
-    """Log ML prediction. Returns inserted row id."""
-    con = _conn()
-    try:
+    """Log ML prediction. Returns inserted row id.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        str(symbol), int(prediction_date), str(predicted_direction), predicted_price, float(confidence),
+        price_at_prediction, model_version or "", model_used or "", regime_at_prediction or "", now_ts(),
+    )
+
+    def _do(con) -> int:
         cur = con.execute(
             """
             INSERT INTO ml_predictions(symbol, prediction_date, predicted_direction, predicted_price, confidence,
                 price_at_prediction, model_version, model_used, regime_at_prediction, recorded_at)
             VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
-            (str(symbol), int(prediction_date), str(predicted_direction), predicted_price, float(confidence),
-             price_at_prediction, model_version or "", model_used or "", regime_at_prediction or "", now_ts()),
+            params,
         )
-        con.commit()
-        return cur.lastrowid or 0
-    finally:
-        con.close()
+        return int(cur.lastrowid or 0)
+
+    return write_txn(None, _do, name="save_ml_prediction")
 
 
 def update_ml_prediction_outcome(prediction_id: int, actual_outcome_7d: Optional[float] = None, actual_outcome_30d: Optional[float] = None) -> None:
@@ -5205,16 +5285,19 @@ def get_ml_model_accuracy(days_back: int = 30, model_used: Optional[str] = None)
 
 
 def save_ml_model_version(model_type: str, version: str, validation_accuracy: float, deployed: bool = False) -> None:
-    """Record new model version after training."""
-    con = _conn()
-    try:
+    """Record new model version after training.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (str(model_type), str(version), float(validation_accuracy), now_ts(), 1 if deployed else 0)
+
+    def _do(con) -> None:
         con.execute(
             "INSERT INTO ml_model_versions(model_type, version, validation_accuracy, trained_at, deployed) VALUES (?,?,?,?,?)",
-            (str(model_type), str(version), float(validation_accuracy), now_ts(), 1 if deployed else 0),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_ml_model_version")
 
 
 def save_intraday_pattern(
@@ -5229,19 +5312,26 @@ def save_intraday_pattern(
     bot_id: Optional[int] = None,
     payload_json: str = "",
 ) -> None:
-    """Save intraday pattern (opening range break, VWAP cross, volume spike) for analysis."""
-    con = _conn()
-    try:
+    """Save intraday pattern (opening range break, VWAP cross, volume spike) for analysis.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    bid = int(bot_id) if bot_id else None
+    params = (
+        str(symbol), str(pattern_type), int(ts), price, vwap, or_high, or_low,
+        volume_spike_ratio, bid, str(payload_json or ""),
+    )
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO intraday_patterns(symbol, pattern_type, ts, price, vwap, or_high, or_low, volume_spike_ratio, bot_id, payload_json)
             VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
-            (str(symbol), str(pattern_type), int(ts), price, vwap, or_high, or_low, volume_spike_ratio, int(bot_id) if bot_id else None, str(payload_json or "")),
+            params,
         )
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="save_intraday_pattern")
 
 
 def add_intelligence_decision(
@@ -5268,51 +5358,55 @@ def add_intelligence_decision(
     realized_slippage: Optional[float] = None,
     fill_quality: Optional[str] = None,
 ) -> int:
-    """Log an intelligence decision to the database."""
-    import json
-    con = _conn()
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO intelligence_decisions(
-            bot_id, ts, symbol, allowed_actions, final_action, final_reason,
-            data_ok, data_reasons, safety_allowed, safety_reasons,
-            regime, regime_confidence, strategy_mode, entry_style, exit_style,
-            base_size, order_type, manage_actions, proposed_orders, debug_json,
-            execution_result, realized_slippage, fill_quality
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(bot_id),
-            now_ts(),
-            str(symbol),
-            str(allowed_actions),
-            str(final_action),
-            str(final_reason),
-            1 if data_ok else 0,
-            str(data_reasons),
-            str(safety_allowed),
-            str(safety_reasons),
-            str(regime),
-            float(regime_confidence),
-            str(strategy_mode),
-            str(entry_style),
-            str(exit_style),
-            float(base_size),
-            str(order_type),
-            str(manage_actions),
-            str(proposed_orders),
-            str(debug_json),
-            str(execution_result) if execution_result else None,
-            float(realized_slippage) if realized_slippage is not None else None,
-            str(fill_quality) if fill_quality else None,
-        ),
+    """Log an intelligence decision to the database.
+
+    Phase 1.2c step 3: routed through write_txn(bot_id, ...). Per-bot
+    table, hot-ish path (every intelligence tick).
+    """
+    bid = int(bot_id)
+    params = (
+        bid,
+        now_ts(),
+        str(symbol),
+        str(allowed_actions),
+        str(final_action),
+        str(final_reason),
+        1 if data_ok else 0,
+        str(data_reasons),
+        str(safety_allowed),
+        str(safety_reasons),
+        str(regime),
+        float(regime_confidence),
+        str(strategy_mode),
+        str(entry_style),
+        str(exit_style),
+        float(base_size),
+        str(order_type),
+        str(manage_actions),
+        str(proposed_orders),
+        str(debug_json),
+        str(execution_result) if execution_result else None,
+        float(realized_slippage) if realized_slippage is not None else None,
+        str(fill_quality) if fill_quality else None,
     )
-    decision_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return decision_id
+
+    def _do(con) -> int:
+        cur = con.execute(
+            """
+            INSERT INTO intelligence_decisions(
+                bot_id, ts, symbol, allowed_actions, final_action, final_reason,
+                data_ok, data_reasons, safety_allowed, safety_reasons,
+                regime, regime_confidence, strategy_mode, entry_style, exit_style,
+                base_size, order_type, manage_actions, proposed_orders, debug_json,
+                execution_result, realized_slippage, fill_quality
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            params,
+        )
+        return int(cur.lastrowid or 0)
+
+    return write_txn(bid, _do, name="add_intelligence_decision")
 
 
 def get_intelligence_decisions(bot_id: int, limit: int = 100) -> List[Dict[str, Any]]:
@@ -5332,23 +5426,49 @@ def get_intelligence_decisions(bot_id: int, limit: int = 100) -> List[Dict[str, 
 
 
 def db_vacuum() -> None:
-    """Run VACUUM to reclaim space and maintain performance. Safe but can take time on large DBs."""
-    con = _conn()
-    try:
-        con.execute("VACUUM")
-        con.commit()
-    finally:
-        con.close()
+    """Run VACUUM to reclaim space and maintain performance.
+
+    Phase 1.2c step 3 (special): VACUUM CANNOT run inside a transaction
+    (SQLite would raise 'cannot VACUUM from within a transaction'),
+    so we cannot route through write_txn directly. Instead we acquire
+    the global write lock manually for the duration to serialise with
+    every other writer and avoid SQLITE_BUSY storms while VACUUM
+    rewrites the entire DB file.
+
+    The WAL checkpoint thread continues to run; that is safe because
+    the checkpoint thread also acquires the global write lock and so
+    will simply wait its turn.
+    """
+    with _global_write_lock:
+        con = open_migration_conn()
+        try:
+            # Defensive: must NOT be inside a transaction. open_migration_conn
+            # returns a fresh conn with no pending statements, but
+            # autocommit semantics in Python's sqlite3 module mean a SELECT
+            # may have started one implicitly. Roll back to be safe.
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            con.execute("VACUUM")
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def db_analyze() -> None:
-    """Run ANALYZE to update query planner statistics. Lightweight, safe to run regularly."""
-    con = _conn()
-    try:
+    """Run ANALYZE to update query planner statistics.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...). ANALYZE
+    creates/updates sqlite_stat tables, which is a write — so it does
+    need to serialise with other writers.
+    """
+    def _do(con) -> None:
         con.execute("ANALYZE")
-        con.commit()
-    finally:
-        con.close()
+
+    write_txn(None, _do, name="db_analyze")
 
 
 def backup_db(dest_path: Optional[str] = None) -> str:
@@ -5373,37 +5493,41 @@ def upsert_watchlist_entry(
     confidence: float = 0.0,
     edge_score: float = 0.0,
 ) -> int:
-    """Insert or update a watchlist entry for a symbol. Returns row id."""
-    con = _conn()
-    ts = now_ts()
-    existing = con.execute(
-        "SELECT id FROM scanner_watchlist WHERE symbol=? AND status='watching' LIMIT 1",
-        (str(symbol),),
-    ).fetchone()
-    if existing:
-        con.execute(
-            """UPDATE scanner_watchlist
-               SET setup_json=?, trigger_conditions=?, regime=?, entry_type=?,
-                   confidence=?, edge_score=?, updated_at=?, market_type=?
-               WHERE id=?""",
-            (setup_json, trigger_conditions, regime, entry_type,
-             confidence, edge_score, ts, market_type, int(existing["id"])),
-        )
-        row_id = int(existing["id"])
-    else:
-        cur = con.cursor()
-        cur.execute(
+    """Insert or update a watchlist entry for a symbol. Returns row id.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...). The
+    SELECT-then-INSERT/UPDATE happens inside the same transaction so
+    a concurrent inserter for the same symbol can't slip in between.
+    """
+    sym = str(symbol)
+
+    def _do(con) -> int:
+        ts = now_ts()
+        existing = con.execute(
+            "SELECT id FROM scanner_watchlist WHERE symbol=? AND status='watching' LIMIT 1",
+            (sym,),
+        ).fetchone()
+        if existing:
+            con.execute(
+                """UPDATE scanner_watchlist
+                   SET setup_json=?, trigger_conditions=?, regime=?, entry_type=?,
+                       confidence=?, edge_score=?, updated_at=?, market_type=?
+                   WHERE id=?""",
+                (setup_json, trigger_conditions, regime, entry_type,
+                 confidence, edge_score, ts, market_type, int(existing["id"])),
+            )
+            return int(existing["id"])
+        cur = con.execute(
             """INSERT INTO scanner_watchlist(
                    symbol, market_type, setup_json, trigger_conditions,
                    regime, entry_type, confidence, edge_score, status, created_at, updated_at
                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(symbol), market_type, setup_json, trigger_conditions,
+            (sym, market_type, setup_json, trigger_conditions,
              regime, entry_type, confidence, edge_score, "watching", ts, ts),
         )
-        row_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return row_id
+        return int(cur.lastrowid or 0)
+
+    return write_txn(None, _do, name="upsert_watchlist_entry")
 
 
 def list_watchlist(status: str = "watching", limit: int = 50) -> List[Dict[str, Any]]:
@@ -5429,27 +5553,39 @@ def get_watchlist_entry(symbol: str, status: str = "watching") -> Optional[Dict[
 
 
 def mark_watchlist_triggered(symbol: str, bot_id: Optional[int] = None) -> None:
-    """Mark a watchlist entry as triggered (converted to bot)."""
-    con = _conn()
-    con.execute(
-        """UPDATE scanner_watchlist
-           SET status='triggered', triggered_at=?, bot_id=?, updated_at=?
-           WHERE symbol=? AND status='watching'""",
-        (now_ts(), bot_id, now_ts(), str(symbol)),
-    )
-    con.commit()
-    con.close()
+    """Mark a watchlist entry as triggered (converted to bot).
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    sym = str(symbol)
+    bid = int(bot_id) if bot_id else None
+
+    def _do(con) -> None:
+        ts = now_ts()
+        con.execute(
+            """UPDATE scanner_watchlist
+               SET status='triggered', triggered_at=?, bot_id=?, updated_at=?
+               WHERE symbol=? AND status='watching'""",
+            (ts, bid, ts, sym),
+        )
+
+    write_txn(None, _do, name="mark_watchlist_triggered")
 
 
 def remove_watchlist_entry(symbol: str) -> None:
-    """Remove a watchlist entry (expired or manually removed)."""
-    con = _conn()
-    con.execute(
-        "UPDATE scanner_watchlist SET status='expired', updated_at=? WHERE symbol=? AND status='watching'",
-        (now_ts(), str(symbol)),
-    )
-    con.commit()
-    con.close()
+    """Remove a watchlist entry (expired or manually removed).
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    sym = str(symbol)
+
+    def _do(con) -> None:
+        con.execute(
+            "UPDATE scanner_watchlist SET status='expired', updated_at=? WHERE symbol=? AND status='watching'",
+            (now_ts(), sym),
+        )
+
+    write_txn(None, _do, name="remove_watchlist_entry")
 
 
 def cleanup_old_watchlist(max_age_hours: int = 72) -> int:
@@ -5541,31 +5677,34 @@ def save_signal_audit(
     rejection_reason: Optional[str] = None,
     price_at_signal: Optional[float] = None,
 ) -> int:
-    """Save a signal audit record for the hybrid screener."""
+    """Save a signal audit record for the hybrid screener.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        str(signal_id), str(symbol), str(asset_type), str(horizon),
+        float(composite_score), float(confidence_score), str(conviction_grade),
+        str(factor_scores_json or ""), str(gate_results_json or ""),
+        str(technical_signals_json or ""), str(metadata_json or ""),
+        str(flags_json or ""), str(rejection_reason) if rejection_reason else None,
+        float(price_at_signal) if price_at_signal else None, now_ts(),
+    )
+
     try:
-        con = _conn()
-        cur = con.cursor()
-        cur.execute(
-            """INSERT INTO signal_audit(
-                signal_id, symbol, asset_type, horizon, composite_score, confidence_score,
-                conviction_grade, factor_scores_json, gate_results_json, technical_signals_json,
-                metadata_json, flags_json, rejection_reason, price_at_signal, created_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                str(signal_id), str(symbol), str(asset_type), str(horizon),
-                float(composite_score), float(confidence_score), str(conviction_grade),
-                str(factor_scores_json or ""), str(gate_results_json or ""),
-                str(technical_signals_json or ""), str(metadata_json or ""),
-                str(flags_json or ""), str(rejection_reason) if rejection_reason else None,
-                float(price_at_signal) if price_at_signal else None, now_ts(),
-            ),
-        )
-        audit_id = int(cur.lastrowid)
-        con.commit()
-        con.close()
-        return audit_id
-    except Exception as e:
-        logger.warning("save_signal_audit failed: %s", e)
+        def _do(con) -> int:
+            cur = con.execute(
+                """INSERT INTO signal_audit(
+                    signal_id, symbol, asset_type, horizon, composite_score, confidence_score,
+                    conviction_grade, factor_scores_json, gate_results_json, technical_signals_json,
+                    metadata_json, flags_json, rejection_reason, price_at_signal, created_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                params,
+            )
+            return int(cur.lastrowid or 0)
+
+        return write_txn(None, _do, name="save_signal_audit")
+    except Exception:
+        logger.exception("save_signal_audit failed")
         return -1
 
 
@@ -5613,17 +5752,26 @@ def cleanup_old_signal_audits(keep_days: int = 14) -> int:
 
 
 def log_audit(action: str, details: str = "", ip: str = "") -> None:
-    """Log an audit event for security and compliance tracking."""
-    try:
-        con = _conn()
+    """Log an audit event for security and compliance tracking.
+
+    Phase 1.2c step 3: routed through write_txn(None, ...).
+    """
+    params = (
+        time.time(), str(action),
+        str(details) if details else None,
+        str(ip) if ip else None,
+    )
+
+    def _do(con) -> None:
         con.execute(
             "INSERT INTO audit_log(timestamp, action, details, ip) VALUES (?, ?, ?, ?)",
-            (time.time(), str(action), str(details) if details else None, str(ip) if ip else None),
+            params,
         )
-        con.commit()
-        con.close()
-    except Exception as e:
-        logger.warning(f"Failed to log audit event: {e}")
+
+    try:
+        write_txn(None, _do, name="log_audit")
+    except Exception:
+        logger.exception("Failed to log audit event")
 
 
 def record_trade_feedback(
