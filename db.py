@@ -1,14 +1,27 @@
 # db.py  (REPLACE ENTIRE FILE)
+import json
 import logging
+import math
 import os
+import random
 import sqlite3
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+# Generic return type for write_txn.
+T = TypeVar("T")
+
 # Allow override via env; default keeps compatibility with your existing file
 DB_NAME = os.getenv("BOT_DB_PATH", "botdb.sqlite3")
+
+# Per-thread connection cache: each thread (scan_short, scan_medium, scan_long,
+# db_cleanup, ml_retrain, etc.) gets its own SQLite connection.  WAL mode allows
+# concurrent readers; the per-thread approach eliminates most write contention
+# because each thread can pipeline its own reads/writes without blocking others.
+_tl = threading.local()
 
 # Whitelist for dynamic SQL (prevents SQL injection)
 _ALLOWED_TABLES = frozenset({
@@ -25,38 +38,524 @@ _ALLOWED_TABLES = frozenset({
     "notifications",  # User-facing notifications: trades, alerts, summaries
     "audit_log",  # Security and compliance tracking
     "trade_feedback",  # ML learning from closed trades
+    "signal_audit",  # Hybrid screener signal audit trail
+    "explore_signals",  # Per (symbol, horizon) Explore feed: pending/buy/watch/rejected (UPSERT only)
+    "explore_backtest_results",  # Cached Explore strategy backtest aggregates
+    "explore_signal_outcomes",  # Tracked buy-signal forward outcomes for strategy win rates
+    "signal_accuracy_baseline",  # Pre-computed strategy win-rate baselines for Explore badges
 })
 _ALLOWED_COLUMNS = frozenset({"bot_id", "id"})
 
 
-def _conn() -> sqlite3.Connection:
+class _NoCloseConn:
     """
-    Stability-focused SQLite connection:
-    - WAL mode reduces 'database is locked' under concurrent reads/writes
-    - busy_timeout makes SQLite wait briefly instead of failing immediately
-    - foreign_keys ON for future-proofing (even if you don't use FKs yet)
+    Wraps a sqlite3.Connection so that .close() is a no-op.
+    The underlying connection stays open for the lifetime of its thread.
+    All other attributes/methods are passed through transparently.
     """
-    con = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30.0)
+    __slots__ = ("_real",)
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_real", real)
+
+    def close(self) -> None:
+        pass  # intentional no-op — thread-local connection is reused
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+    def __enter__(self):
+        return object.__getattribute__(self, "_real").__enter__()
+
+    def __exit__(self, *args):
+        return object.__getattribute__(self, "_real").__exit__(*args)
+
+
+def _make_real_conn() -> sqlite3.Connection:
+    """Create a brand-new raw SQLite connection with all performance pragmas set."""
+    con = sqlite3.connect(DB_NAME, check_same_thread=True, timeout=30.0)
     con.row_factory = sqlite3.Row
-
+    for pragma in (
+        "PRAGMA journal_mode=WAL;",        # WAL: concurrent readers, serialised writers
+        "PRAGMA synchronous=NORMAL;",      # Safe & fast (vs. FULL)
+        "PRAGMA busy_timeout=30000;",      # Wait up to 30 s before OperationalError
+        "PRAGMA foreign_keys=ON;",
+        "PRAGMA cache_size=-65536;",       # 64 MB page cache per connection
+        "PRAGMA temp_store=MEMORY;",
+        "PRAGMA mmap_size=268435456;",     # 256 MB memory-mapped I/O
+    ):
+        try:
+            con.execute(pragma)
+        except Exception:
+            pass
     try:
-        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA wal_checkpoint(PASSIVE);")
     except Exception:
         pass
-    try:
-        con.execute("PRAGMA synchronous=NORMAL;")
-    except Exception:
-        pass
-    try:
-        con.execute("PRAGMA foreign_keys=ON;")
-    except Exception:
-        pass
-    try:
-        con.execute("PRAGMA busy_timeout=5000;")  # ms
-    except Exception:
-        pass
-
     return con
+
+
+def _conn() -> _NoCloseConn:
+    """
+    Return the per-thread cached SQLite connection (creating it on first call).
+    Each OS thread (scan_short, scan_medium, scan_long, ml_retrain, db_cleanup, …)
+    gets its own connection, so they never block each other.
+    WAL mode allows unlimited concurrent readers; writers queue inside SQLite.
+    The returned object silently ignores .close() so callers need not be changed.
+    """
+    real = getattr(_tl, "conn", None)
+    if real is not None:
+        try:
+            real.execute("SELECT 1")        # quick liveness check
+            return _NoCloseConn(real)
+        except Exception:
+            pass                            # connection was closed externally — recreate
+    real = _make_real_conn()
+    _tl.conn = real
+    return _NoCloseConn(real)
+
+
+def _db_retry(fn, *args, _retries: int = 5, **kwargs):
+    """
+    Call fn(*args, **kwargs) with exponential-backoff retry on
+    OperationalError('database is locked').  All other exceptions propagate immediately.
+
+    DEPRECATED: new code MUST use ``write_txn``. This helper exists for the
+    transitional window in Phase 1.2b while the four legacy callers
+    (save_recommendation_snapshot, mark_explore_signals_pending,
+    upsert_explore_feed_row, mark_explore_horizon_pending) are migrated. It is
+    deleted in the final commit of Phase 1.2b step 5.
+    """
+    delay = 0.1
+    for attempt in range(_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc).lower() and attempt < _retries:
+                logger.debug("DB locked — retry %d/%d in %.1fs", attempt + 1, _retries, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 2.0)
+            else:
+                raise
+
+
+# ============================================================================
+# Phase 1.2a — write_txn chokepoint
+# See audit/write_txn_design.md for the full contract and rationale.
+# ============================================================================
+
+# Module-level lock state. Single source of truth for the worker process.
+# BotManager.bot_db_lock delegates to db.bot_db_lock (no parallel registry).
+_bot_locks: Dict[int, "threading.RLock"] = {}
+_bot_locks_guard: "threading.Lock" = threading.Lock()
+_global_write_lock: "threading.RLock" = threading.RLock()
+
+# Per-thread re-entry guard. Nested write_txn calls are a programming bug
+# (they would open a fresh per-thread conn under the same lock and commit
+# before the outer call returns, breaking atomicity). They MUST raise.
+_write_txn_state: "threading.local" = threading.local()
+
+
+def bot_db_lock(bot_id: int) -> "threading.RLock":
+    """Return the canonical per-bot reentrant lock.
+
+    Reentrant (RLock) so a writer can call into a defense-in-depth helper that
+    re-acquires the lock without deadlocking. Cross-thread serialisation is
+    unchanged.
+
+    BotManager.bot_db_lock delegates here; do not maintain a parallel registry.
+    """
+    bid = int(bot_id)
+    with _bot_locks_guard:
+        lk = _bot_locks.get(bid)
+        if lk is None:
+            lk = threading.RLock()
+            _bot_locks[bid] = lk
+        return lk
+
+
+class DBLockedError(sqlite3.OperationalError):
+    """Raised when ``write_txn`` exhausts its retry budget on a locked DB.
+
+    Inherits ``sqlite3.OperationalError`` so existing handlers (e.g.
+    BotRunner._supervised_run_loop) continue to catch it without code changes.
+    Carries structured context for diagnostics: bot_id, op_name, attempts,
+    elapsed_ms, last_sql, last_exc.
+    """
+
+    def __init__(
+        self,
+        *,
+        bot_id: Optional[int],
+        op_name: str,
+        attempts: int,
+        elapsed_ms: int,
+        last_sql: Optional[str],
+        last_exc: Optional[BaseException],
+    ) -> None:
+        self.bot_id = bot_id
+        self.op_name = op_name
+        self.attempts = attempts
+        self.elapsed_ms = elapsed_ms
+        self.last_sql = (last_sql or "")[:512]  # truncate to bound log size
+        self.last_exc = last_exc
+        super().__init__(self.__str__())
+
+    def __str__(self) -> str:
+        bid = "None" if self.bot_id is None else str(self.bot_id)
+        last_type = type(self.last_exc).__name__ if self.last_exc else "?"
+        return (
+            f"DBLockedError(op={self.op_name!r}, bot_id={bid}, "
+            f"attempts={self.attempts}, elapsed_ms={self.elapsed_ms}): "
+            f"{self.last_sql!r} -> {last_type}: {self.last_exc}"
+        )
+
+
+# Sleep schedule for the 5 retries (in milliseconds). The Nth entry is the
+# sleep BEFORE the (N+1)th retry, i.e. between attempt (N+1) and attempt (N+2)
+# in 1-indexed terms. Total max attempts: 6 (initial + 5 retries).
+_RETRY_SCHEDULE_MS: Tuple[int, ...] = (50, 100, 250, 500, 1000)
+
+
+def _next_sleep_sec(retry_idx: int) -> float:
+    """Sleep duration before retry #(retry_idx+1). Applies +/-20% jitter."""
+    base_ms = _RETRY_SCHEDULE_MS[retry_idx]
+    return (base_ms * random.uniform(0.8, 1.2)) / 1000.0
+
+
+def _is_database_locked(exc: BaseException) -> bool:
+    """True iff exc is an OperationalError indicating SQLite-level BUSY/LOCKED."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg
+
+
+class _TrackingCursor:
+    """Cursor proxy that records the most recent SQL on the parent state dict."""
+
+    __slots__ = ("_real", "_state")
+
+    def __init__(self, real: sqlite3.Cursor, state: Dict[str, Any]) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_state", state)
+
+    def execute(self, sql, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = sql
+        return object.__getattribute__(self, "_real").execute(sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = sql
+        return object.__getattribute__(self, "_real").executemany(sql, *args, **kwargs)
+
+    def executescript(self, sql_script, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = (sql_script or "")[:200]
+        return object.__getattribute__(self, "_real").executescript(sql_script, *args, **kwargs)
+
+    def __iter__(self):
+        return iter(object.__getattribute__(self, "_real"))
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        if name in ("_real", "_state"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+class _TrackingConn:
+    """Connection proxy that records the most recent SQL for DBLockedError context."""
+
+    __slots__ = ("_real", "_state")
+
+    def __init__(self, real, state: Dict[str, Any]) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_state", state)
+
+    def execute(self, sql, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = sql
+        return object.__getattribute__(self, "_real").execute(sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = sql
+        return object.__getattribute__(self, "_real").executemany(sql, *args, **kwargs)
+
+    def executescript(self, sql_script, *args, **kwargs):
+        object.__getattribute__(self, "_state")["last_sql"] = (sql_script or "")[:200]
+        return object.__getattribute__(self, "_real").executescript(sql_script, *args, **kwargs)
+
+    def cursor(self, *args, **kwargs):
+        return _TrackingCursor(
+            object.__getattribute__(self, "_real").cursor(*args, **kwargs),
+            object.__getattribute__(self, "_state"),
+        )
+
+    def __enter__(self):
+        return object.__getattribute__(self, "_real").__enter__()
+
+    def __exit__(self, *a):
+        return object.__getattribute__(self, "_real").__exit__(*a)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        if name in ("_real", "_state"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+def write_txn(
+    bot_id: Optional[int],
+    fn: Callable[[Any], T],
+    *,
+    name: Optional[str] = None,
+) -> T:
+    """Single chokepoint for every persistent SQLite write.
+
+    Contract (see audit/write_txn_design.md §1.1):
+      * ``fn`` receives a connection-like object with WAL+busy_timeout PRAGMAs.
+      * ``fn`` MUST NOT call ``write_txn`` recursively (raises RuntimeError).
+      * ``fn`` MUST NOT close the conn or call ``commit()`` itself; this function
+        commits exactly once on success and rolls back on exception.
+      * Per-bot lock when ``bot_id`` is set; global write lock otherwise.
+      * Up to 6 attempts (initial + 5 retries) on "database is locked"; sleeps
+        between retries follow ``_RETRY_SCHEDULE_MS`` with +/-20% jitter.
+      * On final failure raises ``DBLockedError`` (subclass of OperationalError)
+        carrying bot_id, op_name, attempt count, elapsed_ms, last SQL, last exc.
+    """
+    if getattr(_write_txn_state, "active", False):
+        raise RuntimeError(
+            "nested write_txn detected — pass the existing conn to the inner helper instead"
+        )
+
+    op_name = name or getattr(fn, "__name__", "<lambda>")
+    bid: Optional[int] = None if bot_id is None else int(bot_id)
+    lock = bot_db_lock(bid) if bid is not None else _global_write_lock
+
+    state: Dict[str, Any] = {"last_sql": None}
+    started_at = time.monotonic()
+    last_exc: Optional[BaseException] = None
+    attempts_made = 0
+
+    _write_txn_state.active = True
+    try:
+        with lock:
+            for attempt in range(len(_RETRY_SCHEDULE_MS) + 1):  # 0..5 → up to 6 tries
+                if attempt > 0:
+                    sleep_sec = _next_sleep_sec(attempt - 1)
+                    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                    logger.warning(
+                        "write_txn retry %d/%d op=%s bot_id=%s sleep=%.3fs elapsed_ms=%d",
+                        attempt,
+                        len(_RETRY_SCHEDULE_MS),
+                        op_name,
+                        "None" if bid is None else bid,
+                        sleep_sec,
+                        elapsed_ms,
+                    )
+                    time.sleep(sleep_sec)
+
+                attempts_made = attempt + 1
+                noclose = _conn()  # per-thread cached _NoCloseConn over a real conn
+                tracking = _TrackingConn(noclose, state)
+                try:
+                    ret = fn(tracking)
+                except sqlite3.OperationalError as exc:
+                    last_exc = exc
+                    try:
+                        noclose.rollback()
+                    except Exception:
+                        logger.exception(
+                            "write_txn: rollback after OperationalError failed (op=%s bot_id=%s)",
+                            op_name, bid,
+                        )
+                    if _is_database_locked(exc):
+                        continue  # retry
+                    raise
+                except BaseException:
+                    try:
+                        noclose.rollback()
+                    except Exception:
+                        logger.exception(
+                            "write_txn: rollback after non-Operational exception failed (op=%s bot_id=%s)",
+                            op_name, bid,
+                        )
+                    raise
+
+                # Success path: commit, return.
+                try:
+                    noclose.commit()
+                except sqlite3.OperationalError as exc:
+                    # COMMIT itself can fail with "database is locked" under heavy
+                    # WAL contention. Treat the same as fn failure: rollback & retry.
+                    last_exc = exc
+                    try:
+                        noclose.rollback()
+                    except Exception:
+                        logger.exception(
+                            "write_txn: rollback after commit-failure failed (op=%s bot_id=%s)",
+                            op_name, bid,
+                        )
+                    if _is_database_locked(exc):
+                        continue
+                    raise
+                return ret
+
+            # Exhausted all attempts.
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            err = DBLockedError(
+                bot_id=bid,
+                op_name=op_name,
+                attempts=attempts_made,
+                elapsed_ms=elapsed_ms,
+                last_sql=state.get("last_sql"),
+                last_exc=last_exc,
+            )
+            logger.error(
+                "write_txn exhausted retries: %s",
+                err,
+            )
+            raise err from last_exc
+    finally:
+        _write_txn_state.active = False
+
+
+def open_migration_conn() -> sqlite3.Connection:
+    """Public alias for the canonical fresh-connection factory.
+
+    Use from one-shot CLI scripts (scripts/migrate_*.py, dev tools) so PRAGMAs
+    (WAL, busy_timeout=30000, synchronous=NORMAL, foreign_keys=ON, cache=64MB,
+    mmap=256MB) stay consistent with worker-side connections.
+
+    Returns a brand-new ``sqlite3.Connection`` that the caller owns and MUST
+    close. Does NOT participate in the per-thread pool used by ``_conn()``.
+    """
+    return _make_real_conn()
+
+
+# ----------------------------------------------------------------------------
+# WAL checkpoint background thread (folded down from Phase 1.4)
+# ----------------------------------------------------------------------------
+
+_wal_checkpoint_thread: Optional["threading.Thread"] = None
+_wal_checkpoint_stop_event: "threading.Event" = threading.Event()
+_wal_checkpoint_lifecycle_lock: "threading.Lock" = threading.Lock()
+
+
+def _wal_size_bytes() -> int:
+    """Best-effort current size of the WAL sidecar file. 0 if absent."""
+    try:
+        wal_path = DB_NAME + "-wal"
+        return os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+    except OSError:
+        return 0
+
+
+def _wal_checkpoint_loop(interval_sec: int) -> None:
+    """Daemon-thread body: TRUNCATE the WAL every interval_sec seconds.
+
+    Uses ``write_txn(None, ...)`` so the checkpoint contends for the global
+    write lock and cannot race bulk-DELETE cleanups or schema migrations.
+    """
+    # Initial checkpoint runs immediately on thread start, then we sleep.
+    while True:
+        try:
+            size_before = _wal_size_bytes()
+
+            def _do_checkpoint(con):
+                cur = con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                row = cur.fetchone()
+                return tuple(row) if row else None
+
+            try:
+                result = write_txn(None, _do_checkpoint, name="wal_checkpoint")
+            except DBLockedError as e:
+                logger.warning("WAL checkpoint deferred (DB busy): %s", e)
+                result = None
+
+            size_after = _wal_size_bytes()
+            delta = size_before - size_after
+            level = logging.INFO if abs(delta) >= (1 << 20) else logging.DEBUG
+            logger.log(
+                level,
+                "WAL checkpoint: before=%d after=%d delta=%d result=%s",
+                size_before,
+                size_after,
+                delta,
+                result,
+            )
+        except Exception:
+            logger.exception("WAL checkpoint loop iteration failed")
+
+        if _wal_checkpoint_stop_event.wait(timeout=interval_sec):
+            return
+
+
+def start_wal_checkpoint_thread(interval_sec: Optional[int] = None) -> None:
+    """Start the periodic WAL checkpoint daemon. Idempotent.
+
+    Default interval is 60s, overridable via ``BOT_WAL_CHECKPOINT_INTERVAL_SEC``
+    env var. Worker startup (worker_api.py) calls this at boot. Tests should
+    pair this with ``stop_wal_checkpoint_thread`` in their fixtures.
+    """
+    global _wal_checkpoint_thread
+    if interval_sec is None:
+        try:
+            interval_sec = int(os.getenv("BOT_WAL_CHECKPOINT_INTERVAL_SEC", "60"))
+        except ValueError:
+            interval_sec = 60
+    interval_sec = max(1, int(interval_sec))
+
+    with _wal_checkpoint_lifecycle_lock:
+        existing = _wal_checkpoint_thread
+        if existing is not None and existing.is_alive():
+            return
+        _wal_checkpoint_stop_event.clear()
+        t = threading.Thread(
+            target=_wal_checkpoint_loop,
+            args=(interval_sec,),
+            name="db-wal-checkpoint",
+            daemon=True,
+        )
+        _wal_checkpoint_thread = t
+        t.start()
+    logger.info("WAL checkpoint thread started (interval=%ds)", interval_sec)
+
+
+def stop_wal_checkpoint_thread(timeout_sec: float = 5.0) -> None:
+    """Signal the checkpoint thread to exit and join. Idempotent."""
+    global _wal_checkpoint_thread
+    with _wal_checkpoint_lifecycle_lock:
+        t = _wal_checkpoint_thread
+        if t is None or not t.is_alive():
+            _wal_checkpoint_thread = None
+            return
+        _wal_checkpoint_stop_event.set()
+    t.join(timeout=timeout_sec)
+    with _wal_checkpoint_lifecycle_lock:
+        _wal_checkpoint_thread = None
+    if t.is_alive():
+        logger.warning(
+            "WAL checkpoint thread did not exit within %.1fs",
+            timeout_sec,
+        )
+    else:
+        logger.info("WAL checkpoint thread stopped")
+
+
+# ============================================================================
+# End Phase 1.2a chokepoint
+# ============================================================================
 
 
 def now_ts() -> int:
@@ -75,7 +574,70 @@ def _ensure_column(con: sqlite3.Connection, table: str, col: str, col_def_sql: s
         raise ValueError(f"Invalid table name: {table}")
     cols = _table_columns(con, table)
     if col not in cols:
-        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def_sql}")
+        try:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def_sql}")
+            con.commit()
+        except sqlite3.OperationalError as e:
+            # Column may have been added by concurrent init_db call — check again
+            if "duplicate column" not in str(e).lower():
+                logger.error("_ensure_column failed for %s.%s: %s", table, col, e)
+                raise
+
+
+def _migrate_explore_signals_to_v2(cur: sqlite3.Cursor) -> None:
+    """Rebuild explore_signals when pre-v2 schema (snapshot_id / rejection_reason) is present."""
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='explore_signals'")
+    if not cur.fetchone():
+        cur.execute(
+            """
+            CREATE TABLE explore_signals (
+                symbol TEXT NOT NULL,
+                horizon TEXT NOT NULL,
+                status TEXT NOT NULL,
+                conviction_score REAL NOT NULL DEFAULT 0,
+                reason TEXT,
+                strategy TEXT,
+                signal_ts INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL,
+                market_type TEXT,
+                price REAL,
+                change_24h REAL,
+                detail_json TEXT,
+                PRIMARY KEY (symbol, horizon)
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_signals_horizon_status ON explore_signals(horizon, status);"
+        )
+        return
+    cur.execute("PRAGMA table_info(explore_signals)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "conviction_score" in cols:
+        return
+    cur.execute("DROP TABLE explore_signals")
+    cur.execute(
+        """
+        CREATE TABLE explore_signals (
+            symbol TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            status TEXT NOT NULL,
+            conviction_score REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            strategy TEXT,
+            signal_ts INTEGER NOT NULL DEFAULT 0,
+            updated_ts INTEGER NOT NULL,
+            market_type TEXT,
+            price REAL,
+            change_24h REAL,
+            detail_json TEXT,
+            PRIMARY KEY (symbol, horizon)
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_signals_horizon_status ON explore_signals(horizon, status);"
+    )
 
 
 def init_db() -> None:
@@ -127,7 +689,7 @@ def init_db() -> None:
             limit_timeout_sec INTEGER NOT NULL DEFAULT 8,
             daily_loss_limit_pct REAL NOT NULL DEFAULT 0.06,
             pause_hours INTEGER NOT NULL DEFAULT 6,
-            auto_restart INTEGER NOT NULL DEFAULT 0,
+            auto_restart INTEGER NOT NULL DEFAULT 1,
             last_running INTEGER NOT NULL DEFAULT 0,
             
             market_type TEXT NOT NULL DEFAULT 'crypto',
@@ -260,6 +822,101 @@ def init_db() -> None:
             PRIMARY KEY(symbol, horizon)
         );
         """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signal_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            horizon TEXT NOT NULL DEFAULT 'short',
+            composite_score REAL,
+            confidence_score REAL,
+            conviction_grade TEXT,
+            factor_scores_json TEXT,
+            gate_results_json TEXT,
+            technical_signals_json TEXT,
+            metadata_json TEXT,
+            flags_json TEXT,
+            rejection_reason TEXT,
+            price_at_signal REAL,
+            created_ts INTEGER NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS explore_signals (
+            symbol TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            status TEXT NOT NULL,
+            conviction_score REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            strategy TEXT,
+            signal_ts INTEGER NOT NULL DEFAULT 0,
+            updated_ts INTEGER NOT NULL,
+            market_type TEXT,
+            price REAL,
+            change_24h REAL,
+            detail_json TEXT,
+            PRIMARY KEY (symbol, horizon)
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_signals_horizon_status ON explore_signals(horizon, status);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_signals_status ON explore_signals(status, updated_ts DESC);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_signals_symbol ON explore_signals(symbol, horizon);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_signals_conviction ON explore_signals(conviction_score DESC, updated_ts DESC);"
+    )
+    _migrate_explore_signals_to_v2(cur)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS explore_backtest_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            horizon TEXT NOT NULL,
+            computed_ts INTEGER NOT NULL,
+            results_json TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_explore_bt_horizon_ts ON explore_backtest_results(horizon, computed_ts DESC);"
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS explore_signal_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            signal_ts INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            price_5d REAL,
+            price_10d REAL,
+            price_20d REAL,
+            pnl_5d_pct REAL,
+            pnl_10d_pct REAL,
+            pnl_20d_pct REAL,
+            outcome TEXT,
+            composite_score REAL,
+            conviction_grade TEXT,
+            checked_ts INTEGER
+        );
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ex_sig_out_horizon_ts ON explore_signal_outcomes(horizon, signal_ts);"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ex_sig_out_pending ON explore_signal_outcomes(outcome, signal_ts);"
     )
     cur.execute(
         """
@@ -453,8 +1110,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS autopilot_config (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             enabled INTEGER DEFAULT 0,
-            total_capital_allocated REAL DEFAULT 10000.0,
-            max_positions INTEGER DEFAULT 10,
+            total_capital_allocated REAL DEFAULT 100.0,
+            max_positions INTEGER DEFAULT 3,
             position_size_mode TEXT DEFAULT 'conviction_based',
             asset_types TEXT DEFAULT 'both',
             min_score_threshold INTEGER DEFAULT 75,
@@ -488,6 +1145,18 @@ def init_db() -> None:
             max_sector_exposure_pct = 50.0
         WHERE id = 1 AND (max_correlated_exposure_pct < 50 OR max_sector_exposure_pct < 50)
     """)
+    # Migrate: correct autopilot capital if still at factory default high value
+    try:
+        cur.execute("""
+            UPDATE autopilot_config
+            SET total_capital_allocated = 100.0,
+                max_positions = 3,
+                capital_per_bot = 10.0
+            WHERE id = 1
+            AND total_capital_allocated >= 1000.0
+        """)
+    except Exception:
+        pass
     con.commit()
 
     # --- portfolio_snapshots (for charts - 11.md)
@@ -508,6 +1177,47 @@ def init_db() -> None:
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts ON portfolio_snapshots(timestamp)"
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signal_accuracy_baseline (
+            strategy_id TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            sample_size INTEGER DEFAULT 0,
+            win_rate REAL DEFAULT 0,
+            avg_return_pct REAL DEFAULT 0,
+            avg_hold_hours REAL DEFAULT 0,
+            sharpe_ratio REAL DEFAULT 0,
+            last_updated INTEGER DEFAULT 0,
+            PRIMARY KEY (strategy_id, horizon, asset_type)
+        );
+        """
+    )
+    try:
+        _bcnt = cur.execute("SELECT COUNT(*) FROM signal_accuracy_baseline").fetchone()
+        if _bcnt and int(_bcnt[0]) == 0:
+            _tsb = now_ts()
+            _seed_rows = [
+                ("momentum_breakout", "short", "crypto", 150, 0.44, 2.4, 36.0, 0.9, _tsb),
+                ("pullback_support", "medium", "crypto", 120, 0.41, 3.1, 72.0, 0.75, _tsb),
+                ("oversold_reversal", "medium", "stock", 200, 0.39, 1.8, 120.0, 0.55, _tsb),
+                ("trend_continuation", "long", "crypto", 90, 0.38, 4.5, 240.0, 0.62, _tsb),
+                ("crypto_momentum", "short", "crypto", 180, 0.46, 2.9, 24.0, 1.0, _tsb),
+                ("volume_capitulation", "medium", "crypto", 60, 0.52, 3.8, 96.0, 0.7, _tsb),
+                ("oversold_bounce", "medium", "crypto", 100, 0.40, 2.2, 80.0, 0.58, _tsb),
+            ]
+            cur.executemany(
+                """
+                INSERT INTO signal_accuracy_baseline(
+                    strategy_id, horizon, asset_type, sample_size, win_rate,
+                    avg_return_pct, avg_hold_hours, sharpe_ratio, last_updated
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                _seed_rows,
+            )
+    except Exception as _seed_bl_err:
+        logger.debug("signal_accuracy_baseline seed: %s", _seed_bl_err)
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_latest_horizon ON recommendations_latest(horizon)")
 
     # --- market_events (earnings, Fed, etc. - avoid entries day before)
@@ -749,6 +1459,20 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_intel_bot_ts ON intelligence_decisions(bot_id, ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_reco_perf_bot_outcome ON recommendation_performance(bot_id, outcome);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_reco_perf_symbol ON recommendation_performance(symbol, outcome);")
+    # Signal outcome tracking columns on recommendations_snapshots
+    for col_def in [
+        ("entry_price", "REAL"),
+        ("price_24h", "REAL"),
+        ("price_72h", "REAL"),
+        ("outcome_24h", "TEXT"),
+        ("outcome_72h", "TEXT"),
+        ("outcome_checked", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE recommendations_snapshots ADD COLUMN {col_def[0]} {col_def[1]}")
+        except Exception:
+            pass
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reco_snap_outcome ON recommendations_snapshots(outcome_checked, created_ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_intraday_symbol_ts ON intraday_patterns(symbol, ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sector_perf_sector_ts ON sector_performance_history(sector, quarter_ts);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dividend_symbol_ex ON dividend_events(symbol, ex_date);")
@@ -786,7 +1510,7 @@ def init_db() -> None:
         _ensure_column(con, "bots", "limit_timeout_sec", "INTEGER NOT NULL DEFAULT 8")
         _ensure_column(con, "bots", "daily_loss_limit_pct", "REAL NOT NULL DEFAULT 0.06")
         _ensure_column(con, "bots", "pause_hours", "INTEGER NOT NULL DEFAULT 6")
-        _ensure_column(con, "bots", "auto_restart", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "bots", "auto_restart", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(con, "bots", "last_running", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(con, "bots", "market_type", "TEXT NOT NULL DEFAULT 'crypto'")
         _ensure_column(con, "bots", "alpaca_mode", "TEXT NOT NULL DEFAULT 'paper'")
@@ -871,16 +1595,111 @@ def init_db() -> None:
         _ensure_column(con, "deals", "mfe", "REAL")
         _ensure_column(con, "deals", "hold_sec", "INTEGER")
         _ensure_column(con, "deals", "safety_count", "INTEGER")
+        _ensure_column(con, "deals", "realized_pnl_pct", "REAL")
+        _ensure_column(con, "deals", "entry_avg_estimated", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "deals", "data_source", "TEXT")
+        _ensure_column(con, "explore_signals", "rejection_reason", "TEXT")
         _ensure_column(con, "strategy_perf_trades", "symbol", "TEXT")
         _ensure_column(con, "strategy_perf_trades", "regime", "TEXT")
         _ensure_column(con, "strategy_perf_trades", "pnl_pct", "REAL")
         _ensure_column(con, "recommendations_snapshots", "scoring_version", "TEXT NOT NULL DEFAULT 'v1'")
         _ensure_column(con, "recommendations_snapshots", "score_breakdown_json", "TEXT")
+        _ensure_column(con, "recommendations_snapshots", "composite_score", "REAL")
+        _ensure_column(con, "recommendations_snapshots", "confidence_score", "REAL")
+        _ensure_column(con, "recommendations_snapshots", "conviction_grade", "TEXT")
+        _ensure_column(con, "recommendations_snapshots", "factor_scores_json", "TEXT")
+        _ensure_column(con, "recommendations_snapshots", "signal_flags_json", "TEXT")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS explore_signals (
+                symbol TEXT NOT NULL,
+                horizon TEXT NOT NULL,
+                status TEXT NOT NULL,
+                conviction_score REAL NOT NULL DEFAULT 0,
+                reason TEXT,
+                strategy TEXT,
+                signal_ts INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL,
+                market_type TEXT,
+                price REAL,
+                change_24h REAL,
+                detail_json TEXT,
+                PRIMARY KEY (symbol, horizon)
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_signals_horizon_status ON explore_signals(horizon, status);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_signals_status ON explore_signals(status, updated_ts DESC);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_signals_symbol ON explore_signals(symbol, horizon);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_signals_conviction ON explore_signals(conviction_score DESC, updated_ts DESC);"
+        )
+        _migrate_explore_signals_to_v2(cur)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS explore_backtest_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                horizon TEXT NOT NULL,
+                computed_ts INTEGER NOT NULL,
+                results_json TEXT NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_explore_bt_horizon_ts ON explore_backtest_results(horizon, computed_ts DESC);"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS explore_signal_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                horizon TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                signal_ts INTEGER NOT NULL,
+                entry_price REAL NOT NULL,
+                price_5d REAL,
+                price_10d REAL,
+                price_20d REAL,
+                pnl_5d_pct REAL,
+                pnl_10d_pct REAL,
+                pnl_20d_pct REAL,
+                outcome TEXT,
+                composite_score REAL,
+                conviction_grade TEXT,
+                checked_ts INTEGER
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ex_sig_out_horizon_ts ON explore_signal_outcomes(horizon, signal_ts);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ex_sig_out_pending ON explore_signal_outcomes(outcome, signal_ts);"
+        )
         # Indexes that depend on migrated columns
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_perf_bot_ts ON strategy_perf_trades(bot_id, ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_perf_sym ON strategy_perf_trades(symbol, ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_audit_symbol ON signal_audit(symbol, created_ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_audit_grade ON signal_audit(conviction_grade, created_ts);")
     except Exception:
         # If migration fails, do not crash app; tables still usable.
+        pass
+
+    try:
+        con.execute("""
+            UPDATE bots
+            SET max_hold_hours = 72
+            WHERE id IN (59, 42)
+            AND (max_hold_hours IS NULL OR max_hold_hours = 0)
+        """)
+        con.commit()
+    except Exception:
         pass
 
     con.commit()
@@ -1091,7 +1910,7 @@ def create_bot(data: Dict[str, Any]) -> int:
             int(data.get("limit_timeout_sec", 8)),
             float(data.get("daily_loss_limit_pct", 0.06)),
             int(data.get("pause_hours", 6)),
-            int(data.get("auto_restart", 0)),
+            int(data.get("auto_restart", 1)),
             int(data.get("last_running", 0)),
             str(data.get("market_type", "crypto")),
             str(data.get("alpaca_mode", "paper")),
@@ -1103,6 +1922,38 @@ def create_bot(data: Dict[str, Any]) -> int:
     bot_id = int(cur.lastrowid)
     con.close()
     return bot_id
+
+
+def patch_bot_risk_after_create(
+    bot_id: int,
+    *,
+    stop_loss_pct: Optional[float] = None,
+    max_hold_hours: Optional[int] = None,
+) -> None:
+    """Update risk columns not included in INSERT INTO bots (create_bot)."""
+    if stop_loss_pct is None and max_hold_hours is None:
+        return
+    bid = int(bot_id)
+    con = _conn()
+    try:
+        if stop_loss_pct is not None and max_hold_hours is not None:
+            con.execute(
+                "UPDATE bots SET stop_loss_pct=?, max_hold_hours=? WHERE id=?",
+                (float(stop_loss_pct), int(max_hold_hours), bid),
+            )
+        elif stop_loss_pct is not None:
+            con.execute(
+                "UPDATE bots SET stop_loss_pct=? WHERE id=?",
+                (float(stop_loss_pct), bid),
+            )
+        else:
+            con.execute(
+                "UPDATE bots SET max_hold_hours=? WHERE id=?",
+                (int(max_hold_hours or 0), bid),
+            )
+        con.commit()
+    finally:
+        con.close()
 
 
 def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
@@ -1192,7 +2043,7 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
             int(data.get("limit_timeout_sec", 8)),
             float(data.get("daily_loss_limit_pct", 0.06)),
             int(data.get("pause_hours", 6)),
-            int(data.get("auto_restart", 0)),
+            int(data.get("auto_restart", 1)),
             str(data.get("market_type", "crypto")),
             str(data.get("alpaca_mode", "paper")),
             float(data.get("max_drawdown_pct", 0.0)),
@@ -1391,17 +2242,52 @@ def save_autopilot_config(data: Dict[str, Any]) -> None:
 # =========================================================
 # Deals
 # =========================================================
-def open_deal(bot_id: int, symbol: str, state: str = "OPEN") -> int:
+def open_deal(bot_id: int, symbol: str, state: str = "OPEN", opened_at: Optional[int] = None) -> int:
     con = _conn()
     cur = con.cursor()
+    _opened = int(opened_at) if opened_at is not None else now_ts()
     cur.execute(
         "INSERT INTO deals(bot_id, state, opened_at, symbol) VALUES (?,?,?,?)",
-        (int(bot_id), str(state), now_ts(), str(symbol)),
+        (int(bot_id), str(state), _opened, str(symbol)),
     )
     con.commit()
     deal_id = int(cur.lastrowid)
     con.close()
     return deal_id
+
+
+def update_open_deal_entry(
+    deal_id: int,
+    entry_avg: float,
+    base_amount: float,
+    safety_count: int = 0,
+) -> None:
+    """
+    Update an OPEN deal with real entry price and size.
+    Called after a buy executes so the DB reflects the
+    actual position. Without this, entry_avg stays NULL
+    on open deals even when a real position exists.
+    """
+    if not deal_id or not entry_avg or entry_avg <= 0:
+        return
+    con = _conn()
+    try:
+        con.execute(
+            """UPDATE deals SET
+                entry_avg = ?,
+                base_amount = ?,
+                safety_count = ?
+            WHERE id = ? AND state = 'OPEN'""",
+            (
+                float(entry_avg),
+                float(base_amount) if base_amount else None,
+                int(safety_count),
+                int(deal_id),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def close_deal(
@@ -1418,6 +2304,7 @@ def close_deal(
     mfe: Optional[float] = None,
     hold_sec: Optional[int] = None,
     safety_count: Optional[int] = None,
+    entry_avg_estimated: bool = False,
 ) -> None:
     con = _conn()
     # Fetch bot_id and opened_at before update (for recommendation_performance)
@@ -1429,6 +2316,24 @@ def close_deal(
     opened_ts = int(row["opened_at"] or 0) if row else 0
     bot_id_val = int(row["bot_id"]) if row else None
 
+    realized_pnl_pct_val: Optional[float] = None
+    try:
+        ea = float(entry_avg) if entry_avg is not None else None
+        ex = float(exit_avg) if exit_avg is not None else None
+        ba = float(base_amount) if base_amount is not None else None
+        rq = float(realized_pnl_quote) if realized_pnl_quote is not None else None
+        if (
+            ea is not None and ba is not None and rq is not None
+            and ea > 0 and ba > 0 and math.isfinite(ea) and math.isfinite(ba) and math.isfinite(rq)
+        ):
+            denom = ea * ba
+            if denom != 0:
+                realized_pnl_pct_val = (rq / denom) * 100.0
+        if realized_pnl_pct_val is None and ea is not None and ex is not None and ea != 0 and math.isfinite(ea) and math.isfinite(ex):
+            realized_pnl_pct_val = (ex - ea) / ea * 100.0
+    except (TypeError, ValueError):
+        realized_pnl_pct_val = None
+
     con.execute(
         """
         UPDATE deals SET
@@ -1438,6 +2343,8 @@ def close_deal(
             exit_avg=?,
             base_amount=?,
             realized_pnl_quote=?,
+            realized_pnl_pct=?,
+            entry_avg_estimated=?,
             entry_regime=?,
             exit_regime=?,
             entry_strategy=?,
@@ -1455,6 +2362,8 @@ def close_deal(
             float(exit_avg) if exit_avg is not None else None,
             float(base_amount) if base_amount is not None else None,
             float(realized_pnl_quote) if realized_pnl_quote is not None else None,
+            float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
+            1 if entry_avg_estimated else 0,
             str(entry_regime) if entry_regime is not None else None,
             str(exit_regime) if exit_regime is not None else None,
             str(entry_strategy) if entry_strategy is not None else None,
@@ -1501,6 +2410,433 @@ def close_deal(
     con.close()
 
 
+def manual_close_deal_and_journal(
+    deal_id: int,
+    bot_id: int,
+    entry_avg: float,
+    exit_avg: float,
+    base_amount: float,
+    realized_pnl_quote: float,
+    entry_strategy: Optional[str] = None,
+    exit_strategy: Optional[str] = None,
+    hold_sec: Optional[int] = None,
+    safety_count: Optional[int] = None,
+    journal_exit_reason: str = "",
+    entry_regime: Optional[str] = None,
+    exit_regime: Optional[str] = None,
+    mae: Optional[float] = None,
+    mfe: Optional[float] = None,
+    entry_avg_estimated: bool = False,
+) -> Dict[str, Any]:
+    """
+    Manual close from API: one dedicated SQLite connection + single commit so we do not
+    race the per-thread _conn() cache used elsewhere. Caller must serialize with BotManager.bot_db_lock.
+    """
+    con = _make_real_conn()
+    try:
+        row = con.execute("SELECT * FROM deals WHERE id=?", (int(deal_id),)).fetchone()
+        if not row:
+            raise ValueError("Deal not found")
+        drow = dict(row)
+        if int(drow.get("bot_id") or 0) != int(bot_id):
+            raise ValueError("Deal does not belong to this bot")
+        st = str(drow.get("state") or "").upper()
+        if st in ("CLOSED", "CANCELLED"):
+            raise ValueError(f"Deal already {st}")
+
+        closed_ts = now_ts()
+        opened_ts = int(drow.get("opened_at") or 0)
+
+        realized_pnl_pct_val: Optional[float] = None
+        try:
+            ea = float(entry_avg) if entry_avg is not None else None
+            ex = float(exit_avg) if exit_avg is not None else None
+            ba = float(base_amount) if base_amount is not None else None
+            rq = float(realized_pnl_quote) if realized_pnl_quote is not None else None
+            if (
+                ea is not None and ba is not None and rq is not None
+                and ea > 0 and ba > 0 and math.isfinite(ea) and math.isfinite(ba) and math.isfinite(rq)
+            ):
+                denom = ea * ba
+                if denom != 0:
+                    realized_pnl_pct_val = (rq / denom) * 100.0
+            if realized_pnl_pct_val is None and ea is not None and ex is not None and ea != 0 and math.isfinite(ea) and math.isfinite(ex):
+                realized_pnl_pct_val = (ex - ea) / ea * 100.0
+        except (TypeError, ValueError):
+            realized_pnl_pct_val = None
+
+        # Race-safe close: filter on state='OPEN' so concurrent callers see
+        # rowcount=0 and raise ValueError below. Without this predicate
+        # 10 threads can all read the row as OPEN, then all overwrite it.
+        cur = con.execute(
+            """
+            UPDATE deals SET
+                state=?,
+                closed_at=?,
+                entry_avg=?,
+                exit_avg=?,
+                base_amount=?,
+                realized_pnl_quote=?,
+                realized_pnl_pct=?,
+                entry_avg_estimated=?,
+                entry_regime=?,
+                exit_regime=?,
+                entry_strategy=?,
+                exit_strategy=?,
+                mae=?,
+                mfe=?,
+                hold_sec=?,
+                safety_count=?
+            WHERE id=? AND bot_id=? AND state='OPEN'
+            """,
+            (
+                "CLOSED",
+                closed_ts,
+                float(entry_avg) if entry_avg is not None else None,
+                float(exit_avg) if exit_avg is not None else None,
+                float(base_amount) if base_amount is not None else None,
+                float(realized_pnl_quote) if realized_pnl_quote is not None else None,
+                float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
+                1 if entry_avg_estimated else 0,
+                str(entry_regime) if entry_regime is not None else None,
+                str(exit_regime) if exit_regime is not None else None,
+                str(entry_strategy) if entry_strategy is not None else None,
+                str(exit_strategy) if exit_strategy is not None else None,
+                float(mae) if mae is not None else None,
+                float(mfe) if mfe is not None else None,
+                int(hold_sec) if hold_sec is not None else None,
+                int(safety_count) if safety_count is not None else None,
+                int(deal_id),
+                int(bot_id),
+            ),
+        )
+        if int(cur.rowcount or 0) == 0:
+            # Lost the race — another writer closed it first. Roll back so
+            # we do not double-write the trade_journal / trade_feedback below.
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise ValueError(f"Deal {deal_id} not open or not found")
+
+        jr = con.execute("SELECT * FROM trade_journal WHERE deal_id=?", (int(deal_id),)).fetchone()
+        if jr:
+            jdict = dict(jr)
+            er = jdict.get("entry_reason") or ""
+            xr = journal_exit_reason if journal_exit_reason else (jdict.get("exit_reason") or "")
+            ll = jdict.get("lessons_learned") or ""
+            sc = jdict.get("screenshot_data") or ""
+            con.execute(
+                """UPDATE trade_journal SET entry_reason=?, exit_reason=?, lessons_learned=?, screenshot_data=?, updated_at=? WHERE deal_id=?""",
+                (er, xr, ll, sc, closed_ts, int(deal_id)),
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO trade_journal(deal_id, entry_reason, exit_reason, lessons_learned, screenshot_data, updated_at)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (int(deal_id), "", journal_exit_reason or "", "", "", closed_ts),
+            )
+
+        try:
+            profitable_flag = 1 if (realized_pnl_quote or 0) > 0 else 0
+            sym_row = con.execute("SELECT symbol FROM deals WHERE id=?", (int(deal_id),)).fetchone()
+            deal_symbol = sym_row["symbol"] if sym_row else ""
+            features = json.dumps({
+                "entry_avg": float(entry_avg) if entry_avg else 0,
+                "exit_avg": float(exit_avg) if exit_avg else 0,
+                "pnl": float(realized_pnl_quote) if realized_pnl_quote else 0,
+                "exit_strategy": str(exit_strategy or ""),
+                "entry_regime": str(entry_regime or ""),
+                "hold_sec": int(hold_sec) if hold_sec else 0,
+            })
+            con.execute(
+                "INSERT INTO trade_feedback(symbol, timestamp, features_json, profitable) VALUES (?, ?, ?, ?)",
+                (str(deal_symbol), time.time(), features, int(profitable_flag)),
+            )
+        except Exception as fb_err:
+            logger.warning("manual_close_deal_and_journal: trade_feedback failed: %s", fb_err)
+
+        if entry_avg is not None and exit_avg is not None and realized_pnl_quote is not None:
+            try:
+                _record_recommendation_outcome(
+                    con, int(bot_id), int(deal_id),
+                    float(entry_avg), float(exit_avg), float(realized_pnl_quote),
+                    closed_ts, opened_ts,
+                )
+            except Exception:
+                pass
+
+        con.commit()
+        rp = float(realized_pnl_quote)
+        rp_pct = ((float(exit_avg) - float(entry_avg)) / float(entry_avg)) * 100.0 if entry_avg and float(entry_avg) > 0 else 0.0
+        return {
+            "ok": True,
+            "deal_id": int(deal_id),
+            "realized_pnl": rp,
+            "realized_pnl_quote": rp,
+            "realized_pnl_pct": float(rp_pct),
+            "closed_at": closed_ts,
+        }
+    except Exception:
+        try:
+            con.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _safe_float_db(val: Any, default: float = 0.0) -> float:
+    try:
+        v = float(val)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _repair_entry_from_trades_window(
+    kc: Any,
+    symbol: str,
+    opened_sec: int,
+    closed_sec: int,
+    extend_back_sec: int,
+    trade_limit: int = 1000,
+) -> Optional[float]:
+    """Average buy price from exchange trades between deal open/close (with optional extended fetch window)."""
+    try:
+        trades = kc.fetch_my_trades(symbol, limit=int(trade_limit))
+    except Exception:
+        return None
+    opened_ms = int(opened_sec) * 1000
+    closed_ms = int(closed_sec) * 1000
+    since_ms = max(0, int(opened_sec) - int(extend_back_sec)) * 1000
+    buy_amt = 0.0
+    buy_cost = 0.0
+    for t in trades or []:
+        ts = t.get("timestamp")
+        if ts is None:
+            continue
+        try:
+            ts_i = int(ts)
+        except Exception:
+            continue
+        if ts_i < since_ms or ts_i < opened_ms or ts_i > closed_ms:
+            continue
+        side = (t.get("side") or "").lower()
+        if side != "buy":
+            continue
+        amt = _safe_float_db(t.get("amount"), 0.0)
+        price = _safe_float_db(t.get("price"), 0.0)
+        if amt <= 0 or price <= 0:
+            continue
+        buy_amt += amt
+        buy_cost += amt * price
+    if buy_amt <= 0:
+        return None
+    return buy_cost / buy_amt
+
+
+def _repair_entry_from_ohlcv(kc: Any, symbol: str, opened_sec: int) -> Optional[float]:
+    """Closest 1h candle close to deal open time."""
+    try:
+        opened_ms = int(opened_sec) * 1000
+        since_ms = opened_ms - 48 * 3600 * 1000
+        until_ms = opened_ms + 3600 * 1000
+        candles: List[Any] = []
+        if hasattr(kc, "fetch_ohlcv_range"):
+            candles = kc.fetch_ohlcv_range(symbol, "1h", since_ms, until_ms, limit=120) or []
+        if not candles:
+            candles = kc.fetch_ohlcv(symbol, "1h", limit=120) or []
+        if not candles:
+            return None
+        best: Optional[float] = None
+        best_d: Optional[int] = None
+        for c in candles:
+            if not c or len(c) < 5:
+                continue
+            cm = int(c[0])
+            d = abs(cm - opened_ms)
+            if best_d is None or d < best_d:
+                best_d = d
+                best = _safe_float_db(c[4], 0.0)
+        if best is not None and best > 0:
+            return float(best)
+    except Exception as ex:
+        logger.debug("repair_entry_from_ohlcv: %s", ex)
+    return None
+
+
+def get_deal_buy_avg_from_order_events(deal_id: int) -> Optional[Tuple[float, float]]:
+    """
+    Recover average buy price from local order_events for a deal window.
+    Returns (entry_avg, total_buy_qty) or None.
+    """
+    con = _conn()
+    try:
+        deal = con.execute(
+            "SELECT bot_id, symbol, opened_at, closed_at FROM deals WHERE id=?",
+            (int(deal_id),),
+        ).fetchone()
+        if not deal:
+            return None
+        bot_id = int(deal["bot_id"] or 0)
+        sym = str(deal["symbol"] or "").strip()
+        opened = int(deal["opened_at"] or 0)
+        closed = int(deal["closed_at"] or 0) or now_ts()
+        if bot_id <= 0 or not sym or opened <= 0:
+            return None
+        row = con.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS amt, COALESCE(SUM(amount * price), 0) AS cost
+            FROM order_events
+            WHERE bot_id = ? AND symbol = ? AND LOWER(side) = 'buy'
+              AND price IS NOT NULL AND amount IS NOT NULL
+              AND ts >= ? AND ts <= ?
+            """,
+            (bot_id, sym, opened, closed),
+        ).fetchone()
+        amt = _safe_float_db(row["amt"] if row else 0, 0.0)
+        cost = _safe_float_db(row["cost"] if row else 0, 0.0)
+        if amt <= 0 or cost <= 0:
+            return None
+        return (cost / amt, amt)
+    except Exception as ex:
+        logger.debug("get_deal_buy_avg_from_order_events: %s", ex)
+        return None
+    finally:
+        con.close()
+
+
+def repair_closed_deals_missing_entry(kc: Any = None) -> int:
+    """
+    CLOSED deals only: entry_avg IS NULL OR entry_avg = 0.
+    Order of recovery: order_events (local) → exchange trades → OHLCV → exit_avg fallback.
+    """
+    con = _conn()
+    try:
+        rows = con.execute(
+            """
+            SELECT id, bot_id, symbol, opened_at, closed_at, exit_avg, base_amount
+            FROM deals
+            WHERE state='CLOSED' AND (entry_avg IS NULL OR entry_avg = 0)
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        logger.info("repair_closed_deals_missing_entry: repaired 0 deals (none needed)")
+        return 0
+
+    repaired = 0
+    now_sec = int(time.time())
+    for r in rows:
+        did = int(r["id"])
+        sym = str(r["symbol"] or "").strip()
+        opened = int(r["opened_at"] or 0)
+        closed = int(r["closed_at"] or 0)
+        exit_avg = r["exit_avg"]
+        base_amt = r["base_amount"]
+
+        if not sym or opened <= 0:
+            continue
+        if closed <= 0:
+            closed = now_sec
+
+        entry_avg: Optional[float] = None
+        ohlcv_estimated = False
+        data_source: Optional[str] = None
+
+        ob = get_deal_buy_avg_from_order_events(did)
+        if ob and ob[0] > 0:
+            entry_avg = float(ob[0])
+            data_source = "repaired"
+
+        if (entry_avg is None or entry_avg <= 0) and kc is not None:
+            extend_back = min(max(0, closed - opened) * 2, 7 * 86400)
+            entry_avg = _repair_entry_from_trades_window(
+                kc, sym, opened, closed, extend_back_sec=extend_back, trade_limit=1000,
+            )
+            if entry_avg and entry_avg > 0:
+                data_source = data_source or "repaired"
+
+        if (entry_avg is None or entry_avg <= 0) and kc is not None:
+            entry_avg = _repair_entry_from_ohlcv(kc, sym, opened)
+            if entry_avg is not None and entry_avg > 0:
+                ohlcv_estimated = True
+                data_source = data_source or "repaired"
+
+        if entry_avg is None or entry_avg <= 0:
+            ex = _safe_float_db(exit_avg, 0.0)
+            if ex > 0:
+                entry_avg = ex
+                ohlcv_estimated = True
+                data_source = data_source or "repaired"
+                logger.warning(
+                    "repair_closed_deals_missing_entry: deal %d %s entry unrecoverable; using exit_avg as conservative fallback",
+                    did, sym,
+                )
+            else:
+                logger.warning(
+                    "repair_closed_deals_missing_entry: deal %d %s skipped (no entry and no exit)",
+                    did, sym,
+                )
+                continue
+
+        ex = _safe_float_db(exit_avg, 0.0)
+        ba = _safe_float_db(base_amt, 0.0)
+        rpnl: Optional[float] = None
+        rpct: Optional[float] = None
+        if ex > 0 and ba > 0:
+            rpnl = (ex - float(entry_avg)) * ba
+            ea = float(entry_avg)
+            if ea > 0 and ba > 0 and rpnl is not None:
+                rpct = (float(rpnl) / (ea * ba)) * 100.0
+
+        con = _conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                """
+                UPDATE deals SET
+                    entry_avg = ?,
+                    realized_pnl_quote = ?,
+                    realized_pnl_pct = ?,
+                    entry_avg_estimated = ?,
+                    data_source = COALESCE(?, data_source)
+                WHERE id = ? AND state = 'CLOSED'
+                  AND (entry_avg IS NULL OR entry_avg = 0)
+                """,
+                (
+                    float(entry_avg),
+                    float(rpnl) if rpnl is not None else None,
+                    float(rpct) if rpct is not None else None,
+                    1 if ohlcv_estimated else 0,
+                    data_source,
+                    did,
+                ),
+            )
+            if cur.rowcount and int(cur.rowcount) > 0:
+                repaired += 1
+            con.commit()
+        finally:
+            con.close()
+
+    logger.info("repair_closed_deals_missing_entry: repaired %d deals", repaired)
+    return repaired
+
+
+def repair_null_entry_avg_deals(kc: Any = None) -> int:
+    """Alias for repair_closed_deals_missing_entry (closed deals only; see order_events + exchange repair)."""
+    return repair_closed_deals_missing_entry(kc)
+
+
 def get_symbols_with_open_deals() -> List[str]:
     """Return distinct symbols from all open deals."""
     con = _conn()
@@ -1543,13 +2879,52 @@ def latest_open_deal(bot_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def count_closed_deals() -> int:
+    """Count CLOSED deals (live track record — used for Explore honesty badges)."""
+    con = _conn()
+    try:
+        row = con.execute("SELECT COUNT(*) AS c FROM deals WHERE state='CLOSED'").fetchone()
+        return int(row["c"]) if row else 0
+    finally:
+        con.close()
+
+
+def find_stale_ghost_deals(max_age_sec: int = 7200) -> List[Dict[str, Any]]:
+    """Find deals that are OPEN with no entry (entry_avg IS NULL) older than max_age_sec."""
+    con = _conn()
+    cutoff = now_ts() - max_age_sec
+    rows = con.execute(
+        """
+        SELECT id, bot_id, symbol, opened_at, state
+        FROM deals
+        WHERE state='OPEN' AND entry_avg IS NULL AND opened_at < ?
+        ORDER BY opened_at ASC
+        """,
+        (cutoff,),
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def cancel_ghost_deal(deal_id: int) -> None:
+    """Cancel a ghost deal (OPEN with no entry). Sets state=CANCELLED."""
+    con = _conn()
+    con.execute(
+        "UPDATE deals SET state='CANCELLED', closed_at=? WHERE id=? AND state='OPEN'",
+        (now_ts(), int(deal_id)),
+    )
+    con.commit()
+    con.close()
+
+
 def list_deals(bot_id: int, limit: int = 50) -> List[Dict[str, Any]]:
     con = _conn()
     rows = con.execute(
         """
         SELECT
             id, state, opened_at, closed_at, symbol,
-            entry_avg, exit_avg, base_amount, realized_pnl_quote
+            entry_avg, exit_avg, base_amount, realized_pnl_quote, realized_pnl_pct,
+            entry_avg_estimated
         FROM deals
         WHERE bot_id=?
         ORDER BY opened_at DESC
@@ -1568,7 +2943,8 @@ def list_all_deals(state: Optional[str] = None, limit: int = 200) -> List[Dict[s
             """
             SELECT
                 id, bot_id, state, opened_at, closed_at, symbol,
-                entry_avg, exit_avg, base_amount, realized_pnl_quote
+                entry_avg, exit_avg, base_amount, realized_pnl_quote, realized_pnl_pct,
+                data_source
             FROM deals
             WHERE state=?
             ORDER BY opened_at DESC
@@ -1581,7 +2957,8 @@ def list_all_deals(state: Optional[str] = None, limit: int = 200) -> List[Dict[s
             """
             SELECT
                 id, bot_id, state, opened_at, closed_at, symbol,
-                entry_avg, exit_avg, base_amount, realized_pnl_quote
+                entry_avg, exit_avg, base_amount, realized_pnl_quote, realized_pnl_pct,
+                data_source
             FROM deals
             ORDER BY opened_at DESC
             LIMIT ?
@@ -1959,6 +3336,36 @@ def add_regime_snapshot(bot_id: int, symbol: str, regime: str, confidence: float
     con.close()
 
 
+def get_latest_regime_for_symbols(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Most recent regime_snapshots row per symbol (any bot)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not symbols:
+        return out
+    try:
+        con = _conn()
+        for sym in symbols:
+            s = str(sym or "").strip()
+            if not s:
+                continue
+            row = con.execute(
+                """
+                SELECT regime, confidence, ts FROM regime_snapshots
+                WHERE symbol = ? ORDER BY ts DESC LIMIT 1
+                """,
+                (s,),
+            ).fetchone()
+            if row:
+                out[s] = {
+                    "regime": str(row["regime"] or ""),
+                    "regime_score": float(row["confidence"] or 0),
+                    "updated_at": int(row["ts"] or 0),
+                }
+        con.close()
+    except Exception as e:
+        logger.warning("get_latest_regime_for_symbols: %s", e)
+    return out
+
+
 def add_strategy_decision(bot_id: int, strategy: str, action: str, reason: str, regime: str, confidence: float, payload: str) -> None:
     con = _conn()
     con.execute(
@@ -2026,6 +3433,41 @@ def get_strategy_perf(bot_id: int, strategy: str, window: int = 30) -> Dict[str,
         "max_drawdown": dd,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
+    }
+
+
+def get_symbol_profit_factor(symbol: str, window_days: int = 90) -> Dict[str, Any]:
+    """
+    Compute profit_factor, win_rate, and trade count for a symbol across ALL bots.
+    Used by intelligence_layer generate_recommendation() to enrich metrics.
+    Returns: {profit_factor, win_rate, trades, expectancy}
+    """
+    cutoff = int(now_ts()) - window_days * 86400
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT realized_pnl_quote FROM deals
+        WHERE symbol=? AND state='CLOSED' AND closed_at IS NOT NULL AND closed_at >= ?
+        """,
+        (str(symbol), cutoff),
+    ).fetchall()
+    con.close()
+    if not rows:
+        return {"profit_factor": 0.0, "win_rate": 0.0, "trades": 0, "expectancy": 0.0}
+    pnls = [float(r["realized_pnl_quote"] or 0.0) for r in rows]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    total = len(pnls)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses)) if losses else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
+    win_rate = len(wins) / total if total else 0.0
+    expectancy = sum(pnls) / total if total else 0.0
+    return {
+        "profit_factor": round(profit_factor, 3),
+        "win_rate": round(win_rate, 3),
+        "trades": total,
+        "expectancy": round(expectancy, 4),
     }
 
 
@@ -2330,39 +3772,591 @@ def save_recommendation_snapshot(
     reasons_json: str,
     risk_flags_json: str,
     score_breakdown_json: str = "",
+    composite_score: Optional[float] = None,
+    confidence_score: Optional[float] = None,
+    conviction_grade: Optional[str] = None,
+    factor_scores_json: str = "",
+    signal_flags_json: str = "",
 ) -> int:
-    con = _conn()
-    cur = con.cursor()
-    cur.execute(
+    def _do_save():
+        con = _conn()
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO recommendations_snapshots(
+                symbol, horizon, score, regime_json, metrics_json, reasons_json, risk_flags_json,
+                created_ts, score_breakdown_json, composite_score, confidence_score, conviction_grade,
+                factor_scores_json, signal_flags_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(symbol),
+                str(horizon),
+                float(score),
+                str(regime_json or ""),
+                str(metrics_json or ""),
+                str(reasons_json or ""),
+                str(risk_flags_json or ""),
+                now_ts(),
+                str(score_breakdown_json or ""),
+                float(composite_score) if composite_score is not None else None,
+                float(confidence_score) if confidence_score is not None else None,
+                str(conviction_grade) if conviction_grade else None,
+                str(factor_scores_json or ""),
+                str(signal_flags_json or ""),
+            ),
+        )
+        snapshot_id = int(cur.lastrowid)
+        cur.execute(
+            """
+            INSERT INTO recommendations_latest(symbol, horizon, snapshot_id, created_ts)
+            VALUES (?,?,?,?)
+            ON CONFLICT(symbol, horizon) DO UPDATE SET snapshot_id=excluded.snapshot_id, created_ts=excluded.created_ts
+            """,
+            (str(symbol), str(horizon), snapshot_id, now_ts()),
+        )
+        con.commit()
+        con.close()
+        return snapshot_id
+    return _db_retry(_do_save)
+
+
+def mark_explore_signals_pending(horizon: str, scan_ts: int) -> None:
+    """Start-of-scan: mark all explore_signals rows for this horizon pending (stale-safe)."""
+    hor = str(horizon or "short").strip().lower()
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    def _do_mark():
+        con = _conn()
+        con.execute(
+            "UPDATE explore_signals SET status='pending', updated_ts=? WHERE horizon=?",
+            (int(scan_ts), hor),
+        )
+        con.commit()
+        con.close()
+    try:
+        _db_retry(_do_mark)
+    except Exception as e:
+        logger.warning("mark_explore_signals_pending failed: %s", e)
+
+
+def mark_explore_horizon_pending(horizon: str) -> None:
+    """Backward-compatible alias using current timestamp as scan cycle id."""
+    mark_explore_signals_pending(horizon, now_ts())
+
+
+def upsert_explore_feed_row(
+    symbol: str,
+    horizon: str,
+    status: str,
+    conviction_score: float,
+    reason: Optional[str],
+    strategy: Optional[str],
+    signal_ts: int,
+    detail_json: Optional[str],
+    price: Optional[float],
+    change_24h: Optional[float],
+    market_type: Optional[str],
+    rejection_reason: Optional[str] = None,
+) -> None:
+    """
+    Single source of truth for Explore: UPSERT only, PK (symbol, horizon).
+    status: pending | buy | watch | rejected
+    """
+    sym = str(symbol or "").strip()
+    hor = str(horizon or "short").strip().lower()
+    if not sym:
+        return
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    st = str(status or "rejected").strip().lower()
+    if st not in ("pending", "buy", "watch", "rejected"):
+        st = "rejected"
+    ts = now_ts()
+    def _do_upsert():
+        con = _conn()
+        con.execute(
+            """
+            INSERT INTO explore_signals(
+                symbol, horizon, status, conviction_score, reason, strategy,
+                signal_ts, updated_ts, market_type, price, change_24h, detail_json,
+                rejection_reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, horizon) DO UPDATE SET
+                status=excluded.status,
+                conviction_score=excluded.conviction_score,
+                reason=excluded.reason,
+                strategy=excluded.strategy,
+                signal_ts=excluded.signal_ts,
+                updated_ts=excluded.updated_ts,
+                market_type=excluded.market_type,
+                price=excluded.price,
+                change_24h=excluded.change_24h,
+                detail_json=excluded.detail_json,
+                rejection_reason=excluded.rejection_reason
+            """,
+            (
+                sym,
+                hor,
+                st,
+                float(conviction_score or 0),
+                (str(reason)[:2000] if reason else None),
+                (str(strategy)[:128] if strategy else None),
+                int(signal_ts or 0),
+                ts,
+                (str(market_type)[:16] if market_type else None),
+                float(price) if price is not None else None,
+                float(change_24h) if change_24h is not None else None,
+                (str(detail_json)[:12000] if detail_json else None),
+                (str(rejection_reason)[:128] if rejection_reason else None),
+            ),
+        )
+        con.commit()
+        con.close()
+    try:
+        _db_retry(_do_upsert)
+    except Exception as e:
+        logger.warning("upsert_explore_feed_row failed: %s", e)
+
+
+def list_explore_feed(
+    horizon: str,
+    *,
+    market_type: str = "all",
+    statuses: Optional[List[str]] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Read-only feed for Explore UI — no API-side filtering beyond market_type / status."""
+    hor = str(horizon or "short").strip().lower()
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    want_mt = str(market_type or "all").strip().lower()
+    st_list = statuses if statuses else ["buy", "watch"]
+    st_list = [str(s).lower() for s in st_list if s]
+    if not st_list:
+        st_list = ["buy", "watch"]
+    lim = max(1, min(int(limit), 500))
+    placeholders = ",".join("?" * len(st_list))
+    try:
+        con = _conn()
+        q = f"""
+            SELECT symbol, status, conviction_score, reason, strategy, signal_ts, updated_ts,
+                   market_type, price, change_24h, detail_json, rejection_reason
+            FROM explore_signals
+            WHERE horizon=? AND status IN ({placeholders})
         """
-        INSERT INTO recommendations_snapshots(
-            symbol, horizon, score, regime_json, metrics_json, reasons_json, risk_flags_json, created_ts, score_breakdown_json
-        ) VALUES (?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            str(symbol),
-            str(horizon),
-            float(score),
-            str(regime_json or ""),
-            str(metrics_json or ""),
-            str(reasons_json or ""),
-            str(risk_flags_json or ""),
-            now_ts(),
-            str(score_breakdown_json or ""),
-        ),
-    )
-    snapshot_id = int(cur.lastrowid)
-    cur.execute(
-        """
-        INSERT INTO recommendations_latest(symbol, horizon, snapshot_id, created_ts)
-        VALUES (?,?,?,?)
-        ON CONFLICT(symbol, horizon) DO UPDATE SET snapshot_id=excluded.snapshot_id, created_ts=excluded.created_ts
-        """,
-        (str(symbol), str(horizon), snapshot_id, now_ts()),
-    )
-    con.commit()
-    con.close()
-    return snapshot_id
+        params: List[Any] = [hor] + st_list
+        if want_mt == "crypto":
+            q += " AND market_type='crypto'"
+        elif want_mt == "stocks":
+            q += " AND market_type='stocks'"
+        q += " ORDER BY conviction_score DESC LIMIT ?"
+        params.append(lim)
+        rows = con.execute(q, tuple(params)).fetchall()
+        con.close()
+        return [
+            {
+                "symbol": str(r[0]),
+                "status": str(r[1]),
+                "conviction_score": float(r[2] or 0),
+                "reason": str(r[3] or ""),
+                "strategy": str(r[4] or ""),
+                "signal_ts": int(r[5] or 0),
+                "updated_ts": int(r[6] or 0),
+                "market_type": str(r[7] or ""),
+                "price": float(r[8]) if r[8] is not None else None,
+                "change_24h": float(r[9]) if r[9] is not None else None,
+                "detail_json": str(r[10] or ""),
+                "rejection_reason": str(r[11] or "") if len(r) > 11 else "",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning("list_explore_feed failed: %s", e)
+        return []
+
+
+def explore_signals_max_updated_ts(horizon: str, statuses: Optional[List[str]] = None) -> int:
+    """Latest updated_ts among explore_signals rows for freshness checks (autopilot)."""
+    hor = str(horizon or "short").strip().lower()
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    st = statuses or ["buy", "watch"]
+    st = [str(x).lower() for x in st if x]
+    if not st:
+        st = ["buy", "watch"]
+    ph = ",".join("?" * len(st))
+    try:
+        con = _conn()
+        row = con.execute(
+            f"SELECT MAX(updated_ts) AS m FROM explore_signals WHERE horizon=? AND status IN ({ph})",
+            tuple([hor] + st),
+        ).fetchone()
+        con.close()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def list_signal_accuracy_baselines() -> List[Dict[str, Any]]:
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT strategy_id, horizon, asset_type, sample_size, win_rate,
+                   avg_return_pct, avg_hold_hours, sharpe_ratio, last_updated
+            FROM signal_accuracy_baseline
+            ORDER BY horizon, asset_type, strategy_id
+            """
+        ).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("list_signal_accuracy_baselines: %s", e)
+        return []
+
+
+def list_portfolio_equity_curve(days: int = 30) -> List[Dict[str, Any]]:
+    """Time series from portfolio_snapshots for equity curve charts."""
+    d = max(1, min(int(days), 730))
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT timestamp, total_value, total_pnl, realized_pnl, unrealized_pnl
+            FROM portfolio_snapshots
+            WHERE datetime(timestamp) >= datetime('now', '-' || ? || ' days')
+            ORDER BY datetime(timestamp) ASC
+            """,
+            (d,),
+        ).fetchall()
+        con.close()
+        out: List[Dict[str, Any]] = []
+        cum = 0.0
+        for r in rows:
+            drow = dict(r)
+            rp = _safe_float_db(drow.get("realized_pnl"), 0.0)
+            cum += rp
+            out.append({
+                "timestamp": str(drow.get("timestamp") or ""),
+                "portfolio_value": _safe_float_db(drow.get("total_value"), 0.0),
+                "total_pnl": _safe_float_db(drow.get("total_pnl"), 0.0),
+                "realized_pnl": rp,
+                "unrealized_pnl": _safe_float_db(drow.get("unrealized_pnl"), 0.0),
+                "cumulative_realized_pnl": round(cum, 6),
+            })
+        return out
+    except Exception as e:
+        logger.warning("list_portfolio_equity_curve: %s", e)
+        return []
+
+
+def save_explore_backtest_results(horizon: str, results: Dict[str, Any]) -> int:
+    """Persist full backtest JSON; returns row id."""
+    hor = str(horizon or "short").strip().lower()
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    try:
+        con = _conn()
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO explore_backtest_results(horizon, computed_ts, results_json) VALUES (?,?,?)",
+            (hor, now_ts(), json.dumps(results)),
+        )
+        rid = int(cur.lastrowid)
+        con.commit()
+        con.close()
+        return rid
+    except Exception as e:
+        logger.warning("save_explore_backtest_results failed: %s", e)
+        return 0
+
+
+def get_latest_explore_backtest(horizon: str) -> Optional[Dict[str, Any]]:
+    hor = str(horizon or "short").strip().lower()
+    try:
+        con = _conn()
+        row = con.execute(
+            """
+            SELECT id, computed_ts, results_json FROM explore_backtest_results
+            WHERE horizon=? ORDER BY computed_ts DESC LIMIT 1
+            """,
+            (hor,),
+        ).fetchone()
+        con.close()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "computed_ts": int(row[1] or 0),
+            "results": json.loads(row[2] or "{}"),
+        }
+    except Exception as e:
+        logger.warning("get_latest_explore_backtest failed: %s", e)
+        return None
+
+
+def get_explore_rejected_symbols(horizon: str) -> List[str]:
+    """Symbols marked rejected for this horizon (rejection log / strict filter)."""
+    hor = str(horizon or "short").strip().lower()
+    try:
+        con = _conn()
+        rows = con.execute(
+            "SELECT symbol FROM explore_signals WHERE horizon=? AND status='rejected'",
+            (hor,),
+        ).fetchall()
+        con.close()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception as e:
+        logger.warning("get_explore_rejected_symbols failed: %s", e)
+        return []
+
+
+def get_explore_api_excluded_symbols(horizon: str) -> List[str]:
+    """Hide from /api/recommendations: rejected or not yet updated this scan cycle (pending)."""
+    hor = str(horizon or "short").strip().lower()
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT symbol FROM explore_signals
+            WHERE horizon=? AND status IN ('rejected','pending')
+            """,
+            (hor,),
+        ).fetchall()
+        con.close()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception as e:
+        logger.warning("get_explore_api_excluded_symbols failed: %s", e)
+        return []
+
+
+def save_signal_outcome(
+    symbol: str,
+    horizon: str,
+    strategy: str,
+    signal_ts: int,
+    entry_price: float,
+    composite_score: Optional[float] = None,
+    conviction_grade: Optional[str] = None,
+) -> int:
+    """Record a new buy-signal row for forward outcome tracking (pending)."""
+    sym = str(symbol or "").strip()
+    hor = str(horizon or "short").strip().lower()
+    if not sym or hor not in ("short", "medium", "long"):
+        return 0
+    st = str(strategy or "Trend Follow")[:200]
+    try:
+        ep = float(entry_price)
+        if ep <= 0:
+            return 0
+    except (TypeError, ValueError):
+        return 0
+    ts = int(signal_ts or now_ts())
+    chk = now_ts()
+    try:
+        con = _conn()
+        cur = con.cursor()
+        cur.execute(
+            """
+            INSERT INTO explore_signal_outcomes(
+                symbol, horizon, strategy, signal_ts, entry_price,
+                outcome, composite_score, conviction_grade, checked_ts
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                sym,
+                hor,
+                st,
+                ts,
+                ep,
+                "pending",
+                float(composite_score) if composite_score is not None else None,
+                str(conviction_grade)[:8] if conviction_grade else None,
+                chk,
+            ),
+        )
+        rid = int(cur.lastrowid)
+        con.commit()
+        con.close()
+        return rid
+    except Exception as e:
+        logger.warning("save_signal_outcome failed: %s", e)
+        return 0
+
+
+def update_explore_signal_outcome(
+    outcome_id: int,
+    price_5d: Optional[float] = None,
+    price_10d: Optional[float] = None,
+    price_20d: Optional[float] = None,
+) -> None:
+    """Fill forward prices for explore_signal_outcomes; derive PnL % and outcome from 10d bar when available."""
+    if not outcome_id:
+        return
+    try:
+        con = _conn()
+        row = con.execute(
+            "SELECT entry_price, outcome FROM explore_signal_outcomes WHERE id=?",
+            (int(outcome_id),),
+        ).fetchone()
+        if not row:
+            con.close()
+            return
+        entry = float(row[0] or 0)
+        prev_out = str(row[1] or "pending")
+        if entry <= 0:
+            con.close()
+            return
+        p5 = float(price_5d) if price_5d is not None else None
+        p10 = float(price_10d) if price_10d is not None else None
+        p20 = float(price_20d) if price_20d is not None else None
+        pnl5 = ((p5 - entry) / entry * 100.0) if p5 is not None else None
+        pnl10 = ((p10 - entry) / entry * 100.0) if p10 is not None else None
+        pnl20 = ((p20 - entry) / entry * 100.0) if p20 is not None else None
+        outcome = prev_out
+        if str(prev_out).lower() not in ("win", "loss"):
+            if pnl10 is not None:
+                if pnl10 > 0:
+                    outcome = "win"
+                elif pnl10 < -2.0:
+                    outcome = "loss"
+                elif pnl20 is not None:
+                    outcome = "win" if pnl20 > 0 else "loss"
+            elif pnl20 is not None:
+                outcome = "win" if pnl20 > 0 else "loss"
+        con.execute(
+            """
+            UPDATE explore_signal_outcomes SET
+                price_5d=COALESCE(?, price_5d),
+                price_10d=COALESCE(?, price_10d),
+                price_20d=COALESCE(?, price_20d),
+                pnl_5d_pct=COALESCE(?, pnl_5d_pct),
+                pnl_10d_pct=COALESCE(?, pnl_10d_pct),
+                pnl_20d_pct=COALESCE(?, pnl_20d_pct),
+                outcome=?,
+                checked_ts=?
+            WHERE id=?
+            """,
+            (p5, p10, p20, pnl5, pnl10, pnl20, outcome, now_ts(), int(outcome_id)),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        logger.warning("update_explore_signal_outcome failed: %s", e)
+
+
+def list_explore_outcomes_pending_old(
+    min_age_sec: int = 5 * 86400,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """Pending rows at least min_age_sec old (calendar proxy for trading days)."""
+    lim = max(1, min(int(limit), 2000))
+    cutoff = now_ts() - int(min_age_sec)
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT id, symbol, horizon, strategy, signal_ts, entry_price
+            FROM explore_signal_outcomes
+            WHERE (outcome='pending' OR outcome IS NULL OR outcome='')
+              AND signal_ts <= ?
+            ORDER BY signal_ts ASC
+            LIMIT ?
+            """,
+            (cutoff, lim),
+        ).fetchall()
+        con.close()
+        return [
+            {
+                "id": int(r[0]),
+                "symbol": str(r[1]),
+                "horizon": str(r[2]),
+                "strategy": str(r[3]),
+                "signal_ts": int(r[4] or 0),
+                "entry_price": float(r[5] or 0),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning("list_explore_outcomes_pending_old failed: %s", e)
+        return []
+
+
+def get_strategy_win_rates(horizon: str, lookback_days: int = 90) -> Dict[str, Any]:
+    """
+    Per-strategy aggregates for completed outcomes in lookback window.
+    Returns { strategy: {signals, wins, win_rate, avg_return_10d, low_accuracy} }
+    """
+    hor = str(horizon or "short").strip().lower()
+    if hor not in ("short", "medium", "long"):
+        hor = "short"
+    cutoff = now_ts() - max(1, int(lookback_days)) * 86400
+    out: Dict[str, Any] = {}
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT strategy,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                   AVG(pnl_10d_pct) AS avg10
+            FROM explore_signal_outcomes
+            WHERE horizon=? AND signal_ts>=? AND outcome IN ('win','loss')
+            GROUP BY strategy
+            """,
+            (hor, cutoff),
+        ).fetchall()
+        con.close()
+        for r in rows:
+            strat = str(r[0] or "")
+            n = int(r[1] or 0)
+            w = int(r[2] or 0)
+            avg10 = float(r[3]) if r[3] is not None else None
+            wr = (w / n) if n else 0.0
+            out[strat] = {
+                "signals": n,
+                "wins": w,
+                "win_rate": wr,
+                "avg_return_10d": avg10,
+                "low_accuracy": bool(n >= 5 and wr < 0.55),
+            }
+        return out
+    except Exception as e:
+        logger.warning("get_strategy_win_rates failed: %s", e)
+        return {}
+
+
+def list_explore_rejected(horizon: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Recent rejections for Explore UI / /api/explore/signals."""
+    hor = str(horizon or "short").strip().lower()
+    lim = max(1, min(int(limit), 200))
+    try:
+        con = _conn()
+        rows = con.execute(
+            """
+            SELECT symbol, reason, strategy, updated_ts, rejection_reason
+            FROM explore_signals
+            WHERE horizon=? AND status='rejected'
+            ORDER BY updated_ts DESC
+            LIMIT ?
+            """,
+            (hor, lim),
+        ).fetchall()
+        con.close()
+        return [
+            {
+                "symbol": str(r[0]),
+                "reason": str(r[1] or ""),
+                "strategy": str(r[2] or ""),
+                "updated_ts": int(r[3] or 0),
+                "rejection_reason": str(r[4] or "").strip() or str(r[1] or ""),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning("list_explore_rejected failed: %s", e)
+        return []
 
 
 def count_recommendations_by_horizon() -> Dict[str, int]:
@@ -2389,7 +4383,7 @@ def list_recommendations(
     exclude_bases: list of crypto base symbols to never return (e.g. ['STABLE'])."""
     try:
         con = _conn()
-        con.execute("PRAGMA busy_timeout = 2000")
+        con.execute("PRAGMA busy_timeout = 10000")
         rows = con.execute(
             """
             SELECT s.*
@@ -2460,8 +4454,12 @@ def cleanup_invalid_scores() -> int:
         con = _conn()
         cur = con.cursor()
         # Remove perfect scores with no reasons (artifacts)
+        # Note: recommendations_latest doesn't have a score column — join to snapshots
         cur.execute(
-            "DELETE FROM recommendations_latest WHERE score >= 98 AND (reasons_json IS NULL OR reasons_json = '[]' OR reasons_json = '')"
+            """DELETE FROM recommendations_latest WHERE snapshot_id IN (
+                SELECT id FROM recommendations_snapshots
+                WHERE score >= 98 AND (reasons_json IS NULL OR reasons_json = '[]' OR reasons_json = '')
+            )"""
         )
         deleted = cur.rowcount
         # Remove very old recommendations (>48h) to prevent stale data
@@ -2640,6 +4638,110 @@ def get_recommendation_performance_stats(days: int = 30) -> Dict[str, Any]:
         "by_score_range": by_score_range,
         "by_regime": by_regime,
     }
+
+
+def get_per_symbol_accuracy(symbols: list, days: int = 90) -> Dict[str, Dict[str, Any]]:
+    """Per-symbol win rate from recommendation_performance. Returns {symbol: {total, wins, win_rate}}."""
+    if not symbols:
+        return {}
+    since_ts = now_ts() - (int(days) * 86400)
+    con = _conn()
+    placeholders = ",".join("?" for _ in symbols)
+    rows = con.execute(
+        f"""
+        SELECT symbol, outcome
+        FROM recommendation_performance
+        WHERE outcome IN ('win','loss') AND recommendation_date >= ? AND symbol IN ({placeholders})
+        """,
+        [since_ts] + list(symbols),
+    ).fetchall()
+    con.close()
+    result: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        sym = r["symbol"]
+        if sym not in result:
+            result[sym] = {"total": 0, "wins": 0}
+        result[sym]["total"] += 1
+        if r["outcome"] == "win":
+            result[sym]["wins"] += 1
+    for sym in result:
+        t = result[sym]["total"]
+        result[sym]["win_rate"] = round(result[sym]["wins"] / t * 100, 1) if t else 0
+    return result
+
+
+def get_open_signal_outcomes(limit: int = 100):
+    """Get BUY signals that need 24h/72h outcome checking."""
+    con = _conn()
+    try:
+        rows = con.execute(
+            """SELECT id, symbol, score, created_ts, entry_price, price_24h, price_72h, outcome_checked,
+                      metrics_json
+               FROM recommendations_snapshots
+               WHERE outcome_checked < 2 AND score >= 60 AND created_ts > 0
+               ORDER BY created_ts ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def update_signal_outcome(snap_id: int, entry_price=None, price_24h=None, price_72h=None, outcome_24h=None, outcome_72h=None, outcome_checked=None):
+    """Update outcome tracking fields on a recommendations_snapshots row."""
+    con = _conn()
+    try:
+        sets = []
+        vals = []
+        if entry_price is not None:
+            sets.append("entry_price=?"); vals.append(entry_price)
+        if price_24h is not None:
+            sets.append("price_24h=?"); vals.append(price_24h)
+        if price_72h is not None:
+            sets.append("price_72h=?"); vals.append(price_72h)
+        if outcome_24h is not None:
+            sets.append("outcome_24h=?"); vals.append(outcome_24h)
+        if outcome_72h is not None:
+            sets.append("outcome_72h=?"); vals.append(outcome_72h)
+        if outcome_checked is not None:
+            sets.append("outcome_checked=?"); vals.append(outcome_checked)
+        if not sets:
+            return
+        vals.append(snap_id)
+        con.execute(f"UPDATE recommendations_snapshots SET {','.join(sets)} WHERE id=?", vals)
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_signal_accuracy_stats(days: int = 30) -> Dict[str, Any]:
+    """Aggregate signal outcome stats for the accuracy bar."""
+    since_ts = now_ts() - (int(days) * 86400)
+    con = _conn()
+    try:
+        rows_24h = con.execute(
+            "SELECT outcome_24h FROM recommendations_snapshots WHERE outcome_24h IS NOT NULL AND created_ts >= ?",
+            (since_ts,),
+        ).fetchall()
+        rows_72h = con.execute(
+            "SELECT outcome_72h FROM recommendations_snapshots WHERE outcome_72h IS NOT NULL AND created_ts >= ?",
+            (since_ts,),
+        ).fetchall()
+        total_24h = len(rows_24h)
+        wins_24h = sum(1 for r in rows_24h if r["outcome_24h"] == "WIN")
+        total_72h = len(rows_72h)
+        wins_72h = sum(1 for r in rows_72h if r["outcome_72h"] == "WIN")
+        return {
+            "total_24h": total_24h,
+            "wins_24h": wins_24h,
+            "win_rate_24h": round(wins_24h / total_24h * 100, 1) if total_24h else 0,
+            "total_72h": total_72h,
+            "wins_72h": wins_72h,
+            "win_rate_72h": round(wins_72h / total_72h * 100, 1) if total_72h else 0,
+            "total_tracked": max(total_24h, total_72h),
+        }
+    finally:
+        con.close()
 
 
 def save_scoring_calibration_log(
@@ -3228,6 +5330,121 @@ def cleanup_old_portfolio_snapshots(keep_days: int = 90) -> int:
         con.close()
 
 
+def cleanup_old_recommendation_snapshots(keep_days: int = 7) -> int:
+    """Delete recommendation snapshots older than keep_days, except those still referenced by recommendations_latest.
+    Keeps at least 7 days of history for 24h/72h outcome tracking.
+    Returns number of rows deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        # Delete old snapshots NOT referenced by recommendations_latest
+        cur = con.execute(
+            """DELETE FROM recommendations_snapshots
+               WHERE created_ts < ?
+               AND id NOT IN (SELECT snapshot_id FROM recommendations_latest)""",
+            (cutoff,)
+        )
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("cleanup_old_recommendation_snapshots: %s", e)
+        return 0
+
+
+def save_signal_audit(
+    signal_id: str,
+    symbol: str,
+    asset_type: str,
+    horizon: str,
+    composite_score: float,
+    confidence_score: float,
+    conviction_grade: str,
+    factor_scores_json: str = "",
+    gate_results_json: str = "",
+    technical_signals_json: str = "",
+    metadata_json: str = "",
+    flags_json: str = "",
+    rejection_reason: Optional[str] = None,
+    price_at_signal: Optional[float] = None,
+) -> int:
+    """Save a signal audit record for the hybrid screener."""
+    try:
+        con = _conn()
+        cur = con.cursor()
+        cur.execute(
+            """INSERT INTO signal_audit(
+                signal_id, symbol, asset_type, horizon, composite_score, confidence_score,
+                conviction_grade, factor_scores_json, gate_results_json, technical_signals_json,
+                metadata_json, flags_json, rejection_reason, price_at_signal, created_ts
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(signal_id), str(symbol), str(asset_type), str(horizon),
+                float(composite_score), float(confidence_score), str(conviction_grade),
+                str(factor_scores_json or ""), str(gate_results_json or ""),
+                str(technical_signals_json or ""), str(metadata_json or ""),
+                str(flags_json or ""), str(rejection_reason) if rejection_reason else None,
+                float(price_at_signal) if price_at_signal else None, now_ts(),
+            ),
+        )
+        audit_id = int(cur.lastrowid)
+        con.commit()
+        con.close()
+        return audit_id
+    except Exception as e:
+        logger.warning("save_signal_audit failed: %s", e)
+        return -1
+
+
+def list_signal_audits(
+    symbol: str = "",
+    conviction_grade: str = "",
+    limit: int = 100,
+    since_ts: int = 0,
+) -> List[Dict[str, Any]]:
+    """Query signal audit records."""
+    try:
+        con = _conn()
+        where = ["created_ts > ?"]
+        params: list = [since_ts]
+        if symbol:
+            where.append("symbol = ?")
+            params.append(symbol)
+        if conviction_grade:
+            where.append("conviction_grade = ?")
+            params.append(conviction_grade)
+        where_str = " AND ".join(where)
+        params.append(limit)
+        rows = con.execute(
+            f"SELECT * FROM signal_audit WHERE {where_str} ORDER BY created_ts DESC LIMIT ?",
+            params,
+        ).fetchall()
+        con.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("list_signal_audits failed: %s", e)
+        return []
+
+
+def cleanup_old_signal_audits(keep_days: int = 14) -> int:
+    """Delete signal audit records older than keep_days."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM signal_audit WHERE created_ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_signal_audits: %s", e)
+        return 0
+
+
 def log_audit(action: str, details: str = "", ip: str = "") -> None:
     """Log an audit event for security and compliance tracking."""
     try:
@@ -3276,3 +5493,157 @@ def get_trade_feedback(symbol: str = "", profitable: Optional[int] = None, limit
     except Exception as e:
         logger.warning(f"Failed to get trade feedback: {e}")
         return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scheduled DB maintenance — prune tables that grow unbounded
+# ──────────────────────────────────────────────────────────────────────────────
+
+def cleanup_old_bot_logs(keep_days: int = 30) -> int:
+    """Delete bot_logs entries older than keep_days. Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM bot_logs WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_bot_logs: %s", e)
+        return 0
+
+
+def cleanup_old_strategy_decisions(keep_days: int = 30) -> int:
+    """Delete strategy_decisions entries older than keep_days. Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM strategy_decisions WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_strategy_decisions: %s", e)
+        return 0
+
+
+def cleanup_old_explore_signal_outcomes(keep_days: int = 90) -> int:
+    """Delete explore_signal_outcomes entries older than keep_days. Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM explore_signal_outcomes WHERE signal_ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_explore_signal_outcomes: %s", e)
+        return 0
+
+
+def cleanup_old_order_events(keep_days: int = 90) -> int:
+    """Delete order_events entries older than keep_days. Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM order_events WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_order_events: %s", e)
+        return 0
+
+
+def cleanup_old_regime_snapshots(keep_days: int = 30) -> int:
+    """Delete regime_snapshots entries older than keep_days. Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = int(time.time()) - (keep_days * 86400)
+        cur = con.execute("DELETE FROM regime_snapshots WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_regime_snapshots: %s", e)
+        return 0
+
+
+def cleanup_old_trade_feedback(keep_days: int = 180) -> int:
+    """Delete trade_feedback entries older than keep_days (keep for ML). Returns count deleted."""
+    try:
+        con = _conn()
+        cutoff = time.time() - (keep_days * 86400)
+        cur = con.execute("DELETE FROM trade_feedback WHERE timestamp < ?", (cutoff,))
+        deleted = cur.rowcount
+        if deleted > 0:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+        con.close()
+        return deleted
+    except Exception as e:
+        logger.warning("cleanup_old_trade_feedback: %s", e)
+        return 0
+
+
+def run_db_vacuum() -> bool:
+    """Run VACUUM to reclaim disk space after bulk deletes. Returns True on success."""
+    try:
+        con = _conn()
+        con.execute("VACUUM")
+        con.close()
+        logger.info("DB VACUUM completed successfully")
+        return True
+    except Exception as e:
+        logger.warning("run_db_vacuum: %s", e)
+        return False
+
+
+def db_maintenance_cleanup() -> Dict[str, int]:
+    """
+    Run all periodic cleanup jobs. Returns dict of {table: rows_deleted}.
+    Safe to call daily — each function is idempotent.
+    """
+    results: Dict[str, int] = {}
+    jobs = [
+        ("bot_logs_7d",               lambda: cleanup_old_bot_logs(7)),
+        ("strategy_decisions_7d",     lambda: cleanup_old_strategy_decisions(7)),
+        ("regime_snapshots_30d",      lambda: cleanup_old_regime_snapshots(30)),
+        ("order_events_90d",          lambda: cleanup_old_order_events(90)),
+        ("explore_signal_outcomes_30d", lambda: cleanup_old_explore_signal_outcomes(30)),
+        ("recommendation_snapshots_3d", lambda: cleanup_old_recommendation_snapshots(3)),
+        ("signal_audit_7d",           lambda: cleanup_old_signal_audits(7)),
+        ("portfolio_snapshots_30d",   lambda: cleanup_old_portfolio_snapshots(30)),
+        ("trade_feedback_180d",       lambda: cleanup_old_trade_feedback(180)),
+    ]
+    total_deleted = 0
+    for label, fn in jobs:
+        try:
+            n = fn()
+            results[label] = n
+            total_deleted += n
+        except Exception as e:
+            logger.warning("db_maintenance_cleanup %s: %s", label, e)
+            results[label] = -1
+    try:
+        run_db_vacuum()
+        results["vacuum"] = 1
+    except Exception as e:
+        logger.warning("VACUUM failed: %s", e)
+    logger.info("db_maintenance_cleanup: total_deleted=%d results=%s", total_deleted, results)
+    return results

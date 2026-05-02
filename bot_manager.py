@@ -1,4 +1,5 @@
 # bot_manager.py  (REPLACE ENTIRE FILE)
+import contextlib
 import logging
 import os
 import threading
@@ -12,7 +13,11 @@ from db import (
     add_log,
     latest_open_deal,
     open_deal,
+    cancel_ghost_deal,
     close_deal,
+    manual_close_deal_and_journal,
+    get_deal_buy_avg_from_order_events,
+    update_open_deal_entry,
     get_bot,
     pnl_summary,
     set_bot_running,
@@ -52,6 +57,7 @@ from strategies import (
     dominant_regime,
     StrategyContext,
     _atr,
+    macd,
 )
 from intelligence_layer import (
     IntelligenceLayer,
@@ -97,6 +103,24 @@ except ImportError:
     ORDER_BOOK_AVAILABLE = False
     OrderBookAnalyzer = None
 
+try:
+    from pattern_recognition import PatternRecognizer
+    PATTERN_RECOGNITION_AVAILABLE = True
+except ImportError:
+    PATTERN_RECOGNITION_AVAILABLE = False
+    PatternRecognizer = None
+
+# Module-level singleton for pattern recognizer (shared across bots)
+_pattern_recognizer_instance = None
+def _get_pattern_recognizer():
+    global _pattern_recognizer_instance
+    if _pattern_recognizer_instance is None and PATTERN_RECOGNITION_AVAILABLE:
+        try:
+            _pattern_recognizer_instance = PatternRecognizer()
+        except Exception:
+            pass
+    return _pattern_recognizer_instance
+
 
 # =========================
 # Risk / Stability Controls
@@ -121,7 +145,7 @@ BACKOFF_MAX_SEC = float(os.getenv("BACKOFF_MAX_SEC", "30"))
 # Live trading guardrail:
 # - If a bot is set to dry_run=0 (LIVE), this env must be TRUE to allow real orders.
 # - This lets you configure bots as LIVE in UI but still block execution until you’re confident.
-ALLOW_LIVE_TRADING = os.getenv("ALLOW_LIVE_TRADING", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+ALLOW_LIVE_TRADING = os.getenv("ALLOW_LIVE_TRADING", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 
 # ATR-based position sizing: scale order size down when volatility is high
 ATR_POSITION_SIZING_ENABLED = os.getenv("ATR_POSITION_SIZING_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -350,6 +374,9 @@ class RuntimeState:
     regime_confidence: Optional[float] = None
     regime_scores: Optional[Dict[str, float]] = None
     risk_state: Optional[str] = None
+    risk_level: str = "OK"  # OK, WARNING, CAUTION, CRITICAL
+    risk_reason: Optional[str] = None
+    risk_since_ts: int = 0
     gate_details: Optional[Dict[str, Any]] = None
     forced_strategy: Optional[str] = None
     consecutive_losses: int = 0
@@ -406,6 +433,12 @@ class BotRunner:
         self._last_order_sig: Optional[str] = None
         self._pending_partial: Optional[Tuple[float, float, str]] = None
         self._dry_run_safety_used: int = 0
+        # Dry-run simulated trade ledger. Mirrors the shape returned by
+        # `_fetch_trades_since` (timestamp ms, side, amount, price) so that
+        # `_deal_metrics_from_trades` can merge it transparently for paper bots
+        # — without it, dry-run deals never accumulate entry_avg/qty and TP/SL
+        # never closes them, which starves Analytics/Journal/ML training data.
+        self._dry_trades: List[Dict[str, Any]] = []
         self._last_safety_buy_ts: float = 0.0
         self._last_order_ts: int = 0
         self._regime_selected: Optional[str] = None
@@ -471,12 +504,128 @@ class BotRunner:
                 "regime_confidence": self.state.regime_confidence,
                 "regime_scores": self.state.regime_scores,
                 "risk_state": self.state.risk_state,
+                "risk_level": self.state.risk_level,
+                "risk_reason": self.state.risk_reason,
+                "risk_since_ts": self.state.risk_since_ts,
                 "forced_strategy": self.state.forced_strategy,
                 "gate_details": self.state.gate_details,
                 "unrealized_pnl_quote": upnl_q,
                 "unrealized_pnl_pct": upnl_p,
                 "pnl_status": pnl_st,
             }
+
+    def force_close_dry_position(self) -> Dict[str, Any]:
+        """Bug 10: Reset in-memory position state after the API closes a dry-run
+        deal. Called from POST /api/bots/{id}/deals/{deal_id}/close so the bot's
+        next tick starts fresh.
+        """
+        with self._lock:
+            old_deal_id = self.state.deal_id
+            self.state.deal_id = None
+            self.state.deal_opened_at = None
+            self.state.base_pos = 0.0
+            self.state.avg_entry = None
+            self.state.spent_quote = 0.0
+            self.state.safety_used = 0
+            self.state.tp_price = None
+            self.state.tp_order_id = None
+            self.state.trailing_active = False
+            self.state.trailing_price = None
+            self.state.highest_price_reached = None
+            self.state.partial_initial_position = None
+            self.state.partial_levels_hit = []
+            self.state.decision_action = "HOLD"
+            self.state.decision_reason = "Position closed manually."
+            self.state.last_event = "Manual close (dry run)."
+        try:
+            self._dry_trades = []
+        except Exception:
+            pass
+        return {"ok": True, "deal_id": old_deal_id}
+
+    def _bot_db_sync(self):
+        """Serialize deal DB writes with API manual-close and other bots' writers."""
+        if self.manager:
+            return self.manager.bot_db_lock(self.bot_id)
+        return contextlib.nullcontext()
+
+    def _sync_close_deal(self, *args: Any, **kwargs: Any) -> None:
+        with self._bot_db_sync():
+            close_deal(*args, **kwargs)
+
+    def _sync_open_deal(self, *args: Any, **kwargs: Any) -> Any:
+        with self._bot_db_sync():
+            return open_deal(*args, **kwargs)
+
+    def _sync_update_open_deal_entry(self, *args: Any, **kwargs: Any) -> Any:
+        with self._bot_db_sync():
+            return update_open_deal_entry(*args, **kwargs)
+
+    # Minimum deal age (seconds) before a ghost cancellation is allowed unless
+    # the caller passes ``force=True``. Stops a churn pattern where a freshly
+    # opened deal gets cancelled by the next tick before the exchange has even
+    # acked the fill.
+    GHOST_MIN_AGE_SEC: int = int(os.getenv("GHOST_DEAL_MIN_AGE_SEC", "60"))
+
+    def _sync_cancel_ghost_deal(self, deal_id: Any, *args: Any,
+                                force: bool = False, reason: str = "",
+                                **kwargs: Any) -> Any:
+        """Serialised wrapper around ``cancel_ghost_deal`` with a minimum-age guard.
+
+        We log every cancellation with a clear reason. If ``force`` is False
+        and the deal is younger than ``GHOST_MIN_AGE_SEC`` seconds we skip the
+        cancel and log it instead — this prevents tick races where a brand-new
+        deal is killed before the exchange has confirmed (or rejected) the fill.
+        """
+        try:
+            did = int(deal_id)
+        except Exception:
+            did = 0
+        # Read current row to compute age. Use a no-cache call to be safe; if it
+        # fails we still allow the cancel so we don't soft-leak rows.
+        try:
+            from db import _make_real_conn  # type: ignore
+            _con = _make_real_conn()
+            try:
+                _row = _con.execute(
+                    "SELECT opened_at, state, entry_avg FROM deals WHERE id=?", (did,)
+                ).fetchone()
+            finally:
+                try:
+                    _con.close()
+                except Exception:
+                    pass
+        except Exception:
+            _row = None
+        opened_at = int((_row["opened_at"] if _row else 0) or 0)
+        age_sec = int(time.time()) - opened_at if opened_at else 0
+        cur_state = str((_row["state"] if _row else "") or "").upper()
+        entry_avg = (_row["entry_avg"] if _row else None)
+        log_reason = reason or "unspecified"
+        logger.warning(
+            "cancel_ghost_deal bot=%s deal=%s age=%ss state=%s entry_avg=%s force=%s reason=%s",
+            self.bot_id, did, age_sec, cur_state, entry_avg, force, log_reason,
+        )
+        try:
+            add_log(self.bot_id, "WARN",
+                    f"cancel_ghost_deal #{did} (age={age_sec}s, entry_avg={entry_avg}, force={force}, reason={log_reason})",
+                    "SYSTEM")
+        except Exception:
+            pass
+        if (not force) and opened_at > 0 and age_sec < self.GHOST_MIN_AGE_SEC and entry_avg is None:
+            logger.info(
+                "cancel_ghost_deal: SKIP bot=%s deal=%s age=%ss < min %ss (no entry yet, no force)",
+                self.bot_id, did, age_sec, self.GHOST_MIN_AGE_SEC,
+            )
+            try:
+                add_log(self.bot_id, "INFO",
+                        f"cancel_ghost_deal #{did} skipped: age {age_sec}s < min {self.GHOST_MIN_AGE_SEC}s",
+                        "SYSTEM")
+            except Exception:
+                pass
+            return None
+        with self._bot_db_sync():
+            return cancel_ghost_deal(did, *args, **kwargs)
 
     def _log(self, msg: str, level: str = "INFO", category: str = "SYSTEM") -> None:
         now = time.time()
@@ -506,7 +655,8 @@ class BotRunner:
                 if now - self._last_insufficient_notify_ts < 3600.0:  # 1 hour
                     return
                 self._last_insufficient_notify_ts = now
-            self._notify_discord(f"⚠️ {self._bot_label()}: {msg}")
+            if os.getenv("DISCORD_NOTIFY_ERRORS", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+                self._notify_discord(f"⚠️ {self._bot_label()}: {msg}", force=True)
 
     def _heartbeat(self) -> None:
         with self._lock:
@@ -533,16 +683,24 @@ class BotRunner:
             pass
         return False
 
-    def _notify_discord(self, message: str, trade_event: bool = False, force: bool = False) -> None:
+    def _notify_discord(
+        self,
+        message: str,
+        trade_event: bool = False,
+        force: bool = False,
+        order_id: Optional[str] = None,
+    ) -> None:
         if os.getenv("DISCORD_OFF", "0").strip().lower() in ("1", "true", "yes"):
             return
         webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
         if not webhook:
             return
-        # DISCORD_TRADES_ONLY=1: only send trades + lifecycle (start/stop/blocked). force=True bypasses.
+        # DISCORD_TRADES_ONLY=1: only send confirmed trade-related lines. force=True bypasses (start/stop only).
         trades_only = os.getenv("DISCORD_TRADES_ONLY", "1").strip().lower() in ("1", "true", "yes")
         if trades_only and not trade_event and not force:
             return
+        if order_id:
+            message = f"{message}\nOrder ID: {order_id}"
         now = time.time()
         if self._last_discord_msg == message and (now - self._last_discord_ts) < 60.0:
             return
@@ -757,6 +915,29 @@ class BotRunner:
         except Exception:
             pass
 
+        # Pattern recognition signals (fed into market_breadth for intelligence layer)
+        try:
+            pr = _get_pattern_recognizer()
+            if pr and candles_1h and len(candles_1h) >= 20:
+                # Convert OHLCV list format to dict format expected by PatternRecognizer
+                candles_dict = [
+                    {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c) > 5 else 0}
+                    for c in candles_1h[-100:]
+                ]
+                if hasattr(pr, 'get_pattern_signals'):
+                    pattern_signals = pr.get_pattern_signals(candles_dict)
+                else:
+                    pattern_signals = {}
+                if pattern_signals:
+                    market_breadth["pattern_signals"] = {
+                        "bullish_count": pattern_signals.get("bullish_count", 0),
+                        "bearish_count": pattern_signals.get("bearish_count", 0),
+                        "overall_bias": pattern_signals.get("overall_bias", "neutral"),
+                        "strongest_pattern": pattern_signals.get("strongest_pattern"),
+                    }
+        except Exception as _pr_err:
+            logger.debug("Pattern recognition in intelligence context failed: %s", _pr_err)
+
         # Fallback: derive price from candles when live ticker returns 0 (market closed, API glitch)
         if (price is None or price <= 0) and (candles_1d or candles_4h or candles_1h):
             if candles_1d and len(candles_1d[-1]) >= 5:
@@ -803,7 +984,92 @@ class BotRunner:
     # -----------------
     # Lifecycle
     # -----------------
-    def start(self) -> str:
+    def _supervised_run_loop(self) -> None:
+        """Wrap _run_loop with auto-restart on fatal exceptions.
+
+        Behaviour:
+          - If the run-loop returns/exits cleanly, we exit too.
+          - If the run-loop raises (and was caught by its own try/except), we
+            check `auto_restart` on the bot row. If set, we wait 30 s, clear
+            `last_event`, and re-enter the loop. We bound restart attempts by
+            using exponential backoff (30s -> 60s -> 120s, capped at 300s) so a
+            persistently broken bot does not hammer the system.
+          - We always honour `_stop` as a hard exit — operator-initiated stop
+            wins over auto-restart.
+        """
+        backoff = 30.0
+        max_backoff = 300.0
+        while not self._stop.is_set():
+            had_fatal = False
+            try:
+                self._run_loop()
+            except Exception as e:
+                had_fatal = True
+                logger.exception("BotRunner._supervised_run_loop: bot %s loop raised", self.bot_id)
+                with self._lock:
+                    self.state.errors += 1
+                    self.state.last_event = f"Fatal error: {type(e).__name__}: {e}"
+
+            # _run_loop catches its own exceptions and stores them in last_event,
+            # so detect that case too.
+            try:
+                with self._lock:
+                    le = str(self.state.last_event or "")
+            except Exception:
+                le = ""
+            if le.startswith("Fatal error:"):
+                had_fatal = True
+                # Log the captured fatal text via journalctl so operators can see
+                # WHY the bot crashed even when add_log() itself fails (e.g.
+                # because of DB-lock contention during a startup storm).
+                logger.error(
+                    "BotRunner._supervised_run_loop: bot %s captured fatal in inner loop: %s",
+                    self.bot_id, le,
+                )
+
+            # Loop returned (either clean exit or post-fatal). Decide whether to retry.
+            if self._stop.is_set():
+                break
+            try:
+                bot = get_bot(self.bot_id) or {}
+            except Exception:
+                bot = {}
+            # Only auto-restart when there was a fatal — otherwise a clean stop
+            # (e.g. "Deal closed. Bot stopped.") should remain stopped unless
+            # auto_restart explicitly opts in via a fresh start.
+            if not had_fatal:
+                break
+            if int(bot.get("auto_restart", 1)) != 1 or int(bot.get("enabled", 0)) != 1:
+                break
+
+            sleep_for = min(backoff, max_backoff)
+            with self._lock:
+                self.state.last_event = (
+                    f"Auto-restart in {int(sleep_for)}s after fatal error."
+                )
+            try:
+                add_log(self.bot_id, "WARN",
+                        f"Auto-restart in {int(sleep_for)}s after fatal error (auto_restart=1).",
+                        "SYSTEM")
+            except Exception:
+                pass
+            # Sleep in 1s slices so an operator stop can preempt the wait.
+            slept = 0.0
+            while slept < sleep_for and not self._stop.is_set():
+                time.sleep(1.0)
+                slept += 1.0
+            if self._stop.is_set():
+                break
+            with self._lock:
+                self.state.last_event = "Auto-restart: re-entering tick loop."
+                self.state.running = True
+            try:
+                add_log(self.bot_id, "INFO", "Auto-restart: re-entering tick loop.", "SYSTEM")
+            except Exception:
+                pass
+            backoff = min(backoff * 2.0, max_backoff)
+
+    def start(self, silent: bool = False) -> str:
         # Prevent duplicate threads
         if self._thread and self._thread.is_alive():
             return "Already running."
@@ -819,7 +1085,7 @@ class BotRunner:
             self.state.last_event = "Starting..."
             self.state.errors = 0
 
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._supervised_run_loop, daemon=True)
         self._thread.start()
 
         with self._lock:
@@ -827,18 +1093,18 @@ class BotRunner:
 
         self._log("Start command received.", "INFO", "SYSTEM")
         self._log("Bot is turned on.", "INFO", "SYSTEM")
-        if os.getenv("DISCORD_NOTIFY_STARTED", "1").strip().lower() in ("1", "true", "yes"):
+        if not silent and os.getenv("DISCORD_NOTIFY_STARTED", "1").strip().lower() in ("1", "true", "yes"):
             self._notify_discord(f"✅ {self._bot_label()} started.", force=True)
         try:
             # Force enable on start to prevent loop lockout
             from db import set_bot_enabled
-            set_bot_enabled(self.bot_id, True) 
+            set_bot_enabled(self.bot_id, True)
             set_bot_running(self.bot_id, True)
         except Exception:
             pass
         return "Started."
 
-    def stop(self) -> str:
+    def stop(self, silent: bool = False) -> str:
         self._stopping = True
         self._stop.set()
 
@@ -868,7 +1134,8 @@ class BotRunner:
             self.state.last_event = "Stopped." if not still_alive else "Stop requested; thread still shutting down..."
 
         self._log("Bot stopped.", "INFO", "SYSTEM")
-        self._notify_discord(f"🛑 {self._bot_label()} stopped.", force=True)
+        if not silent:
+            self._notify_discord(f"🛑 {self._bot_label()} stopped.", force=True)
         try:
             set_bot_running(self.bot_id, False)
         except Exception:
@@ -1030,10 +1297,13 @@ class BotRunner:
     def _fetch_trades_since(self, symbol: str, since_ms: int, limit: int = 200) -> List[Dict[str, Any]]:
         """
         Best-effort: use ccxt since= if available; otherwise fetch and filter locally.
+
+        For dry-run bots also merges in `self._dry_trades` so that simulated buys
+        and sells participate in `_deal_metrics_from_trades`. Without this merge
+        paper bots return zero buy_amt and the TP/SL closure path never fires.
         """
         trades: List[Dict[str, Any]] = []
         try:
-            # Use the locked wrapper when possible
             trades = self.kc.fetch_my_trades(symbol, limit=limit)
         except Exception:
             trades = []
@@ -1049,18 +1319,74 @@ class BotRunner:
                     out.append(t)
             except Exception:
                 out.append(t)
+
+        # Merge in simulated dry-run trades (filtered by since_ms and symbol).
+        try:
+            for dt in self._dry_trades:
+                if dt.get("symbol") and dt.get("symbol") != symbol:
+                    continue
+                ts = dt.get("timestamp")
+                if ts is None or int(ts) >= int(since_ms):
+                    out.append(dt)
+        except Exception:
+            pass
         return out
 
+    def _record_dry_trade(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        price: float,
+        order_id: Optional[str] = None,
+    ) -> None:
+        """Append a simulated fill to the dry-run trade ledger.
+
+        Called immediately after `executor.execute_decision` returns a dry-run
+        order so the simulated fill is visible to `_deal_metrics_from_trades`
+        on the very next poll. Trades older than 30 days are pruned to keep
+        the list bounded.
+        """
+        try:
+            amt = float(amount or 0.0)
+            px = float(price or 0.0)
+            if amt <= 0 or px <= 0:
+                return
+            entry = {
+                "timestamp": int(time.time() * 1000),
+                "symbol": str(symbol),
+                "side": str(side or "").lower(),
+                "amount": amt,
+                "price": px,
+                "cost": amt * px,
+                "id": order_id or f"dry_{int(time.time() * 1000)}",
+                "fee": {"cost": 0.0, "currency": "USD"},
+                "is_dry_run": True,
+            }
+            self._dry_trades.append(entry)
+            cutoff_ms = int((time.time() - 30 * 86400) * 1000)
+            if len(self._dry_trades) > 50:
+                self._dry_trades = [t for t in self._dry_trades if int(t.get("timestamp", 0)) >= cutoff_ms]
+        except Exception as exc:
+            logger.debug("record_dry_trade failed: %s", exc)
+
     def _deal_metrics_from_trades(
-        self, symbol: str, deal_opened_at_sec: int
+        self,
+        symbol: str,
+        deal_opened_at_sec: int,
+        extend_back_sec: int = 0,
+        trade_limit: int = 500,
     ) -> Tuple[Optional[float], float, float, float, float]:
         """
         Returns:
           avg_entry, buy_amount_base, buy_cost_quote, sell_amount_base, sell_proceeds_quote
-        Only considers trades since deal opened.
+        Only considers trades at or after deal open time (extend_back_sec widens the fetch window
+        for APIs that return recent-only batches; trades before open are ignored).
         """
-        since_ms = int(deal_opened_at_sec) * 1000
-        trades = self._fetch_trades_since(symbol, since_ms, limit=500)
+        since_sec = max(0, int(deal_opened_at_sec) - int(extend_back_sec))
+        since_ms = int(since_sec) * 1000
+        deal_open_ms = int(deal_opened_at_sec) * 1000
+        trades = self._fetch_trades_since(symbol, since_ms, limit=int(trade_limit))
 
         buy_amt = 0.0
         buy_cost = 0.0
@@ -1068,6 +1394,13 @@ class BotRunner:
         sell_proceeds = 0.0
 
         for t in trades:
+            ts = t.get("timestamp")
+            if ts is not None:
+                try:
+                    if int(ts) < deal_open_ms:
+                        continue
+                except Exception:
+                    pass
             side = (t.get("side") or "").lower()
             amt = _safe_float(t.get("amount"), 0.0)
             price = _safe_float(t.get("price"), 0.0)
@@ -1082,6 +1415,208 @@ class BotRunner:
 
         avg_entry = (buy_cost / buy_amt) if buy_amt > 0 else None
         return avg_entry, buy_amt, buy_cost, sell_amt, sell_proceeds
+
+    def _entry_estimate_from_ohlcv_nearest(self, symbol: str, deal_opened_at_sec: int) -> Optional[float]:
+        """Kraken OHLCV: candle close nearest to deal open time (1h)."""
+        try:
+            opened_ms = int(deal_opened_at_sec) * 1000
+            since_ms = opened_ms - 48 * 3600 * 1000
+            until_ms = opened_ms + 3600 * 1000
+            candles: List[Any] = []
+            if hasattr(self.kc, "fetch_ohlcv_range"):
+                candles = self.kc.fetch_ohlcv_range(symbol, "1h", since_ms, until_ms, limit=120) or []
+            if not candles:
+                candles = self.kc.fetch_ohlcv(symbol, "1h", limit=120) or []
+            if not candles:
+                return None
+            best: Optional[float] = None
+            best_d: Optional[int] = None
+            for c in candles:
+                if not c or len(c) < 5:
+                    continue
+                cm = int(c[0])
+                d = abs(cm - opened_ms)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = _safe_float(c[4], 0.0)
+            if best is not None and best > 0:
+                return float(best)
+        except Exception as ex:
+            logger.debug("entry OHLCV estimate failed: %s", ex)
+        return None
+
+    def _begin_trading_session_reset_deals(self, base: str = "", dry_run: bool = True) -> int:
+        """
+        Reconcile session state with any existing OPEN deal.
+
+        Bug 1 fix: NEVER cancel an OPEN deal on bot restart if it represents a real
+        trade (entry_avg is set, or — in live mode — the exchange still holds the
+        position). Only true *ghost* deals (entry_avg IS NULL AND no exchange
+        position) are cancelled here. Take-profit, stop-loss, manual close, or
+        confirmed exit are the only legitimate transitions to CANCELLED/CLOSED.
+
+        Returns anchor unix ts for trade attribution until a real deal row exists.
+        """
+        od = latest_open_deal(self.bot_id)
+        if od:
+            deal_age = time.time() - int(od.get("opened_at") or 0)
+            if deal_age < 60:
+                return int(od.get("opened_at") or int(time.time()))
+
+            has_exchange_position = False
+            exchange_qty = 0.0
+            if base and not dry_run:
+                try:
+                    _, pos_total = self._balance_free_total(base)
+                    exchange_qty = float(pos_total or 0)
+                    has_exchange_position = exchange_qty > 0
+                except Exception as _bp_err:
+                    logger.warning("reconcile: balance check for %s failed: %s", base, _bp_err)
+
+            # If the deal already records a real entry, treat it as a real position
+            # and resume regardless of dry/live mode. In dry-run, the recorded
+            # entry_avg + base_amount IS the position.
+            has_recorded_entry = od.get("entry_avg") is not None and float(od.get("entry_avg") or 0) > 0
+            recorded_qty = float(od.get("base_amount") or 0.0)
+
+            if has_exchange_position or has_recorded_entry:
+                deal_id = int(od["id"])
+                resume_qty = exchange_qty if has_exchange_position else recorded_qty
+                logger.info(
+                    "reconcile: bot %d resuming OPEN deal #%d (qty=%.8f %s, entry=%s, source=%s)",
+                    self.bot_id, deal_id, resume_qty, base or "?",
+                    od.get("entry_avg"),
+                    "exchange" if has_exchange_position else "db",
+                )
+                with self._lock:
+                    self.state.deal_id = deal_id
+                    self.state.deal_opened_at = int(od.get("opened_at") or int(time.time()))
+                    self.state.base_pos = resume_qty
+                    if od.get("entry_avg") is not None:
+                        try:
+                            self.state.avg_entry = float(od["entry_avg"])
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        self.state.safety_used = int(od.get("safety_count") or 0)
+                    except (TypeError, ValueError):
+                        pass
+
+                # Live mode only: if exchange has a real position but DB row is
+                # missing entry_avg, populate it from current ticker so subsequent
+                # logic has a reference price.
+                if has_exchange_position and od.get("entry_avg") is None:
+                    try:
+                        price = float(self.kc.fetch_ticker(
+                            self._resolve_ticker_symbol(base)
+                        ).get("last", 0))
+                    except Exception:
+                        price = 0.0
+                    if price > 0:
+                        try:
+                            self._sync_update_open_deal_entry(
+                                deal_id=deal_id,
+                                entry_avg=price,
+                                base_amount=exchange_qty,
+                                safety_count=0,
+                            )
+                            with self._lock:
+                                self.state.avg_entry = price
+                            logger.info(
+                                "reconcile: deal #%d updated entry_avg=%.6f qty=%.8f",
+                                deal_id, price, exchange_qty,
+                            )
+                        except Exception as _ue:
+                            logger.warning("reconcile: update_open_deal_entry failed: %s", _ue)
+
+                self._session_trade_anchor_ts = int(od.get("opened_at") or int(time.time()))
+                return self._session_trade_anchor_ts
+
+            # True ghost: OPEN, no entry_avg recorded, AND in live mode no exchange
+            # position. These are leftover rows from a crashed entry attempt.
+            try:
+                logger.info(
+                    "reconcile: bot %d cancelling true ghost deal #%d (no entry, no exchange position)",
+                    self.bot_id, int(od["id"]),
+                )
+                # Reconcile path runs on bot start; the deal_age >= 60 guard above
+                # makes this safe and we know there is no exchange position.
+                self._sync_cancel_ghost_deal(int(od["id"]),
+                                             force=True,
+                                             reason="reconcile_no_exchange_position")
+            except Exception:
+                pass
+
+        anchor = int(time.time())
+        with self._lock:
+            self.state.deal_id = None
+            self.state.deal_opened_at = anchor
+        self._session_trade_anchor_ts = anchor
+
+        if base and not dry_run:
+            try:
+                _, pos_total = self._balance_free_total(base)
+                if float(pos_total or 0) > 0:
+                    exchange_qty = float(pos_total)
+                    nid = self._sync_open_deal(self.bot_id,
+                                    self._bot_symbol_for_deal(),
+                                    state="OPEN", opened_at=anchor)
+                    logger.info(
+                        "reconcile: bot %d — no DB deal but exchange has %.8f %s — created deal #%d",
+                        self.bot_id, exchange_qty, base, nid,
+                    )
+                    with self._lock:
+                        self.state.deal_id = nid
+                        self.state.deal_opened_at = anchor
+                        self.state.base_pos = exchange_qty
+                    try:
+                        price = float(self.kc.fetch_ticker(
+                            self._resolve_ticker_symbol(base)
+                        ).get("last", 0))
+                    except Exception:
+                        price = 0.0
+                    if price > 0:
+                        self._sync_update_open_deal_entry(
+                            deal_id=nid,
+                            entry_avg=price,
+                            base_amount=exchange_qty,
+                            safety_count=0,
+                        )
+                        with self._lock:
+                            self.state.avg_entry = price
+                        logger.info(
+                            "reconcile: deal #%d entry_avg=%.6f qty=%.8f",
+                            nid, price, exchange_qty,
+                        )
+            except Exception as _rec_err:
+                logger.warning("reconcile: create deal for orphan position failed: %s", _rec_err)
+
+        return anchor
+
+    def _resolve_ticker_symbol(self, base: str) -> str:
+        """Best-effort resolve a base asset to a tradeable symbol for fetch_ticker."""
+        bot = get_bot(self.bot_id)
+        if bot:
+            raw = str(bot.get("symbol") or "")
+            if raw:
+                markets = self.kc.load_markets()
+                resolved = _try_resolve_symbol(markets, raw)
+                if resolved:
+                    return resolved
+        for suffix in ("/USD", "/USDT", "USD", ""):
+            candidate = f"{base}{suffix}"
+            try:
+                markets = self.kc.load_markets()
+                if candidate in markets:
+                    return candidate
+            except Exception:
+                pass
+        return f"{base}/USD"
+
+    def _bot_symbol_for_deal(self) -> str:
+        """Return the bot's configured symbol for deal records."""
+        bot = get_bot(self.bot_id)
+        return str(bot.get("symbol") or "") if bot else ""
 
     def _account_snapshot_simple(self, quote: str, last_price: float, position_size: float) -> AccountSnapshot:
         free_quote, total_quote = self._balance_free_total(quote)
@@ -1344,19 +1879,21 @@ class BotRunner:
                 base = str(mk.get("base"))
                 quote = str(mk.get("quote"))
 
-            deal = latest_open_deal(self.bot_id)
-            if deal:
-                deal_id = int(deal["id"])
-                deal_opened_at = int(deal.get("opened_at") or int(time.time()))
-                self._set(f"Resuming existing open deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+            self._begin_trading_session_reset_deals(base=base, dry_run=dry_run)
+            if self.state.deal_id:
+                self._set(
+                    f"Session start: reconciled deal #{self.state.deal_id} with exchange position.",
+                    "INFO",
+                    "STRATEGY",
+                )
             else:
-                deal_id = open_deal(self.bot_id, symbol, state="OPEN")
-                deal_opened_at = int(time.time())
-                self._set(f"Opened new deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+                self._set(
+                    "Session start: no open deal; new deal opens only after a buy order is placed.",
+                    "INFO",
+                    "STRATEGY",
+                )
 
             with self._lock:
-                self.state.deal_id = deal_id
-                self.state.deal_opened_at = deal_opened_at
                 self.state.partial_initial_position = None
                 self.state.partial_levels_hit = []
 
@@ -1455,6 +1992,17 @@ class BotRunner:
                     except Exception:
                         pos_free, pos_total = 0.0, 0.0
 
+                if not dry_run and float(pos_total or 0) > 0 and self.state.deal_id is None:
+                    try:
+                        anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                        nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                        with self._lock:
+                            self.state.deal_id = nid
+                            self.state.deal_opened_at = int(time.time())
+                        self._set(f"Opened deal #{nid} (existing exchange position).", "INFO", "STRATEGY")
+                    except Exception as _ode:
+                        logger.warning("open_deal for existing position failed: %s", _ode)
+
                 if avg_entry and price > 0 and float(self.state.base_pos or 0.0) > 0:
                     pnl_pct = (price - avg_entry) / avg_entry
                     with self._lock:
@@ -1469,6 +2017,17 @@ class BotRunner:
                     if buy_cost > 0:
                         self.state.spent_quote = float(buy_cost)
                     self.state.safety_used = int(safety_used_est)
+
+                if self.state.deal_id and self.state.avg_entry:
+                    try:
+                        self._sync_update_open_deal_entry(
+                            deal_id=int(self.state.deal_id),
+                            entry_avg=float(self.state.avg_entry),
+                            base_amount=float(self.state.base_pos or 0),
+                            safety_count=int(getattr(self.state, 'safety_used', 0) or 0),
+                        )
+                    except Exception as _ue:
+                        logger.debug("update_open_deal_entry: %s", _ue)
 
                 self._maybe_send_pnl_update()
 
@@ -1637,12 +2196,65 @@ class BotRunner:
                 else:
                     self._pending_partial = None
 
-                # Fallback to smart_decide logic for TP if Intelligence didn't explicitly trigger an exit?
-                # Actually, legacy smart_decide handled TP internally via 'tp_price'.
-                # We need to make sure handle TP logic is preserved.
-                # Since IntelligenceLayer.evaluate() calls _manage_trades(), it should handle it.
-                # However, our loop below checks `self.state.tp_price`.
-                
+                # Time-based exit: if position held > max_hold_hours
+                # and we're in a ranging/bear market, exit to free capital
+                if mapped_action == "HOLD":
+                    _max_hold = int(bot.get("max_hold_hours") or 0)
+                    if _max_hold > 0 and self.state.deal_opened_at:
+                        _held_hours = (
+                            time.time() - float(self.state.deal_opened_at)
+                        ) / 3600.0
+                        if _held_hours >= _max_hold:
+                            _regime_label = str(
+                                self.state.regime_label or ""
+                            ).upper()
+                            _should_time_exit = _regime_label in (
+                                "RANGING", "RANGE", "HIGH_VOL_RISK",
+                                "WEAK_BEAR", "BEAR", "STRONG_BEAR"
+                            )
+                            if _should_time_exit and float(pos_free or 0) > 0:
+                                self._log(
+                                    f"Time-based exit: held {_held_hours:.1f}h "
+                                    f">= {_max_hold}h limit in {_regime_label} "
+                                    f"regime — closing position",
+                                    "INFO", "STRATEGY"
+                                )
+                                try:
+                                    self._ensure_trading_allowed()
+                                    self.kc.create_market_sell_base(
+                                        symbol, float(pos_free),
+                                        f"time_exit_{self.bot_id}"
+                                    )
+                                    deal_id = self.state.deal_id
+                                    if deal_id:
+                                        from db import close_deal
+                                        self._sync_close_deal(
+                                            deal_id,
+                                            entry_avg=float(avg_entry or 0),
+                                            exit_avg=float(price),
+                                            base_amount=float(pos_free),
+                                            realized_pnl_quote=float(
+                                                (price - (avg_entry or 0))
+                                                * float(pos_free)
+                                            ),
+                                            exit_strategy="time_exit",
+                                        )
+                                    with self._lock:
+                                        self.state.deal_id = None
+                                        self.state.base_pos = 0.0
+                                        self.state.avg_entry = None
+                                        self.state.tp_price = None
+                                    mapped_action = "TIME_EXIT"
+                                    reason = (
+                                        f"Time exit after {_held_hours:.1f}h "
+                                        f"in {_regime_label} regime"
+                                    )
+                                except Exception as _te:
+                                    self._log(
+                                        f"Time exit failed: {_te}",
+                                        "ERROR", "ORDER"
+                                    )
+
                 decision = LegacyDecision(mapped_action, reason)
 
 
@@ -1685,7 +2297,6 @@ class BotRunner:
                         self._set("Insufficient quote balance for entry.", "ERROR", "RISK")
                         time.sleep(poll)
                         continue
-                    self._notify_discord(f"🟢 {self._bot_label()} Smart DCA entry buy {eff_base:.2f} {quote}", trade_event=True)
                     self._ensure_trading_allowed()
                     is_major = symbol in ("XBT/USD", "BTC/USD", "ETH/USD")
                     allowed, eff_size, ob_reason = _check_order_book_market(self.kc, symbol, "buy", float(eff_base), is_major)
@@ -1695,9 +2306,39 @@ class BotRunner:
                         continue
                     if eff_size < eff_base and ob_reason:
                         self._set(f"Order book: {ob_reason}", "INFO", "ORDER")
-                    self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    _entry_ord = self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    _eid = str((_entry_ord or {}).get("id") or "")
+                    _wait_e = {"ok": False}
+                    _fnw = getattr(self.kc, "wait_market_order_fill", None)
+                    if callable(_fnw) and _eid:
+                        _wait_e = _fnw(_eid, symbol, timeout=45.0)
+                    if not _wait_e.get("ok"):
+                        self._set(
+                            f"Entry buy submitted but fill not confirmed ({_wait_e.get('error', '?')}). No deal opened.",
+                            "WARN",
+                            "ORDER",
+                        )
+                        time.sleep(poll)
+                        continue
                     self._last_buy_ts = time.time()
                     self._last_pnl_notify_ts = 0.0
+                    if self.state.deal_id is None:
+                        try:
+                            anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                            nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                            with self._lock:
+                                self.state.deal_id = nid
+                                self.state.deal_opened_at = int(time.time())
+                            self._set(f"Opened deal #{nid} after Smart DCA entry buy (fill confirmed).", "INFO", "STRATEGY")
+                            _avg_e = _wait_e.get("average")
+                            self._notify_discord(
+                                f"🟢 {self._bot_label()} Smart DCA entry buy {eff_size:.2f} {quote}"
+                                + (f" filled @ {_avg_e}" if _avg_e else " filled"),
+                                trade_event=True,
+                                order_id=_eid or None,
+                            )
+                        except Exception:
+                            pass
 
                 if decision.action == "SAFETY_ORDER":
                     self._log_decision(decision.action, decision.reason)
@@ -1711,7 +2352,6 @@ class BotRunner:
                         self._set("Safety buy blocked: insufficient quote balance.", "ERROR", "RISK")
                         time.sleep(poll)
                         continue
-                    self._notify_discord(f"🟢 {self._bot_label()} Smart DCA safety buy {eff_safety:.2f} {quote}", trade_event=True)
                     self._ensure_trading_allowed()
                     is_major = symbol in ("XBT/USD", "BTC/USD", "ETH/USD")
                     allowed, eff_size, ob_reason = _check_order_book_market(self.kc, symbol, "buy", float(eff_safety), is_major)
@@ -1719,9 +2359,39 @@ class BotRunner:
                         self._set(f"Order book block: {ob_reason}", "WARN", "RISK")
                         time.sleep(poll)
                         continue
-                    self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    _safe_ord = self.kc.create_market_buy_quote(symbol, float(eff_size))
+                    _sid = str((_safe_ord or {}).get("id") or "")
+                    _wait_s = {"ok": False}
+                    _fns = getattr(self.kc, "wait_market_order_fill", None)
+                    if callable(_fns) and _sid:
+                        _wait_s = _fns(_sid, symbol, timeout=45.0)
+                    if not _wait_s.get("ok"):
+                        self._set(
+                            f"Safety buy submitted but fill not confirmed ({_wait_s.get('error', '?')}). No deal opened.",
+                            "WARN",
+                            "ORDER",
+                        )
+                        time.sleep(poll)
+                        continue
                     self._last_buy_ts = time.time()
                     self._last_pnl_notify_ts = 0.0
+                    if self.state.deal_id is None:
+                        try:
+                            anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                            nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                            with self._lock:
+                                self.state.deal_id = nid
+                                self.state.deal_opened_at = int(time.time())
+                            self._set(f"Opened deal #{nid} after Smart DCA safety buy (fill confirmed).", "INFO", "STRATEGY")
+                            _avg_s = _wait_s.get("average")
+                            self._notify_discord(
+                                f"🟢 {self._bot_label()} Smart DCA safety buy {eff_size:.2f} {quote}"
+                                + (f" filled @ {_avg_s}" if _avg_s else " filled"),
+                                trade_event=True,
+                                order_id=_sid or None,
+                            )
+                        except Exception:
+                            pass
                     if tp_order_id:
                         self._cancel_order_safe(symbol, tp_order_id)
                         tp_order_id = None
@@ -1766,7 +2436,7 @@ class BotRunner:
                         if is_final:
                             deal_id = self.state.deal_id
                             if deal_id:
-                                close_deal(
+                                self._sync_close_deal(
                                     deal_id,
                                     entry_avg=float(avg_entry or 0),
                                     exit_avg=float(price),
@@ -1822,7 +2492,7 @@ class BotRunner:
                         self.kc.create_market_sell_base(symbol, float(pos_total), f"trail_{self.bot_id}")
                         deal_id = self.state.deal_id
                         if deal_id:
-                            close_deal(
+                            self._sync_close_deal(
                                 deal_id,
                                 entry_avg=float(avg_entry or 0),
                                 exit_avg=float(price),
@@ -1876,10 +2546,30 @@ class BotRunner:
                     try:
                         realized = float(sell_proceeds - buy_cost)
                         avg_exit = (sell_proceeds / sell_amt) if sell_amt > 0 else None
+                        # Rich trade-closed notification for stop-loss exit
+                        try:
+                            from discord_notifications import DiscordNotifier
+                            _dn = DiscordNotifier()
+                            _hold_h = (int(time.time()) - int(self.state.deal_opened_at or int(time.time()))) / 3600.0
+                            _notional = float(avg_entry or 0.0) * float(buy_amt or 0.0)
+                            _pnl_pct = (float(realized) / _notional) if _notional > 0 else 0.0
+                            _dn.notify_trade_closed(
+                                bot_id=self.bot_id,
+                                symbol=symbol,
+                                exit_reason="SL",
+                                entry_price=float(avg_entry or 0.0),
+                                exit_price=float(avg_exit or 0.0),
+                                pnl_usd=float(realized),
+                                pnl_pct=_pnl_pct,
+                                duration_hours=_hold_h,
+                                strategy=str(self.state.active_strategy or "unknown"),
+                            )
+                        except Exception as _dn_err:
+                            logger.debug("notify_trade_closed (SL) failed: %s", _dn_err)
                         od = latest_open_deal(self.bot_id)
                         if od:
                             hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
-                            close_deal(
+                            self._sync_close_deal(
                                 int(od["id"]),
                                 float(avg_entry) if avg_entry is not None else None,
                                 float(avg_exit) if avg_exit is not None else None,
@@ -1902,10 +2592,11 @@ class BotRunner:
                     except Exception:
                         pass
                     if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
-                        new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
+                        anc = int(time.time())
                         with self._lock:
-                            self.state.deal_id = new_deal_id
-                            self.state.deal_opened_at = int(time.time())
+                            self.state.deal_id = None
+                            self.state.deal_opened_at = anc
+                            self._session_trade_anchor_ts = anc
                             self.state.safety_used = 0
                             self.state.spent_quote = 0.0
                             self.state.tp_order_id = None
@@ -1915,7 +2606,7 @@ class BotRunner:
                             self.state.mfe = None
                             self.state.partial_initial_position = None
                             self.state.partial_levels_hit = []
-                        self._set("Auto-restart after stop-loss: opened new deal.", "INFO", "SYSTEM")
+                        self._set("Auto-restart after stop-loss: deal deferred until next entry order.", "INFO", "SYSTEM")
                         time.sleep(poll)
                         continue
                     with self._lock:
@@ -1966,10 +2657,30 @@ class BotRunner:
                                 f"✅ {self._bot_label()} deal closed. Realized: {realized:.2f} {quote}",
                                 trade_event=True,
                             )
+                            # Rich trade-closed notification via DiscordNotifier
+                            try:
+                                from discord_notifications import DiscordNotifier
+                                _dn = DiscordNotifier()
+                                _hold_h = (int(time.time()) - int(self.state.deal_opened_at or int(time.time()))) / 3600.0
+                                _notional = float(avg_entry or 0.0) * float(buy_amt or 0.0)
+                                _pnl_pct = (float(realized) / _notional) if _notional > 0 else 0.0
+                                _dn.notify_trade_closed(
+                                    bot_id=self.bot_id,
+                                    symbol=symbol,
+                                    exit_reason="TP",
+                                    entry_price=float(avg_entry or 0.0),
+                                    exit_price=float(avg_exit or 0.0),
+                                    pnl_usd=float(realized),
+                                    pnl_pct=_pnl_pct,
+                                    duration_hours=_hold_h,
+                                    strategy=str(self.state.active_strategy or "unknown"),
+                                )
+                            except Exception as _dn_err:
+                                logger.debug("notify_trade_closed (TP close) failed: %s", _dn_err)
                             od = latest_open_deal(self.bot_id)
                             if od:
                                 hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
-                                close_deal(
+                                self._sync_close_deal(
                                     int(od["id"]),
                                     float(avg_entry) if avg_entry is not None else None,
                                     float(avg_exit) if avg_exit is not None else None,
@@ -2010,10 +2721,11 @@ class BotRunner:
                                     if trip_and_alert:
                                         trip_and_alert("3 consecutive losses — autopilot paused for 24h", pause_hours=24, bot_label="System")
                             if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
-                                new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
+                                anc = int(time.time())
                                 with self._lock:
-                                    self.state.deal_id = new_deal_id
-                                    self.state.deal_opened_at = int(time.time())
+                                    self.state.deal_id = None
+                                    self.state.deal_opened_at = anc
+                                    self._session_trade_anchor_ts = anc
                                     self.state.safety_used = 0
                                     self.state.spent_quote = 0.0
                                     self.state.tp_order_id = None
@@ -2021,122 +2733,7 @@ class BotRunner:
                                     self.state.entry_strategy = None
                                     self.state.mae = None
                                     self.state.mfe = None
-                                self._set("Auto-restart: opened new deal.", "INFO", "SYSTEM")
-                                time.sleep(poll)
-                                continue
-                            with self._lock:
-                                self.state.running = False
-                                self.state.last_event = "Deal closed. Bot stopped."
-                            return
-                    except Exception:
-                        pass
-
-                        time.sleep(poll)
-                        continue
-                    with self._lock:
-                        self.state.running = False
-                        self.state.last_event = "Stop-loss executed. Bot stopped."
-                    return
-
-                if decision.action == "TAKE_PROFIT":
-                    self._log_decision(decision.action, decision.reason)
-                    if dry_run or not pos_free:
-                        self._notify_discord(f"[DRY RUN] {self._bot_label()} Smart DCA take profit.")
-                        time.sleep(poll)
-                        continue
-                    price_tp = float(decision.order.get("price") or 0.0) if decision.order else 0.0
-                    if price_tp > 0:
-                        self._notify_discord(f"🟣 {self._bot_label()} Smart DCA TP sell @ {price_tp:.2f} {quote}", trade_event=True)
-                        self._ensure_trading_allowed()
-                        o = self.kc.create_limit_sell_base(symbol, pos_free, price_tp)
-                        tp_order_id = o.get("id")
-                        with self._lock:
-                            self.state.tp_order_id = tp_order_id
-
-                if decision.action == "TRAIL_TP_UPDATE":
-                    self._log_decision(decision.action, decision.reason)
-                    if dry_run or not pos_free:
-                        time.sleep(poll)
-                        continue
-                    trail_price = float(decision.order.get("trail_price") or 0.0) if decision.order else 0.0
-                    if trail_price > 0 and (time.time() - self._last_tp_update_ts) > 30:
-                        if tp_order_id:
-                            self._cancel_order_safe(symbol, tp_order_id)
-                            tp_order_id = None
-                        self._ensure_trading_allowed()
-                        o = self.kc.create_limit_sell_base(symbol, pos_free, trail_price)
-                        tp_order_id = o.get("id")
-                        self._last_tp_update_ts = time.time()
-                        with self._lock:
-                            self.state.tp_order_id = tp_order_id
-
-                # Deal closure detection (live only)
-                if not dry_run:
-                    try:
-                        if buy_amt > 0 and pos_total <= 0.0:
-                            realized = float(sell_proceeds - buy_cost)
-                            avg_exit = (sell_proceeds / sell_amt) if sell_amt > 0 else None
-                            self._set(f"Deal closed. Realized PnL (est): {realized:.2f} {quote}.", "INFO", "ORDER")
-                            self._notify_discord(
-                                f"✅ {self._bot_label()} deal closed. Realized: {realized:.2f} {quote}",
-                                trade_event=True,
-                            )
-                            od = latest_open_deal(self.bot_id)
-                            if od:
-                                hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
-                                close_deal(
-                                    int(od["id"]),
-                                    float(avg_entry) if avg_entry is not None else None,
-                                    float(avg_exit) if avg_exit is not None else None,
-                                    float(buy_amt),
-                                    float(realized),
-                                    entry_regime=self.state.entry_regime,
-                                    exit_regime=self.state.regime_label,
-                                    entry_strategy=self.state.entry_strategy,
-                                    exit_strategy=self.state.active_strategy,
-                                    mae=self.state.mae,
-                                    mfe=self.state.mfe,
-                                    hold_sec=hold_sec,
-                                    safety_count=self.state.safety_used,
-                                )
-                                try:
-                                    strat = self.state.entry_strategy or self.state.active_strategy or "unknown"
-                                    notional = float(avg_entry or 0.0) * float(buy_amt or 0.0)
-                                    pnl_pct = (float(realized) / notional) if notional > 0 else None
-                                    add_strategy_trade(
-                                        self.bot_id,
-                                        strat,
-                                        float(realized),
-                                        symbol=symbol,
-                                        regime=_safe_enum_val(self.state.entry_regime or self.state.regime_label),
-                                        pnl_pct=pnl_pct,
-                                    )
-                                except Exception:
-                                    pass
-                                with self._lock:
-                                    if float(realized) < 0:
-                                        self.state.consecutive_losses += 1
-                                    else:
-                                        self.state.consecutive_losses = 0
-                                # 3-loss circuit breaker: pause autopilot 24h
-                                if float(realized) < 0 and get_global_consecutive_losses(10) <= -3:
-                                    pause_until = int(time.time()) + 86400  # 24h
-                                    set_setting("loss_circuit_pause_until", str(pause_until))
-                                    if trip_and_alert:
-                                        trip_and_alert("3 consecutive losses — autopilot paused for 24h", pause_hours=24, bot_label="System")
-                            if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
-                                new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
-                                with self._lock:
-                                    self.state.deal_id = new_deal_id
-                                    self.state.deal_opened_at = int(time.time())
-                                    self.state.safety_used = 0
-                                    self.state.spent_quote = 0.0
-                                    self.state.tp_order_id = None
-                                    self.state.entry_regime = None
-                                    self.state.entry_strategy = None
-                                    self.state.mae = None
-                                    self.state.mfe = None
-                                self._set("Auto-restart: opened new deal.", "INFO", "SYSTEM")
+                                self._set("Auto-restart: deal deferred until next entry order.", "INFO", "SYSTEM")
                                 time.sleep(poll)
                                 continue
                             with self._lock:
@@ -2280,25 +2877,31 @@ class BotRunner:
             base = str(mk.get("base"))
             quote = str(mk.get("quote"))
 
-            deal = latest_open_deal(self.bot_id)
-            if deal:
-                deal_id = int(deal["id"])
-                deal_opened_at = int(deal.get("opened_at") or int(time.time()))
-                self._set(f"Resuming existing open deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+            self._begin_trading_session_reset_deals(base=base, dry_run=dry_run)
+            if self.state.deal_id:
+                self._set(
+                    f"Session start: reconciled deal #{self.state.deal_id} with exchange position.",
+                    "INFO",
+                    "STRATEGY",
+                )
             else:
-                deal_id = open_deal(self.bot_id, symbol, state="OPEN")
-                deal_opened_at = int(time.time())
-                self._set(f"Opened new deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+                self._set(
+                    "Session start: no open deal; new deal opens only after entry order or existing position sync.",
+                    "INFO",
+                    "STRATEGY",
+                )
 
             with self._lock:
-                self.state.deal_id = deal_id
-                self.state.deal_opened_at = deal_opened_at
                 self.state.tp_order_id = None
                 self.state.trailing_active = False
                 self.state.trailing_price = None
                 self.state.highest_price_reached = None
                 self.state.partial_initial_position = None
                 self.state.partial_levels_hit = []
+
+            _consecutive_entry_rejections = 0
+            _ENTRY_REJECTION_LIMIT = int(os.getenv("ENTRY_REJECTION_LIMIT", "10"))
+            _ENTRY_REJECTION_COOLDOWN_SEC = int(os.getenv("ENTRY_REJECTION_COOLDOWN_SEC", "1800"))
 
             while not self._stop.is_set():
                 bot = get_bot(self.bot_id)
@@ -2334,6 +2937,35 @@ class BotRunner:
                         continue
                 except Exception:
                     pass
+
+                # Ghost position detector — cancel deals with no real entry
+                if self.state.deal_id is not None:
+                    try:
+                        _ghost_od = latest_open_deal(self.bot_id)
+                        if _ghost_od:
+                            _ghost_age_h = (time.time() - int(_ghost_od.get("opened_at") or 0)) / 3600
+                            if _ghost_age_h > 2 and _ghost_od.get("entry_avg") is None:
+                                logger.warning(
+                                    "Ghost position detected for bot %s deal %s "
+                                    "(age %.1fh, no entry) — cancelling",
+                                    self.bot_id, _ghost_od.get("id"), _ghost_age_h,
+                                )
+                                try:
+                                    self._sync_cancel_ghost_deal(
+                                        int(_ghost_od["id"]),
+                                        force=True,
+                                        reason=f"ghost_age_{_ghost_age_h:.1f}h_no_entry",
+                                    )
+                                    self.state.deal_id = None
+                                    self.state.deal_opened_at = None
+                                    self._set(
+                                        "Ghost position cleared — bot ready for new entries",
+                                        "INFO", "SYSTEM",
+                                    )
+                                except Exception as _ge:
+                                    logger.warning("cancel_ghost_deal: %s", _ge)
+                    except Exception:
+                        pass
 
                 # Price
                 try:
@@ -2460,6 +3092,28 @@ class BotRunner:
                         self.state.spent_quote = float(buy_cost)
                     self.state.safety_used = int(safety_used_est)
 
+                if self.state.deal_id and self.state.avg_entry:
+                    try:
+                        self._sync_update_open_deal_entry(
+                            deal_id=int(self.state.deal_id),
+                            entry_avg=float(self.state.avg_entry),
+                            base_amount=float(self.state.base_pos or 0),
+                            safety_count=int(getattr(self.state, 'safety_used', 0) or 0),
+                        )
+                    except Exception as _ue:
+                        logger.debug("update_open_deal_entry: %s", _ue)
+
+                if not dry_run and float(pos_total or 0) > 0 and self.state.deal_id is None:
+                    try:
+                        anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                        nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                        with self._lock:
+                            self.state.deal_id = nid
+                            self.state.deal_opened_at = int(time.time())
+                        self._set(f"Opened deal #{nid} (existing exchange position).", "INFO", "STRATEGY")
+                    except Exception as _ode:
+                        logger.warning("open_deal for existing position failed: %s", _ode)
+
                 self._maybe_send_pnl_update()
 
                 try:
@@ -2471,7 +3125,22 @@ class BotRunner:
 
                 # Portfolio-level risk checks
                 risk_reason = None
-                equity = float(account.total_usd) + float(account.positions_usd)
+                # Use the full Kraken portfolio total (all assets) for equity.
+                # account.total_usd is only the USD quote balance, which severely underestimates
+                # total equity on accounts holding BTC, ETH, or other assets — causing false
+                # exposure cap triggers. Get a cached full portfolio value (refresh every 5min).
+                _now_for_cache = int(time.time())
+                if not hasattr(self, '_cached_equity') or not hasattr(self, '_cached_equity_ts') or \
+                   _now_for_cache - getattr(self, '_cached_equity_ts', 0) > 300:
+                    try:
+                        _full_portfolio = self.manager.get_portfolio_total() if self.manager else 0.0
+                        self._cached_equity = float(_full_portfolio) if _full_portfolio and float(_full_portfolio) > 1.0 else 0.0
+                    except Exception:
+                        self._cached_equity = 0.0
+                    self._cached_equity_ts = _now_for_cache
+                _full_equity = getattr(self, '_cached_equity', 0.0)
+                equity = _full_equity if _full_equity > float(account.total_usd) + float(account.positions_usd) \
+                    else float(account.total_usd) + float(account.positions_usd)
                 position_value = float(self.state.base_pos or 0.0) * float(price or 0.0)
 
                 # B3: Centralized circuit breakers (daily loss, drawdown, exposure, max deals)
@@ -2560,11 +3229,16 @@ class BotRunner:
                     except ImportError:
                         pass
                     if min_free_pct > 0 and equity > 0 and not is_paper:
-                        free_ratio = float(account.free_usd) / equity
+                        # Use USD-only balance as denominator. Using full portfolio equity
+                        # (which includes crypto holdings like XMR, TRX) would cause false
+                        # PAUSE when the account holds crypto assets but has adequate free USD.
+                        # e.g. $9 free USD / $108 total portfolio = 8.3% even though $9 > base_quote.
+                        _usd_denom = float(account.total_usd) if float(account.total_usd or 0) > 0 else equity
+                        free_ratio = float(account.free_usd) / _usd_denom
                         if free_ratio <= min_free_pct:
                             risk_reason = "Minimum free cash reserve reached."
                             self._log(
-                                f"Reserve check: account=live balance={equity:.2f} free={account.free_usd:.2f} "
+                                f"Reserve check: account=live usd_total={_usd_denom:.2f} free={account.free_usd:.2f} "
                                 f"reserve_req={min_free_pct*100:.1f}% ratio={free_ratio*100:.1f}%",
                                 "DEBUG", "RISK"
                             )
@@ -2633,28 +3307,55 @@ class BotRunner:
                 except Exception:
                     pass
 
+                # Compute risk level from drawdown + consecutive losses
+                _dd_pct = float(perf.drawdown or 0.0) * 100
+                _consec = self.state.consecutive_losses
+                _risk_lvl = "OK"
                 if risk_reason:
-                    with self._lock:
+                    _risk_lvl = "CRITICAL"
+                elif _dd_pct >= 12 or _consec >= 5:
+                    _risk_lvl = "CAUTION"
+                elif _dd_pct >= 8 or _consec >= 3:
+                    _risk_lvl = "WARNING"
+
+                with self._lock:
+                    if risk_reason:
                         self.state.risk_state = risk_reason
+                        self.state.risk_level = "CRITICAL"
+                        self.state.risk_reason = risk_reason
+                        if self.state.risk_since_ts == 0:
+                            self.state.risk_since_ts = int(time.time())
+                    elif _risk_lvl != "OK":
+                        self.state.risk_state = f"{_risk_lvl}: drawdown {_dd_pct:.1f}%, {_consec} consecutive losses"
+                        self.state.risk_level = _risk_lvl
+                        self.state.risk_reason = self.state.risk_state
+                        if self.state.risk_since_ts == 0:
+                            self.state.risk_since_ts = int(time.time())
+                    else:
+                        self.state.risk_state = None
+                        self.state.risk_level = "OK"
+                        self.state.risk_reason = None
+                        self.state.risk_since_ts = 0
+
+                if risk_reason:
                     self._log_decision("PAUSE", risk_reason)
-                    # D3: Discord alert for risk pause (rate limited)
-                    if os.getenv("DISCORD_NOTIFY_RISK", "1").strip().lower() in ("1", "true", "yes", "y", "on"):
+                    if os.getenv("DISCORD_NOTIFY_RISK", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
                         key = f"risk_pause:{risk_reason[:60]}"
                         now = time.time()
                         if getattr(self, "_last_risk_pause_notify", None) != key or (now - getattr(self, "_last_risk_pause_notify_ts", 0)) > 3600:
                             self._last_risk_pause_notify = key
                             self._last_risk_pause_notify_ts = now
                             self._notify_discord(f"⚠️ {self._bot_label()}: PAUSE — {risk_reason}", force=True)
-                    # Update heartbeat before sleep to prevent watchdog restart
                     self._heartbeat()
                     time.sleep(poll)
                     continue
-                else:
-                    with self._lock:
-                        self.state.risk_state = None
+
+                # CAUTION level: reduce position size by 50%
+                if _risk_lvl == "CAUTION":
+                    self._log(f"CAUTION risk: drawdown {_dd_pct:.1f}%, {_consec} losses — sizing reduced 50%", "WARN", "RISK")
 
                 # Risk scaling (regime + multi-timeframe + BTC correlation)
-                risk_mult = 1.0
+                risk_mult = 0.5 if _risk_lvl == "CAUTION" else 1.0
                 scores = regime.scores or {}
                 if scores.get("high_vol_score", 0.0) >= 0.6:
                     risk_mult *= 0.6
@@ -2757,7 +3458,7 @@ class BotRunner:
                             if is_final:
                                 deal_id = self.state.deal_id
                                 if deal_id:
-                                    close_deal(
+                                    self._sync_close_deal(
                                         deal_id,
                                         entry_avg=float(avg_entry or 0),
                                         exit_avg=float(price),
@@ -2813,7 +3514,7 @@ class BotRunner:
                                     if deal_id:
                                         _entry = float(avg_entry) if avg_entry else None
                                         _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
-                                        close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
+                                        self._sync_close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
                                                        base_amount=float(pos_total),
                                                        realized_pnl_quote=_pnl,
                                                        exit_strategy="stop_loss")
@@ -2847,12 +3548,80 @@ class BotRunner:
                                     self.kc.create_market_sell_base(symbol, float(pos_total), f"timeexit_{self.bot_id}")
                                     deal_id = self.state.deal_id
                                     if deal_id:
-                                        _entry = float(avg_entry) if avg_entry else None
-                                        _pnl = float(price - _entry) * float(pos_total) if _entry else 0.0
-                                        close_deal(deal_id, entry_avg=_entry, exit_avg=float(price),
-                                                       base_amount=float(pos_total),
-                                                       realized_pnl_quote=_pnl,
-                                                       exit_strategy="time_exit")
+                                        _entry_estimated = False
+                                        _entry: Optional[float] = float(avg_entry) if avg_entry else None
+                                        if _entry is None or _entry <= 0:
+                                            now_sec = int(time.time())
+                                            hold_sec = max(0, now_sec - deal_opened_at)
+                                            extend_back = min(2 * hold_sec, 7 * 86400)
+                                            for attempt in range(3):
+                                                try:
+                                                    avg_retry, _, _, _, _ = self._deal_metrics_from_trades(
+                                                        symbol,
+                                                        deal_opened_at,
+                                                        extend_back_sec=extend_back,
+                                                        trade_limit=1000,
+                                                    )
+                                                    if avg_retry and avg_retry > 0:
+                                                        _entry = float(avg_retry)
+                                                        logger.info(
+                                                            "TIME EXIT: avg_entry recovered (attempt %d) deal %s bot %s",
+                                                            attempt + 1,
+                                                            deal_id,
+                                                            self.bot_id,
+                                                        )
+                                                        break
+                                                except Exception as e:
+                                                    logger.warning(
+                                                        "TIME EXIT metrics recovery attempt %d failed: %s",
+                                                        attempt + 1,
+                                                        e,
+                                                    )
+                                                    time.sleep(2)
+                                            if _entry is None or _entry <= 0:
+                                                try:
+                                                    ob = get_deal_buy_avg_from_order_events(int(deal_id))
+                                                    if ob and ob[0] > 0:
+                                                        _entry = float(ob[0])
+                                                        logger.info(
+                                                            "TIME EXIT: entry_avg from order_events (deal %s, bot %s)",
+                                                            deal_id,
+                                                            self.bot_id,
+                                                        )
+                                                except Exception as e:
+                                                    logger.error("TIME EXIT order_events fallback failed: %s", e)
+                                            if _entry is None or _entry <= 0:
+                                                ohlcv_e = self._entry_estimate_from_ohlcv_nearest(
+                                                    symbol, deal_opened_at
+                                                )
+                                                if ohlcv_e and ohlcv_e > 0:
+                                                    _entry = float(ohlcv_e)
+                                                    _entry_estimated = True
+                                                    logger.info(
+                                                        "TIME EXIT: avg_entry estimated from OHLCV fallback "
+                                                        "(deal %s, bot %s)",
+                                                        deal_id,
+                                                        self.bot_id,
+                                                    )
+                                                else:
+                                                    _entry = float(price)
+                                                    _entry_estimated = True
+                                                    logger.warning(
+                                                        "TIME EXIT: avg_entry unrecoverable; using current price as "
+                                                        "conservative fallback (deal %s, bot %s)",
+                                                        deal_id,
+                                                        self.bot_id,
+                                                    )
+                                        _pnl = float(price - float(_entry)) * float(pos_total)
+                                        self._sync_close_deal(
+                                            deal_id,
+                                            entry_avg=float(_entry),
+                                            exit_avg=float(price),
+                                            base_amount=float(pos_total),
+                                            realized_pnl_quote=_pnl,
+                                            exit_strategy="time_exit",
+                                            entry_avg_estimated=_entry_estimated,
+                                        )
                                 except Exception as e:
                                     self._set(f"Time exit sell failed: {e}", "ERROR", "ORDER")
                             self._heartbeat()
@@ -2888,7 +3657,7 @@ class BotRunner:
                             self.kc.create_market_sell_base(symbol, float(pos_total), f"trail_{self.bot_id}")
                             deal_id = self.state.deal_id
                             if deal_id:
-                                close_deal(
+                                self._sync_close_deal(
                                     deal_id,
                                     entry_avg=float(avg_entry or 0),
                                     exit_avg=float(price),
@@ -2983,13 +3752,13 @@ class BotRunner:
                 if _safe_enum_val(intel_decision.allowed_actions) == "NO_TRADE":
                     block_msg = f"Trading blocked by Intelligence Layer: {intel_decision.final_reason}"
                     self._set(block_msg, "INFO", "INTELLIGENCE")
-                    if os.getenv("DISCORD_NOTIFY_BLOCKED", "1").strip().lower() in ("1", "true", "yes", "y", "on"):
+                    if os.getenv("DISCORD_NOTIFY_BLOCKED", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
                         key = f"blocked:{(intel_decision.final_reason or '')[:80]}"
                         now = time.time()
                         if getattr(self, "_last_blocked_notify", None) != key or (now - getattr(self, "_last_blocked_notify_ts", 0)) > 3600:
                             self._last_blocked_notify = key
                             self._last_blocked_notify_ts = now
-                            self._notify_discord(f"⚠️ {self._bot_label()}: {block_msg}", force=True)
+                            self._notify_discord(f"⚠️ {self._bot_label()}: {block_msg}")
                     # Still execute trade management actions
                     if intel_decision.trade_management.manage_actions:
                         try:
@@ -3090,7 +3859,42 @@ class BotRunner:
                     "INFO",
                     "INTELLIGENCE"
                 )
-                
+
+                # Entry rejection tracking: detect ENTER→HOLD loop
+                _has_position = float(self.state.base_pos or 0) > 0
+                if not _has_position and intel_decision.final_action == "ENTER" and decision.action == "HOLD":
+                    _consecutive_entry_rejections += 1
+                    if _consecutive_entry_rejections >= _ENTRY_REJECTION_LIMIT:
+                        _cooldown_msg = (
+                            f"Entry rejected {_consecutive_entry_rejections} consecutive times. "
+                            f"Closing ghost deal and cooling down {_ENTRY_REJECTION_COOLDOWN_SEC // 60}m."
+                        )
+                        self._set(_cooldown_msg, "WARN", "STRATEGY")
+                        add_log(self.bot_id, "WARN", _cooldown_msg, "STRATEGY")
+                        od = latest_open_deal(self.bot_id)
+                        if od and od.get("entry_avg") is None:
+                            try:
+                                # Forced cancel after persistent ENTER->HOLD rejections.
+                                # The ENTRY_REJECTION_LIMIT (default 10 ticks) ensures
+                                # the deal has had real time to fill.
+                                self._sync_cancel_ghost_deal(
+                                    int(od["id"]),
+                                    force=True,
+                                    reason=f"entry_rejection_loop_{_consecutive_entry_rejections}_attempts",
+                                )
+                                self._set(f"Ghost deal #{od['id']} auto-cancelled (no entry after {_consecutive_entry_rejections} attempts).", "WARN", "SYSTEM")
+                            except Exception:
+                                pass
+                        self._cooldown_until = int(time.time()) + _ENTRY_REJECTION_COOLDOWN_SEC
+                        with self._lock:
+                            self.state.cooldown_until = int(self._cooldown_until)
+                        _consecutive_entry_rejections = 0
+                        self._heartbeat()
+                        time.sleep(poll)
+                        continue
+                elif decision.action in ("ENTER", "SCALE_IN", "SAFETY_ORDER"):
+                    _consecutive_entry_rejections = 0
+
                 # Add strategy's proposed order to Intelligence decision
                 if decision.order:
                     # Attach cost-model context for executor
@@ -3111,6 +3915,41 @@ class BotRunner:
                     decision.order["spread_pct"] = float(getattr(intel_context, "spread_pct", None) or 0.0)
                     decision.order["volatility_pct"] = float(vol_pct or 0.0)
                     decision.order["quote_ts"] = float(now_ts)
+                    # Stamp the live price snapshot on every order. Strategies emit market
+                    # orders without a "price" field (price is determined at fill time on
+                    # live exchanges), but for logs and the dry-run executor fallback we
+                    # need a concrete number — using $0 made every "ORDER PROPOSED" log
+                    # line meaningless and broke dry-run fills when fetch_ticker hiccupped.
+                    try:
+                        if price and float(price) > 0:
+                            if not decision.order.get("price") or float(decision.order.get("price") or 0) <= 0:
+                                decision.order["price"] = float(price)
+                            decision.order["last_price"] = float(price)
+                    except Exception:
+                        pass
+
+                    # Apply Intelligence Layer's risk-adjusted position sizing to entry orders.
+                    # IL computes base_size from portfolio equity * base_risk_pct * regime/Kelly/volatility scalars.
+                    # This ensures bots size down automatically in high-vol or weak-regime conditions.
+                    # Rule: IL can REDUCE order size (risk management), but never EXCEEDS the user's configured base_quote.
+                    if decision.order.get("side") == "buy" and decision.action in ("ENTER", "SCALE_IN", "SAFETY_ORDER"):
+                        try:
+                            intel_base_size = float(intel_decision.position_sizing.base_size)
+                            current_size = float(decision.order.get("size_quote") or 0.0)
+                            configured_base_quote = float(bot_cfg.get("base_quote") or current_size or 25.0)
+                            if intel_base_size > 5.0 and current_size > 0:
+                                # Cap at configured base_quote — never spend more than user set up per order
+                                applied_size = max(5.0, min(intel_base_size, configured_base_quote))
+                                if abs(applied_size - current_size) > 0.50:
+                                    self._log(
+                                        f"INTEL SIZING: {current_size:.2f} → {applied_size:.2f} USD "
+                                        f"(IL base={intel_base_size:.2f}, cfg={configured_base_quote:.2f})",
+                                        "INFO", "INTEL"
+                                    )
+                                decision.order["size_quote"] = applied_size
+                        except Exception:
+                            pass
+
                     if not eod_close_triggered:
                         intel_decision.proposed_orders.append(decision.order)
                     self._log(
@@ -3178,12 +4017,21 @@ class BotRunner:
                             time.sleep(poll)
                             continue
 
+                    # Pass strategy_mode so SmartEntryFilter can skip trend checks for DCA
+                    _strat_mode = ""
+                    try:
+                        _strat_mode = str(intel_decision.strategy_routing.strategy_mode or "")
+                    except Exception:
+                        pass
+                    if not _strat_mode:
+                        _strat_mode = str(self.bot.get("strategy_mode", "") if hasattr(self, "bot") and self.bot else "")
                     exec_result = self.executor.execute_decision(
                         intel_decision, self.bot_id, symbol, dry_run,
                         risk_context=risk_ctx,
                         candles_1h=candles_1h or [],
                         candles_4h=candles_4h or [],
                         candles_1d=candles_1d or [],
+                        strategy_mode=_strat_mode,
                     )
                     
                     if exec_result.get("errors"):
@@ -3197,6 +4045,18 @@ class BotRunner:
                     if exec_result.get("orders_placed"):
                         for order in exec_result["orders_placed"]:
                             self._set(f"Order placed: {order.get('side')} {order.get('type')} @ {order.get('price')}", "INFO", "EXECUTOR")
+                            # Record simulated fills for dry-run bots so the deal
+                            # metrics / closure pipeline sees them as if they came
+                            # back from the exchange. Live fills come back via
+                            # _fetch_trades_since(symbol) directly.
+                            if dry_run and order.get("status") == "dry_run":
+                                self._record_dry_trade(
+                                    symbol=symbol,
+                                    side=str(order.get("side") or ""),
+                                    amount=float(order.get("amount") or 0.0),
+                                    price=float(order.get("price") or 0.0),
+                                    order_id=str(order.get("id") or ""),
+                                )
                         # Update scale-in state after ENTER or SCALE_IN
                         if decision.action == "ENTER":
                             self.state.scale_in_tranche_index = 1
@@ -3204,6 +4064,31 @@ class BotRunner:
                         elif decision.action == "SCALE_IN":
                             self.state.scale_in_tranche_index = int(decision.order.get("scale_in_tranche", 0) or 0) + 1
                             self.state.scale_in_last_add_ts = int(time.time())
+                        if self.state.deal_id is None:
+                            for _ord in exec_result.get("orders_placed") or []:
+                                if (_ord.get("side") or "").lower() != "buy":
+                                    continue
+                                if decision.action not in ("ENTER", "SCALE_IN", "SAFETY_ORDER"):
+                                    continue
+                                if _ord.get("fill_confirmed") is not True:
+                                    continue
+                                try:
+                                    anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                                    nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                                    with self._lock:
+                                        self.state.deal_id = nid
+                                        self.state.deal_opened_at = int(time.time())
+                                    self._set(f"Opened deal #{nid} after confirmed exchange fill.", "INFO", "STRATEGY")
+                                    _oid = str(_ord.get("id") or "")
+                                    _avg = _ord.get("average_fill_price")
+                                    _msg = (
+                                        f"🟢 {self._bot_label()} buy filled (deal #{nid})"
+                                        + (f" @ {_avg}" if _avg else "")
+                                    )
+                                    self._notify_discord(_msg, trade_event=True, order_id=_oid or None)
+                                except Exception as _ode:
+                                    logger.warning("open_deal after entry failed: %s", _ode)
+                                break
                     
                     # Update intelligence decision with execution results
                     try:
@@ -3215,55 +4100,61 @@ class BotRunner:
                 
                 # Legacy execution path removed (replaced by self.executor.execute_decision)
 
-                # Deal closure detection (same as classic)
-                if not dry_run:
-                    try:
-                        _, base_total = self._balance_free_total(base)
-                        if buy_amt > 0 and base_total <= 0.0:
-                            realized = float(sell_proceeds - buy_cost)
-                            avg_exit = (sell_proceeds / sell_amt) if sell_amt > 0 else None
-                            self._set(f"Deal closed. Realized PnL (est): {realized:.2f} {quote}.", "INFO", "ORDER")
-                            self.state.scale_in_tranche_index = 0
-                            self.state.scale_in_last_add_ts = None
-                            od = latest_open_deal(self.bot_id)
-                            if od:
-                                hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
-                                close_deal(
-                                    int(od["id"]),
-                                    float(avg_entry) if avg_entry is not None else None,
-                                    float(avg_exit) if avg_exit is not None else None,
-                                    float(buy_amt),
-                                    float(realized),
-                                    entry_regime=self.state.entry_regime,
-                                    exit_regime=self.state.regime_label,
-                                    entry_strategy=self.state.entry_strategy,
-                                    exit_strategy=self.state.active_strategy,
-                                    mae=self.state.mae,
-                                    mfe=self.state.mfe,
-                                    hold_sec=hold_sec,
-                                    safety_count=self.state.safety_used,
-                                )
-                                try:
-                                    strat = self.state.entry_strategy or self.state.active_strategy or "unknown"
-                                    add_strategy_trade(self.bot_id, strat, float(realized))
-                                except Exception:
-                                    pass
-                            if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
-                                new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
-                                with self._lock:
-                                    self.state.deal_id = new_deal_id
-                                    self.state.deal_opened_at = int(time.time())
-                                    self.state.safety_used = 0
-                                    self.state.spent_quote = 0.0
-                                    self.state.tp_order_id = None
-                                self._set("Auto-restart: opened new deal.", "INFO", "SYSTEM")
-                                continue
+                # Deal closure detection — works for both live (real exchange balance)
+                # and dry-run (simulated balance from _dry_trades). Dry-run paths must
+                # close deals too, otherwise Analytics/Journal/ML stay empty forever.
+                try:
+                    if dry_run:
+                        base_total_for_closure = float(max(buy_amt - sell_amt, 0.0))
+                    else:
+                        _, base_total_for_closure = self._balance_free_total(base)
+                    if buy_amt > 0 and base_total_for_closure <= 1e-9:
+                        realized = float(sell_proceeds - buy_cost)
+                        avg_exit = (sell_proceeds / sell_amt) if sell_amt > 0 else None
+                        _label = "[DRY] " if dry_run else ""
+                        self._set(f"{_label}Deal closed. Realized PnL (est): {realized:.2f} {quote}.", "INFO", "ORDER")
+                        self.state.scale_in_tranche_index = 0
+                        self.state.scale_in_last_add_ts = None
+                        od = latest_open_deal(self.bot_id)
+                        if od:
+                            hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
+                            self._sync_close_deal(
+                                int(od["id"]),
+                                float(avg_entry) if avg_entry is not None else None,
+                                float(avg_exit) if avg_exit is not None else None,
+                                float(buy_amt),
+                                float(realized),
+                                entry_regime=self.state.entry_regime,
+                                exit_regime=self.state.regime_label,
+                                entry_strategy=self.state.entry_strategy,
+                                exit_strategy=self.state.active_strategy,
+                                mae=self.state.mae,
+                                mfe=self.state.mfe,
+                                hold_sec=hold_sec,
+                                safety_count=self.state.safety_used,
+                            )
+                            try:
+                                strat = self.state.entry_strategy or self.state.active_strategy or "unknown"
+                                add_strategy_trade(self.bot_id, strat, float(realized))
+                            except Exception:
+                                pass
+                        if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
+                            anc = int(time.time())
                             with self._lock:
-                                self.state.running = False
-                                self.state.last_event = "Deal closed. Bot stopped."
-                            return
-                    except Exception:
-                        pass
+                                self.state.deal_id = None
+                                self.state.deal_opened_at = anc
+                                self._session_trade_anchor_ts = anc
+                                self.state.safety_used = 0
+                                self.state.spent_quote = 0.0
+                                self.state.tp_order_id = None
+                            self._set("Auto-restart: deal deferred until next entry order.", "INFO", "SYSTEM")
+                            continue
+                        with self._lock:
+                            self.state.running = False
+                            self.state.last_event = "Deal closed. Bot stopped."
+                        return
+                except Exception:
+                    pass
 
                 time.sleep(poll)
 
@@ -3417,20 +4308,22 @@ class BotRunner:
             # Redundant logic removed (handled above)
             pass
 
-            # Resume-safe: use existing open deal if present, otherwise create one.
-            deal = latest_open_deal(self.bot_id)
-            if deal:
-                deal_id = int(deal["id"])
-                deal_opened_at = int(deal.get("opened_at") or int(time.time()))
-                self._set(f"Resuming existing open deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+            self._begin_trading_session_reset_deals(base=base, dry_run=dry_run)
+            deal_opened_at = int(self.state.deal_opened_at or int(time.time()))
+            if self.state.deal_id:
+                self._set(
+                    f"Classic DCA: reconciled deal #{self.state.deal_id} with exchange position.",
+                    "INFO",
+                    "STRATEGY",
+                )
             else:
-                deal_id = open_deal(self.bot_id, symbol, state="OPEN")
-                deal_opened_at = int(time.time())
-                self._set(f"Opened new deal (deal_id={deal_id}).", "INFO", "STRATEGY")
+                self._set(
+                    "Classic DCA: no open deal; deal row opens after first buy or when syncing an existing position.",
+                    "INFO",
+                    "STRATEGY",
+                )
 
             with self._lock:
-                self.state.deal_id = deal_id
-                self.state.deal_opened_at = deal_opened_at
                 self.state.safety_used = 0
                 self.state.spent_quote = 0.0
                 self.state.tp_order_id = None
@@ -3499,6 +4392,17 @@ class BotRunner:
                         self.state.base_pos = total_base
                 except Exception:
                     pass
+                if not dry_run and self.state.deal_id is None:
+                    try:
+                        anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                        nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                        with self._lock:
+                            self.state.deal_id = nid
+                            self.state.deal_opened_at = int(time.time())
+                        deal_opened_at = int(self.state.deal_opened_at)
+                        self._set(f"Opened deal #{nid} (existing position).", "INFO", "STRATEGY")
+                    except Exception:
+                        pass
 
             if buy_amt <= 0.0 and not base_already_placed_dry and not already_has_position and not has_open_buy_order and not self._stop.is_set():
                 # CRITICAL: Ensure base_quote is reasonable (not the full investment)
@@ -3622,13 +4526,8 @@ class BotRunner:
                                 "INFO",
                                 "ORDER",
                             )
-                            self._notify_discord(
-                                f"🟢 {self._bot_label()} base buy {base_amt:.8f} {base} @ {base_px:.2f} {quote}",
-                                trade_event=True,
-                            )
                         else:
                             self._set(f"Placing base order. Size: {effective_base:.8f} {quote}.", "INFO", "ORDER")
-                            self._notify_discord(f"🟢 {self._bot_label()} base buy {effective_base:.2f} {quote}", trade_event=True)
                         
                         # CRITICAL: Use effective_base (ATR-scaled)
                         self._ensure_trading_allowed()
@@ -3639,9 +4538,45 @@ class BotRunner:
                         else:
                             if eff_size < effective_base and ob_reason:
                                 self._set(f"Order book: {ob_reason}", "INFO", "ORDER")
-                            self.kc.create_market_buy_quote(symbol, float(eff_size))
-                            self._last_buy_ts = time.time()
-                            self._last_pnl_notify_ts = 0.0
+                            _bo = self.kc.create_market_buy_quote(symbol, float(eff_size))
+                            _bid = str((_bo or {}).get("id") or "")
+                            _wait_b = {"ok": False}
+                            _fnb = getattr(self.kc, "wait_market_order_fill", None)
+                            if callable(_fnb) and _bid:
+                                _wait_b = _fnb(_bid, symbol, timeout=45.0)
+                            if not _wait_b.get("ok"):
+                                self._set(
+                                    f"Base buy submitted but fill not confirmed ({_wait_b.get('error', '?')}). No deal opened.",
+                                    "WARN",
+                                    "ORDER",
+                                )
+                            else:
+                                self._last_buy_ts = time.time()
+                                self._last_pnl_notify_ts = 0.0
+                                if self.state.deal_id is None:
+                                    try:
+                                        anc = int(getattr(self, "_session_trade_anchor_ts", int(time.time())))
+                                        nid = self._sync_open_deal(self.bot_id, symbol, state="OPEN", opened_at=anc)
+                                        with self._lock:
+                                            self.state.deal_id = nid
+                                            self.state.deal_opened_at = int(time.time())
+                                        self._set(f"Opened deal #{nid} after base buy (fill confirmed).", "INFO", "STRATEGY")
+                                        _avgb = _wait_b.get("average")
+                                        if base_px and base_amt:
+                                            self._notify_discord(
+                                                f"🟢 {self._bot_label()} base buy {base_amt:.8f} {base}"
+                                                f" @ {(_avgb or base_px):.2f} {quote}",
+                                                trade_event=True,
+                                                order_id=_bid or None,
+                                            )
+                                        else:
+                                            self._notify_discord(
+                                                f"🟢 {self._bot_label()} base buy {effective_base:.2f} {quote} filled",
+                                                trade_event=True,
+                                                order_id=_bid or None,
+                                            )
+                                    except Exception:
+                                        pass
 
             # Ladder anchor:
             # - Use the first observed price after start (stable for DCA ladder),
@@ -3701,6 +4636,35 @@ class BotRunner:
                         break
                 except Exception:
                     pass
+
+                # Ghost position detector — cancel deals with no real entry
+                if self.state.deal_id is not None:
+                    try:
+                        _ghost_od = latest_open_deal(self.bot_id)
+                        if _ghost_od:
+                            _ghost_age_h = (time.time() - int(_ghost_od.get("opened_at") or 0)) / 3600
+                            if _ghost_age_h > 2 and _ghost_od.get("entry_avg") is None:
+                                logger.warning(
+                                    "Ghost position detected for bot %s deal %s "
+                                    "(age %.1fh, no entry) — cancelling",
+                                    self.bot_id, _ghost_od.get("id"), _ghost_age_h,
+                                )
+                                try:
+                                    self._sync_cancel_ghost_deal(
+                                        int(_ghost_od["id"]),
+                                        force=True,
+                                        reason=f"ghost_age_{_ghost_age_h:.1f}h_no_entry",
+                                    )
+                                    self.state.deal_id = None
+                                    self.state.deal_opened_at = None
+                                    self._set(
+                                        "Ghost position cleared — bot ready for new entries",
+                                        "INFO", "SYSTEM",
+                                    )
+                                except Exception as _ge:
+                                    logger.warning("cancel_ghost_deal: %s", _ge)
+                    except Exception:
+                        pass
 
                 # Current price - ALWAYS fetch live, no caching
                 # For stocks, check market hours first
@@ -3832,6 +4796,17 @@ class BotRunner:
                     self.state.base_pos = float(pos_total) if not dry_run else float(max(buy_amt - sell_amt, 0.0))
                     if buy_cost > 0:
                         self.state.spent_quote = float(buy_cost)
+
+                if self.state.deal_id and self.state.avg_entry:
+                    try:
+                        self._sync_update_open_deal_entry(
+                            deal_id=int(self.state.deal_id),
+                            entry_avg=float(self.state.avg_entry),
+                            base_amount=float(self.state.base_pos or 0),
+                            safety_count=int(getattr(self.state, 'safety_used', 0) or 0),
+                        )
+                    except Exception as _ue:
+                        logger.debug("update_open_deal_entry: %s", _ue)
 
                 self._maybe_send_pnl_update()
 
@@ -4083,7 +5058,7 @@ class BotRunner:
                             od = latest_open_deal(self.bot_id)
                             if od:
                                 hold_sec = int(time.time()) - int(self.state.deal_opened_at or int(time.time()))
-                                close_deal(
+                                self._sync_close_deal(
                                     int(od["id"]),
                                     float(avg_entry) if avg_entry is not None else None,
                                     float(avg_exit) if avg_exit is not None else None,
@@ -4114,16 +5089,17 @@ class BotRunner:
                                     pass
 
                             if int(bot.get("auto_restart", 0)) == 1 and not self._stop.is_set():
-                                new_deal_id = open_deal(self.bot_id, symbol, state="OPEN")
+                                anc = int(time.time())
                                 with self._lock:
-                                    self.state.deal_id = new_deal_id
-                                    self.state.deal_opened_at = int(time.time())
+                                    self.state.deal_id = None
+                                    self.state.deal_opened_at = anc
+                                    self._session_trade_anchor_ts = anc
                                     self.state.safety_used = 0
                                     self.state.spent_quote = 0.0
                                     self.state.tp_order_id = None
                                 self._dry_run_safety_used = 0
                                 self._last_safety_buy_ts = 0.0
-                                self._set("Auto-restart: opened new deal.", "INFO", "SYSTEM")
+                                self._set("Auto-restart: deal deferred until next entry order.", "INFO", "SYSTEM")
                                 continue
 
                             with self._lock:
@@ -4179,6 +5155,8 @@ class BotManager:
         self._bots: Dict[int, BotRunner] = {}
         self._lock = threading.Lock()
         self._md_lock = threading.Lock()
+        # Per-bot DB locks moved to db._bot_locks (single source of truth, see
+        # audit/write_txn_design.md §3.1). bot_db_lock() below delegates to it.
         self._md_cache: Dict[str, Dict[str, Any]] = {}
         try:
             from market_data import MarketDataRouter
@@ -4190,6 +5168,58 @@ class BotManager:
         except Exception as e:
             logger.warning("MarketDataRouter init failed, using legacy ohlcv: %s", e)
             self._md_router = None
+
+    def bot_db_lock(self, bot_id: int):
+        """Per-bot DB lock — delegates to db.bot_db_lock (single registry).
+
+        Reentrant (RLock) so a writer that legitimately re-takes the lock for
+        defense-in-depth no longer deadlocks. Cross-thread ordering unchanged.
+        """
+        from db import bot_db_lock as _db_bot_db_lock
+        return _db_bot_db_lock(bot_id)
+
+    def manual_close_open_deal(
+        self,
+        bot_id: int,
+        deal_id: int,
+        *,
+        entry_avg: float,
+        exit_avg: float,
+        base_amount: float,
+        realized_pnl_quote: float,
+        entry_strategy: Optional[str],
+        exit_strategy: str,
+        hold_sec: int,
+        safety_count: int,
+        journal_exit_reason: str,
+        entry_regime: Optional[str] = None,
+        exit_regime: Optional[str] = None,
+        mae: Optional[float] = None,
+        mfe: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Record manual deal close in one DB transaction, then reset runner memory (outside DB lock)."""
+        with self.bot_db_lock(int(bot_id)):
+            out = manual_close_deal_and_journal(
+                int(deal_id),
+                int(bot_id),
+                float(entry_avg),
+                float(exit_avg),
+                float(base_amount),
+                float(realized_pnl_quote),
+                entry_strategy=entry_strategy,
+                exit_strategy=exit_strategy,
+                hold_sec=int(hold_sec),
+                safety_count=int(safety_count),
+                journal_exit_reason=journal_exit_reason,
+                entry_regime=entry_regime,
+                exit_regime=exit_regime,
+                mae=mae,
+                mfe=mfe,
+            )
+        runner = self._bots.get(int(bot_id))
+        if runner:
+            runner.force_close_dry_position()
+        return out
 
     def subscribe_all_symbols(self) -> None:
         """Subscribe to WebSocket for all stock bot symbols (UnifiedAlpacaClient)."""
@@ -4326,28 +5356,53 @@ class BotManager:
         return existing or []
 
     def get_portfolio_total(self) -> float:
-        """Aggregate portfolio value from all connected accounts (Kraken + Alpaca)."""
+        """Aggregate portfolio value (USD) from all connected accounts (Kraken + Alpaca).
+        Uses live ticker prices to convert non-USD assets, so the result is a proper equity figure."""
         total = 0.0
         try:
             if self.kc and hasattr(self.kc, "fetch_balance"):
                 bal = self.kc.fetch_balance()
-                free = (bal.get("free") or {}) or {}
-                total += float(free.get("USD") or free.get("ZUSD") or 0) or 0
-                total += float(free.get("USDT") or 0) or 0
-                for asset, amt in (bal.get("total") or {}).items():
-                    if asset in ("USD", "ZUSD", "USDT"):
+                asset_totals = bal.get("total") or {}
+                # USD/stablecoins — add at face value
+                for usd_key in ("USD", "ZUSD", "USDT", "USDC", "DAI"):
+                    v = asset_totals.get(usd_key)
+                    if v:
+                        total += float(v)
+                # Non-USD assets — convert via live price
+                for asset, amt in asset_totals.items():
+                    if asset in ("USD", "ZUSD", "USDT", "USDC", "DAI") or not amt:
+                        continue
+                    raw = float(amt)
+                    if raw <= 0:
                         continue
                     try:
-                        if asset == "XXBT":
-                            total += float(amt or 0) * 43000
+                        # Build ccxt-style symbol (handle Kraken asset naming)
+                        clean = asset.lstrip("X").lstrip("Z") if len(asset) > 3 else asset
+                        if clean in ("BTC", "XBT"):
+                            sym = "BTC/USD"
+                        elif clean in ("ETH",):
+                            sym = "ETH/USD"
                         else:
-                            total += float(amt or 0)
+                            sym = f"{clean}/USD"
+                        markets = self.kc.ex.markets or {} if hasattr(self.kc, "ex") else {}
+                        if sym in markets:
+                            ticker = self.kc.ex.fetch_ticker(sym)
+                            px = float(ticker.get("last") or ticker.get("close") or 0)
+                            if px > 0:
+                                total += raw * px
+                                continue
                     except Exception:
                         pass
+                    # Fallback: for very small unknown assets, add raw amount (≈stablecoin peg)
+                    if raw < 1000:
+                        total += raw
         except Exception as e:
             logger.debug("Kraken balance for portfolio_total failed: %s", e)
         try:
-            for client in [getattr(self, "alpaca_paper", None), getattr(self, "alpaca_live", None)]:
+            # Only include Alpaca LIVE account in portfolio total.
+            # Paper account has a fake $100k balance that inflates equity figures,
+            # breaking all risk checks for crypto bots (e.g. free_ratio = $9 / $100,108 → always PAUSE).
+            for client in [getattr(self, "alpaca_live", None)]:
                 if client and hasattr(client, "get_account"):
                     acct = client.get_account()
                     total += float(acct.get("portfolio_value") or acct.get("equity") or 0) or 0
@@ -4449,11 +5504,59 @@ class BotManager:
                 self._bots[bot_id] = BotRunner(bot_id, client, self)
             return self._bots[bot_id]
 
-    def start(self, bot_id: int) -> str:
-        return self.get_runner(bot_id).start()
+    def start(self, bot_id: int, silent: bool = False) -> str:
+        return self.get_runner(bot_id).start(silent=silent)
 
-    def stop(self, bot_id: int) -> str:
-        return self.get_runner(bot_id).stop()
+    def stop(self, bot_id: int, silent: bool = False) -> str:
+        return self.get_runner(bot_id).stop(silent=silent)
 
     def snapshot(self, bot_id: int) -> Dict[str, Any]:
         return self.get_runner(bot_id).snapshot()
+
+    def force_close_dry_position(self, bot_id: int) -> Dict[str, Any]:
+        """Bug 10: Reset a bot's in-memory state after a dry-run deal is closed."""
+        runner = self._bots.get(int(bot_id))
+        if runner is None:
+            return {"ok": True, "deal_id": None, "note": "no active runner"}
+        return runner.force_close_dry_position()
+
+    def reset_error(self, bot_id: int) -> Dict[str, Any]:
+        """Clear a stuck/blocked bot: wipe last_event, reset risk flags, and
+        re-spawn the runner thread if it died on a fatal error.
+
+        Used by `POST /api/bots/{bot_id}/reset-error` to unstick bots wedged
+        with messages like "Fatal error: database is locked" without requiring
+        a service restart.
+        """
+        bid = int(bot_id)
+        info: Dict[str, Any] = {"ok": True, "bot_id": bid, "actions": []}
+        runner = self._bots.get(bid)
+        was_alive = bool(runner and runner._thread and runner._thread.is_alive())
+        if runner is not None:
+            with runner._lock:
+                runner.state.last_event = ""
+                runner.state.errors = 0
+                runner.state.last_tick_ts = int(time.time())
+                rs = str(runner.state.risk_state or "").upper()
+                if rs in ("BLOCKED", "CRITICAL", "ERROR"):
+                    runner.state.risk_state = None
+                    runner.state.risk_level = "OK"
+                    runner.state.risk_reason = None
+                    runner.state.risk_since_ts = 0
+                    info["actions"].append("cleared_risk_flag")
+            info["actions"].append("cleared_last_event")
+        # If the runner thread is dead but the bot is enabled, re-spawn it.
+        try:
+            bot = get_bot(bid) or {}
+        except Exception:
+            bot = {}
+        is_enabled = int(bot.get("enabled", 0)) == 1
+        if (not was_alive) and is_enabled:
+            try:
+                msg = self.get_runner(bid).start(silent=True)
+                info["actions"].append(f"restarted_runner: {msg}")
+            except Exception as e:
+                logger.exception("reset_error: failed to restart runner for bot %s", bid)
+                info["actions"].append(f"restart_failed: {type(e).__name__}: {e}")
+                info["ok"] = False
+        return info
