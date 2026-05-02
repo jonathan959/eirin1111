@@ -435,6 +435,192 @@ def test_add_order_event_under_concurrent_load(temp_db):
         assert n > 0, f"bot {b} made no forward progress"
 
 
+# ===========================================================================
+# 1.2b step 5: explore_*: save_signal_outcome, update_explore_signal_outcome,
+#                          mark_explore_signals_pending, mark_explore_horizon_pending,
+#                          upsert_explore_feed_row, save_recommendation_snapshot
+# Plus deletion of legacy _db_retry helper.
+# ===========================================================================
+
+def test_save_recommendation_snapshot_returns_id_and_upserts_latest(temp_db):
+    sid = dbmod.save_recommendation_snapshot(
+        symbol="ETH/USD", horizon="short", score=72.5,
+        regime_json="{}", metrics_json="{}", reasons_json="[]", risk_flags_json="[]",
+        composite_score=68.0, confidence_score=0.8, conviction_grade="A",
+    )
+    assert sid > 0
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        latest = fresh.execute(
+            "SELECT snapshot_id FROM recommendations_latest WHERE symbol='ETH/USD' AND horizon='short'"
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert int(latest["snapshot_id"]) == sid
+
+
+def test_mark_explore_signals_pending_updates_status(temp_db):
+    # Seed two rows.
+    dbmod.upsert_explore_feed_row(
+        symbol="BTC/USD", horizon="short", status="buy",
+        conviction_score=80, reason="r", strategy="s",
+        signal_ts=int(time.time()), detail_json=None, price=100.0,
+        change_24h=0.0, market_type="crypto",
+    )
+    dbmod.upsert_explore_feed_row(
+        symbol="ETH/USD", horizon="short", status="watch",
+        conviction_score=60, reason="r", strategy="s",
+        signal_ts=int(time.time()), detail_json=None, price=200.0,
+        change_24h=0.0, market_type="crypto",
+    )
+
+    dbmod.mark_explore_signals_pending("short", int(time.time()))
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        statuses = [r[0] for r in fresh.execute(
+            "SELECT status FROM explore_signals WHERE horizon='short'"
+        ).fetchall()]
+    finally:
+        fresh.close()
+    assert all(s == "pending" for s in statuses), statuses
+
+
+def test_upsert_explore_feed_row_inserts_then_updates(temp_db):
+    dbmod.upsert_explore_feed_row(
+        symbol="SOL/USD", horizon="medium", status="buy",
+        conviction_score=70, reason="initial", strategy="s",
+        signal_ts=100, detail_json=None, price=10.0,
+        change_24h=1.0, market_type="crypto",
+    )
+    dbmod.upsert_explore_feed_row(
+        symbol="SOL/USD", horizon="medium", status="watch",
+        conviction_score=55, reason="updated", strategy="s",
+        signal_ts=200, detail_json=None, price=11.0,
+        change_24h=2.0, market_type="crypto",
+    )
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        rows = fresh.execute(
+            "SELECT status, reason, signal_ts FROM explore_signals "
+            "WHERE symbol='SOL/USD' AND horizon='medium'"
+        ).fetchall()
+    finally:
+        fresh.close()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "watch"
+    assert rows[0]["reason"] == "updated"
+    assert int(rows[0]["signal_ts"]) == 200
+
+
+def test_save_signal_outcome_then_update_pnl(temp_db):
+    rid = dbmod.save_signal_outcome(
+        symbol="BTC/USD", horizon="short", strategy="t",
+        signal_ts=int(time.time()), entry_price=100.0,
+        composite_score=75.0, conviction_grade="B",
+    )
+    assert rid > 0
+
+    dbmod.update_explore_signal_outcome(
+        outcome_id=rid, price_5d=102.0, price_10d=110.0, price_20d=115.0,
+    )
+
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        fresh.row_factory = sqlite3.Row
+        row = fresh.execute(
+            "SELECT outcome, pnl_5d_pct, pnl_10d_pct, pnl_20d_pct FROM explore_signal_outcomes WHERE id=?",
+            (rid,),
+        ).fetchone()
+    finally:
+        fresh.close()
+    assert row["outcome"] == "win"
+    assert abs(float(row["pnl_5d_pct"]) - 2.0) < 1e-6
+    assert abs(float(row["pnl_10d_pct"]) - 10.0) < 1e-6
+    assert abs(float(row["pnl_20d_pct"]) - 15.0) < 1e-6
+
+
+def test_mark_explore_horizon_pending_alias(temp_db):
+    dbmod.upsert_explore_feed_row(
+        symbol="X/USD", horizon="long", status="buy",
+        conviction_score=50, reason="r", strategy="s",
+        signal_ts=100, detail_json=None, price=10.0,
+        change_24h=0.0, market_type="crypto",
+    )
+    dbmod.mark_explore_horizon_pending("long")
+    fresh = sqlite3.connect(temp_db, timeout=5.0)
+    try:
+        s = fresh.execute(
+            "SELECT status FROM explore_signals WHERE symbol='X/USD' AND horizon='long'"
+        ).fetchone()[0]
+    finally:
+        fresh.close()
+    assert s == "pending"
+
+
+def test_db_retry_helper_was_removed():
+    """Phase 1.2b step 5 deletes _db_retry. Ensure the symbol no longer exists."""
+    assert not hasattr(dbmod, "_db_retry"), \
+        "_db_retry should be deleted in Phase 1.2b step 5; new code uses write_txn"
+
+
+def test_explore_writers_under_concurrent_load(temp_db):
+    """4 threads each calling a mix of save_signal_outcome /
+    upsert_explore_feed_row / mark_explore_signals_pending for 1.5s; assert
+    zero OperationalError leaks."""
+    DURATION_SEC = 1.5
+    errors: list = []
+    err_lock = threading.Lock()
+    counts = {"so": 0, "ufr": 0, "msp": 0}
+    cnt_lock = threading.Lock()
+
+    def _writer(label: str):
+        deadline = time.monotonic() + DURATION_SEC
+        i = 0
+        while time.monotonic() < deadline:
+            try:
+                if label == "so":
+                    dbmod.save_signal_outcome(
+                        symbol=f"S{i}/USD", horizon="short", strategy="t",
+                        signal_ts=int(time.time()), entry_price=10.0 + i,
+                    )
+                elif label == "ufr":
+                    dbmod.upsert_explore_feed_row(
+                        symbol=f"S{i % 5}/USD", horizon="short", status="buy",
+                        conviction_score=60, reason="r", strategy="s",
+                        signal_ts=int(time.time()), detail_json=None,
+                        price=1.0, change_24h=0.0, market_type="crypto",
+                    )
+                else:  # msp
+                    dbmod.mark_explore_signals_pending("short", int(time.time()))
+                with cnt_lock:
+                    counts[label] += 1
+            except sqlite3.OperationalError as e:
+                with err_lock:
+                    errors.append((label, repr(e)))
+                return
+            i += 1
+
+    threads = [
+        threading.Thread(target=_writer, args=("so",)),
+        threading.Thread(target=_writer, args=("ufr",)),
+        threading.Thread(target=_writer, args=("ufr",)),  # 2nd UFR for hot conflict
+        threading.Thread(target=_writer, args=("msp",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=DURATION_SEC + 5.0)
+        assert not t.is_alive()
+
+    assert not errors, f"OperationalError leaked: {errors}"
+    for label, n in counts.items():
+        assert n > 0, f"{label} made no forward progress"
+
+
 def test_cancel_ghost_deal_serialises_with_open_deal_for_same_bot(temp_db):
     """For the SAME bot_id, cancel_ghost_deal and open_deal must serialise
     on the per-bot RLock (no interleaving)."""

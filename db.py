@@ -121,28 +121,10 @@ def _conn() -> _NoCloseConn:
     return _NoCloseConn(real)
 
 
-def _db_retry(fn, *args, _retries: int = 5, **kwargs):
-    """
-    Call fn(*args, **kwargs) with exponential-backoff retry on
-    OperationalError('database is locked').  All other exceptions propagate immediately.
-
-    DEPRECATED: new code MUST use ``write_txn``. This helper exists for the
-    transitional window in Phase 1.2b while the four legacy callers
-    (save_recommendation_snapshot, mark_explore_signals_pending,
-    upsert_explore_feed_row, mark_explore_horizon_pending) are migrated. It is
-    deleted in the final commit of Phase 1.2b step 5.
-    """
-    delay = 0.1
-    for attempt in range(_retries + 1):
-        try:
-            return fn(*args, **kwargs)
-        except sqlite3.OperationalError as exc:
-            if "database is locked" in str(exc).lower() and attempt < _retries:
-                logger.debug("DB locked — retry %d/%d in %.1fs", attempt + 1, _retries, delay)
-                time.sleep(delay)
-                delay = min(delay * 2, 2.0)
-            else:
-                raise
+# _db_retry was removed in Phase 1.2b step 5 once its last 4 callers
+# (save_recommendation_snapshot, mark_explore_signals_pending,
+# upsert_explore_feed_row, save_signal_outcome via inheritance) migrated to
+# write_txn. New code MUST use db.write_txn. See audit/write_txn_design.md sec 3.4.
 
 
 # ============================================================================
@@ -3845,8 +3827,9 @@ def save_recommendation_snapshot(
     factor_scores_json: str = "",
     signal_flags_json: str = "",
 ) -> int:
-    def _do_save():
-        con = _conn()
+    holder: Dict[str, int] = {}
+
+    def _do(con) -> None:
         cur = con.cursor()
         cur.execute(
             """
@@ -3882,28 +3865,33 @@ def save_recommendation_snapshot(
             """,
             (str(symbol), str(horizon), snapshot_id, now_ts()),
         )
-        con.commit()
-        con.close()
-        return snapshot_id
-    return _db_retry(_do_save)
+        holder["id"] = snapshot_id
+
+    write_txn(None, _do, name="save_recommendation_snapshot")
+    return holder.get("id", 0)
 
 
 def mark_explore_signals_pending(horizon: str, scan_ts: int) -> None:
-    """Start-of-scan: mark all explore_signals rows for this horizon pending (stale-safe)."""
+    """Start-of-scan: mark all explore_signals rows for this horizon pending (stale-safe).
+
+    Migrated to write_txn(None, ...) in Phase 1.2b step 5. The legacy
+    _db_retry wrapper is now redundant and removed at the end of this file.
+    """
     hor = str(horizon or "short").strip().lower()
     if hor not in ("short", "medium", "long"):
         hor = "short"
-    def _do_mark():
-        con = _conn()
+
+    def _do(con) -> None:
         con.execute(
             "UPDATE explore_signals SET status='pending', updated_ts=? WHERE horizon=?",
             (int(scan_ts), hor),
         )
-        con.commit()
-        con.close()
+
     try:
-        _db_retry(_do_mark)
+        write_txn(None, _do, name="mark_explore_signals_pending")
     except Exception as e:
+        # Surface to caller via log; explore-rescan callers tolerate misses on
+        # individual scans (a subsequent scan will re-mark).
         logger.warning("mark_explore_signals_pending failed: %s", e)
 
 
@@ -3940,8 +3928,8 @@ def upsert_explore_feed_row(
     if st not in ("pending", "buy", "watch", "rejected"):
         st = "rejected"
     ts = now_ts()
-    def _do_upsert():
-        con = _conn()
+
+    def _do(con) -> None:
         con.execute(
             """
             INSERT INTO explore_signals(
@@ -3978,10 +3966,9 @@ def upsert_explore_feed_row(
                 (str(rejection_reason)[:128] if rejection_reason else None),
             ),
         )
-        con.commit()
-        con.close()
+
     try:
-        _db_retry(_do_upsert)
+        write_txn(None, _do, name="upsert_explore_feed_row")
     except Exception as e:
         logger.warning("upsert_explore_feed_row failed: %s", e)
 
@@ -4221,8 +4208,9 @@ def save_signal_outcome(
         return 0
     ts = int(signal_ts or now_ts())
     chk = now_ts()
-    try:
-        con = _conn()
+    holder: Dict[str, int] = {}
+
+    def _do(con) -> None:
         cur = con.cursor()
         cur.execute(
             """
@@ -4243,10 +4231,11 @@ def save_signal_outcome(
                 chk,
             ),
         )
-        rid = int(cur.lastrowid)
-        con.commit()
-        con.close()
-        return rid
+        holder["id"] = int(cur.lastrowid)
+
+    try:
+        write_txn(None, _do, name="save_signal_outcome")
+        return holder.get("id", 0)
     except Exception as e:
         logger.warning("save_signal_outcome failed: %s", e)
         return 0
@@ -4261,19 +4250,17 @@ def update_explore_signal_outcome(
     """Fill forward prices for explore_signal_outcomes; derive PnL % and outcome from 10d bar when available."""
     if not outcome_id:
         return
-    try:
-        con = _conn()
+
+    def _do(con) -> None:
         row = con.execute(
             "SELECT entry_price, outcome FROM explore_signal_outcomes WHERE id=?",
             (int(outcome_id),),
         ).fetchone()
         if not row:
-            con.close()
             return
         entry = float(row[0] or 0)
         prev_out = str(row[1] or "pending")
         if entry <= 0:
-            con.close()
             return
         p5 = float(price_5d) if price_5d is not None else None
         p10 = float(price_10d) if price_10d is not None else None
@@ -4307,8 +4294,9 @@ def update_explore_signal_outcome(
             """,
             (p5, p10, p20, pnl5, pnl10, pnl20, outcome, now_ts(), int(outcome_id)),
         )
-        con.commit()
-        con.close()
+
+    try:
+        write_txn(None, _do, name="update_explore_signal_outcome")
     except Exception as e:
         logger.warning("update_explore_signal_outcome failed: %s", e)
 
