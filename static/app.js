@@ -296,10 +296,10 @@ function initNotificationBell() {
   if (!notificationBell || !notificationBadge) return;
 
   function updateBadge() {
-    fetch("/api/activity/unread", { headers: { "X-API-Key": window.__API_TOKEN || "" } })
+    fetch("/api/notifications/unread_count", { headers: { "X-API-Key": window.__API_TOKEN || "" } })
       .then(r => r.json())
       .then(d => {
-        const count = d.count || 0;
+        const count = d.unread_count || d.count || 0;
         if (count > 0) {
           notificationBadge.textContent = count > 99 ? "99+" : count;
           notificationBadge.style.display = "block";
@@ -315,7 +315,7 @@ function initNotificationBell() {
   });
 
   updateBadge();
-  setInterval(updateBadge, 5000);
+  setInterval(updateBadge, 60000); // 60s — was 5s (CPU reduction)
 }
 
 /**
@@ -326,7 +326,7 @@ function easeOutQuad(t) {
 }
 
 window.formatNumber = function(value) {
-  if (typeof value !== 'number') return '0';
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '0';
   if (Math.abs(value) >= 1e6) {
     return (value / 1e6).toFixed(1) + 'M';
   }
@@ -353,41 +353,155 @@ window.animateValue = function(el, start, end, duration = 500) {
 
 /**
  * Real-time P&L ticker
+ *
+ * Caches the most recent portfolio + active-bots values in localStorage so that
+ * subsequent page loads don't flash "Portfolio: $—" / "Active: 0 bots" while the
+ * first /api/portfolio + /api/health responses are in flight. Falls back to the
+ * "$—" / "0" placeholders only when nothing has ever been cached.
  */
+const TICKER_CACHE_LS_KEY = "pnl_ticker_cache_v1";
+
+function _readTickerCache() {
+  try {
+    const raw = localStorage.getItem(TICKER_CACHE_LS_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return null;
+    // Discard cache older than 7 days (stale data is worse than the placeholder).
+    if (obj.ts && (Date.now() - obj.ts) > 7 * 86400 * 1000) return null;
+    return obj;
+  } catch (e) { return null; }
+}
+
+function _writeTickerCache(patch) {
+  try {
+    const cur = _readTickerCache() || {};
+    const next = { ...cur, ...patch, ts: Date.now() };
+    localStorage.setItem(TICKER_CACHE_LS_KEY, JSON.stringify(next));
+  } catch (e) {}
+}
+
 function initPnLTicker() {
   const ticker = document.getElementById("pnlTicker");
   if (!ticker) return;
+  let lastValidActiveBots = null;
+
+  // Hydrate from localStorage immediately so the header doesn't flash "$—" / "0 bots"
+  // before the first API call returns. Stale-but-known is better than blank.
+  try {
+    const cached = _readTickerCache();
+    const valueEl = document.getElementById("tickerValue");
+    const pnlEl = document.getElementById("tickerPnl");
+    const activeBotsEl = document.getElementById("tickerBots");
+    if (cached) {
+      if (valueEl && typeof cached.totalValue === "number" && cached.totalValue > 0) {
+        valueEl.textContent = "$" + cached.totalValue.toFixed(2);
+        valueEl.title = "Showing last cached value — refreshing…";
+      }
+      if (pnlEl && typeof cached.todayPnL === "number") {
+        pnlEl.textContent = (cached.todayPnL >= 0 ? "+$" : "-$") + Math.abs(cached.todayPnL).toFixed(2);
+        pnlEl.className = cached.todayPnL >= 0 ? "pos" : "neg";
+      }
+      if (activeBotsEl && typeof cached.activeBots === "number") {
+        activeBotsEl.textContent = String(cached.activeBots);
+        lastValidActiveBots = cached.activeBots;
+      }
+    }
+  } catch (e) {}
 
   function updateTicker() {
-    fetch("/api/portfolio")
-      .then(r => r.json())
-      .then(data => {
-        if (!data.portfolio) return;
-        const portfolio = data.portfolio;
-        const todayPnL = parseFloat(portfolio.today_pnl || 0);
-        const totalValue = parseFloat(portfolio.total_value || 0);
-        const activeBotsEl = document.getElementById("tickerBots");
-        const valueEl = document.getElementById("tickerValue");
-        const pnlEl = document.getElementById("tickerPnl");
+    Promise.all([
+      fetch("/api/portfolio").then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch("/api/health").then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([portData, healthData]) => {
+      const valueEl = document.getElementById("tickerValue");
+      const pnlEl = document.getElementById("tickerPnl");
+      const activeBotsEl = document.getElementById("tickerBots");
 
-        if (valueEl) {
-          const oldValue = parseFloat(valueEl.textContent.replace(/[^0-9.-]/g, '') || 0);
-          animateValue(valueEl, oldValue, totalValue, 300);
+      // Build a single cache patch from this update so the localStorage write
+      // happens even if individual fields (e.g. totalValue==0) would have skipped
+      // a per-field write previously.
+      const patch = {};
+      let havePort = false;
+      let haveHealth = false;
+
+      if (portData && portData.portfolio) {
+        havePort = true;
+        const portfolio = portData.portfolio;
+        const totalValue = Number(portfolio.total_usd || portfolio.total_value) || 0;
+        patch.totalValue = totalValue;
+
+        if (valueEl && totalValue > 0) {
+          valueEl.textContent = '$' + totalValue.toFixed(2);
+          valueEl.title = "";
         }
+
         if (pnlEl) {
-          pnlEl.textContent = (todayPnL >= 0 ? '+' : '') + formatNumber(todayPnL);
+          const history = portData.history || [];
+          let todayPnL = 0;
+          if (history.length > 0 && totalValue > 0) {
+            const now = Date.now() / 1000;
+            const target24h = now - 86400;
+            let oldest = history.reduce((best, h) =>
+              Math.abs(h.ts - target24h) < Math.abs(best.ts - target24h) ? h : best
+            , history[0]);
+            todayPnL = totalValue - (oldest.total_usd || totalValue);
+          }
+          pnlEl.textContent = (todayPnL >= 0 ? '+$' : '-$') + Math.abs(todayPnL).toFixed(2);
           pnlEl.className = todayPnL >= 0 ? 'pos' : 'neg';
+          patch.todayPnL = todayPnL;
         }
-        if (activeBotsEl) {
-          activeBotsEl.textContent = portfolio.active_bot_count || 0;
-        }
-      })
-      .catch(() => {});
+      }
+
+      if (activeBotsEl && healthData && healthData.bots && typeof healthData.bots.running === "number") {
+        haveHealth = true;
+        lastValidActiveBots = healthData.bots.running;
+        activeBotsEl.textContent = String(lastValidActiveBots);
+        patch.activeBots = lastValidActiveBots;
+      } else if (activeBotsEl && lastValidActiveBots !== null) {
+        activeBotsEl.textContent = String(lastValidActiveBots);
+      }
+
+      // Single write per update, only when at least one source returned successfully —
+      // avoids overwriting good cached values with empty data from a failed fetch.
+      if (havePort || haveHealth) {
+        _writeTickerCache(patch);
+      }
+    }).catch(() => {});
   }
 
   updateTicker();
-  setInterval(updateTicker, 10000);
+  setInterval(updateTicker, 30000); // 30s — was 10s (CPU reduction)
 }
+
+/** CoinGecko: at most one request per second globally. */
+window.__cgIconQueue = window.__cgIconQueue || [];
+window.__cgIconPumpScheduled = window.__cgIconPumpScheduled || false;
+
+function pumpCgIconQueue() {
+  var fn = window.__cgIconQueue.shift();
+  if (!fn) {
+    window.__cgIconPumpScheduled = false;
+    return;
+  }
+  Promise.resolve(fn())
+    .catch(function() {})
+    .then(function() {
+      setTimeout(pumpCgIconQueue, 1000);
+    });
+}
+
+window.scheduleCoingeckoFetch = function(task) {
+  return new Promise(function(resolve, reject) {
+    window.__cgIconQueue.push(function() {
+      return Promise.resolve(task()).then(resolve, reject);
+    });
+    if (!window.__cgIconPumpScheduled) {
+      window.__cgIconPumpScheduled = true;
+      setTimeout(pumpCgIconQueue, 0);
+    }
+  });
+};
 
 /**
  * Initialize all UI enhancements on page load

@@ -10,6 +10,7 @@ import json
 import logging
 import gc
 import hashlib
+import math
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -159,6 +160,7 @@ from db import (
     list_deals,
     list_all_deals,
     list_closed_deals_for_journal,
+    list_journal_entries,
     get_deal,
     pnl_summary,
     bot_deal_stats,
@@ -788,7 +790,7 @@ AUTO_START_ENABLED = os.getenv("AUTO_START_ENABLED", "1").strip().lower() in (
     "y",
     "on",
 )
-HEALTH_WATCHDOG_SEC = int(os.getenv("HEALTH_WATCHDOG_SEC", "60"))
+HEALTH_WATCHDOG_SEC = int(os.getenv("HEALTH_WATCHDOG_SEC", "30"))
 RECO_SYMBOLS = [
     s.strip() for s in os.getenv(
         "RECO_SYMBOLS",
@@ -1451,7 +1453,7 @@ def _require_api_key(
             from urllib.parse import urlparse
             ref_host = urlparse(referer or "").netloc.split(":")[0] if referer else ""
             req_host = (host_header or "").split(":")[0].strip()
-            allowed = os.getenv("API_ALLOWED_HOSTS", "localhost,127.0.0.1,::1,3.148.6.246")
+            allowed = os.getenv("API_ALLOWED_HOSTS", "localhost,127.0.0.1,::1,3.151.143.63")
             allowed_set = {h.strip().lower() for h in allowed.split(",") if h.strip()}
             for h in (ref_host, req_host):
                 if h and h.lower() in allowed_set:
@@ -1528,6 +1530,12 @@ async def api_create_bot(request: Request):
     if safety_quote > max_spend_quote * 0.3 or safety_quote > 75:
         safety_quote = min(max(5.0, max_spend_quote * 0.10), 75.0)
 
+    if payload.get("base_order_quote") is not None:
+        try:
+            base_quote = float(payload.get("base_order_quote"))
+        except (TypeError, ValueError):
+            pass
+
     data = {
         "name": name,
         "symbol": symbol,
@@ -1545,6 +1553,8 @@ async def api_create_bot(request: Request):
         "max_open_orders": int(payload.get("max_open_orders") or 6),
         "market_type": market_type_val,
         "alpaca_mode": str(payload.get("alpaca_mode") or "paper"),
+        "max_total_exposure_pct": float(payload.get("max_total_exposure_pct") or 0.50),
+        "per_symbol_exposure_pct": float(payload.get("per_symbol_exposure_pct") or payload.get("per_symbol_pct") or 0.15),
     }
     for _k in ("stop_loss_pct", "max_hold_hours"):
         if _k in payload:
@@ -1558,6 +1568,17 @@ async def api_create_bot(request: Request):
             return _json({"ok": False, "error": fatal[0], "validation_issues": validation_issues}, 400)
     except ImportError:
         validation_issues = []
+    from services.exposure_cap import build_exposure_cap_error
+
+    pv_cap = _portfolio_value_usd_for_exposure()
+    cap_err = build_exposure_cap_error(
+        pv_cap,
+        float(data.get("base_quote") or 0),
+        float(data.get("per_symbol_exposure_pct") or 0),
+        float(data.get("max_total_exposure_pct") or 0.5),
+    )
+    if cap_err:
+        return _json(cap_err, 422)
     try:
         bot_id = create_bot(data)
         sl_a = data.get("stop_loss_pct")
@@ -1774,6 +1795,18 @@ async def api_bots_import(request: Request):
 # =========================================================
 # Helpers
 # =========================================================
+
+def _portfolio_value_usd_for_exposure() -> float:
+    """Live aggregate portfolio (USD) for per-symbol cap checks on bot save."""
+    try:
+        if bm:
+            v = float(bm.get_portfolio_total())
+            if math.isfinite(v) and v > 0:
+                return v
+    except Exception:
+        pass
+    return 0.0
+
 
 def _sanitize_bot_numbers(data: Dict[str, Any]) -> None:
     """Clamp critical bot numeric fields to sane ranges (mutates data in place)."""
@@ -4695,8 +4728,12 @@ def _health_watchdog_loop() -> None:
                                 )
                     continue
                 last_tick = int(snap.get("last_tick_ts") or 0)
-                stale_threshold = 600  # 10 minutes for all bots
-                if last_tick and (now - last_tick) > stale_threshold:
+                bot_row = get_bot(bot_id) or b
+                db_polled = int(bot_row.get("last_polled_at") or 0)
+                last_ref = max(last_tick, db_polled)
+                poll_s = max(1, int(bot_row.get("poll_seconds") or 10))
+                stale_threshold = max(120, 2 * poll_s)
+                if last_ref and (now - last_ref) > stale_threshold:
                     if bool(snap.get("running")):
                         bot = get_bot(bot_id)
                         is_stock = bot and (len(str(bot.get("symbol", ""))) < 6 and "/" not in str(bot.get("symbol", "")))
@@ -4725,8 +4762,8 @@ def _health_watchdog_loop() -> None:
                         if (now - _last_restart) < WATCHDOG_MIN_RESTART_INTERVAL_SEC:
                             continue
                         # Only restart if TRULY stale (>15 min for stocks, >10 min for crypto)
-                        _restart_threshold = 900 if is_stock else stale_threshold
-                        if (now - last_tick) > _restart_threshold:
+                        _restart_threshold = max(stale_threshold, 900 if is_stock else stale_threshold)
+                        if (now - last_ref) > _restart_threshold:
                             bm.stop(bot_id, silent=True)
                             time.sleep(1)
                             ok, reason = _can_start_bot_live(b)
@@ -4735,7 +4772,7 @@ def _health_watchdog_loop() -> None:
                                 setattr(_health_watchdog_loop, f"_last_restart_{bot_id}", now)
                                 try:
                                     add_log(bot_id, "WARN",
-                                            f"Watchdog restarted stalled bot (last tick: {now - last_tick}s ago).",
+                                            f"Watchdog restarted stalled bot (last activity: {now - last_ref}s ago).",
                                             "SYSTEM")
                                 except Exception as log_err:
                                     logger.warning("watchdog add_log skipped (locked?): %s", log_err)
@@ -5493,9 +5530,6 @@ def _startup_impl():
 @app.put("/api/bots/{bot_id}")
 async def api_update_bot(bot_id: int, request: Request):
     """Update bot settings. Merges payload with existing bot for partial updates."""
-    if not bm:
-        reason = _bm_not_ready_reason() or "BotManager not initialized"
-        return _json({"ok": False, "error": "BotManager not initialized", "reason": reason}, 503)
     payload = await request.json()
     if not isinstance(payload, dict):
         return _json({"ok": False, "error": "Invalid payload"}, 400)
@@ -5503,6 +5537,45 @@ async def api_update_bot(bot_id: int, request: Request):
     b = get_bot(int(bot_id))
     if not b:
         return _json({"ok": False, "error": "Bot not found"}, 404)
+
+    # Live-promotion guard runs BEFORE the bm-not-initialized check so we never
+    # have a window where dry_run could be silently flipped to 0. Any 1->0 flip
+    # on dry_run must satisfy the same safety contract as POST
+    # /api/go_live/confirm. Without this, a stray PUT (or the older /bots Go
+    # Live modal) could promote a bot to live with one click and zero checks.
+    # The typed-LIVE confirmation is required so even a successful PUT cannot
+    # silently flip dry_run.
+    if "dry_run" in payload:
+        try:
+            requested_dry = int(payload.get("dry_run"))
+        except (TypeError, ValueError):
+            requested_dry = 1
+        current_dry = int(b.get("dry_run", 1) or 1)
+        if current_dry == 1 and requested_dry == 0:
+            confirm_str = str(payload.get("confirm", "")).strip().upper()
+            if confirm_str != "LIVE":
+                return _json({
+                    "ok": False,
+                    "error": "Live promotion requires confirm=\"LIVE\" in body. Use POST /api/go_live/confirm.",
+                }, 400)
+            # Strict gate: same shared function as /api/safety/checklist and
+            # /api/go_live/confirm. The gate is on the dry_run 1->0 transition
+            # itself, so it applies regardless of caller identity (browser
+            # session, worker token, automation script).
+            from services import safety_checklist as _sc
+            check = _sc.compute_live_readiness()
+            if not check.get("live_ready"):
+                return _json({
+                    "ok": False,
+                    "error": "Live promotion blocked: safety checklist not live_ready",
+                    "blocking_reasons": check.get("blocking_reasons", []),
+                    "flags": check.get("flags", {}),
+                }, 409)
+
+    # All non-promotion edits still require BM to be up.
+    if not bm:
+        reason = _bm_not_ready_reason() or "BotManager not initialized"
+        return _json({"ok": False, "error": "BotManager not initialized", "reason": reason}, 503)
 
     # Merge: existing bot as base, overlay payload (partial updates supported)
     raw_sym = str(payload.get("symbol") or b.get("symbol") or "").strip()
@@ -5561,16 +5634,53 @@ async def api_update_bot(bot_id: int, request: Request):
         "min_free_cash_pct": float(_ov("min_free_cash_pct", 0.1, lambda x: float(x) if x is not None else 0.1)),
         "max_concurrent_deals": int(_ov("max_concurrent_deals", 6, lambda x: int(x) if x is not None else 6)),
         "spread_guard_pct": float(_ov("spread_guard_pct", 0.003, lambda x: float(x) if x is not None else 0.003)),
-        "limit_timeout_sec": int(_ov("limit_timeout_sec", 8, lambda x: int(x) if x is not None else 8)),
+        "limit_timeout_sec": int(_ov("limit_timeout_sec", 45, lambda x: int(x) if x is not None else 45)),
         "max_drawdown_pct": float(_ov("max_drawdown_pct", 0.0, lambda x: float(x) if x is not None else 0.0)),
         "hard_sl_pct": float(_ov("hard_sl_pct", 0.0, lambda x: float(x) if x is not None else 0.0)),
     }
+    if payload.get("base_order_quote") is not None:
+        try:
+            settings["base_quote"] = float(payload.get("base_order_quote"))
+        except (TypeError, ValueError):
+            pass
+    if payload.get("per_symbol_pct") is not None:
+        try:
+            settings["per_symbol_exposure_pct"] = float(payload.get("per_symbol_pct"))
+        except (TypeError, ValueError):
+            pass
     if settings["max_spend_quote"] <= 0:
         settings["max_spend_quote"] = settings["base_quote"] + settings["safety_quote"] * settings["max_safety"]
 
     _sanitize_bot_numbers(settings)
+    from services.exposure_cap import build_exposure_cap_error
+
+    pv_cap = _portfolio_value_usd_for_exposure()
+    cap_err = build_exposure_cap_error(
+        pv_cap,
+        float(settings.get("base_quote") or 0),
+        float(settings.get("per_symbol_exposure_pct") or 0),
+        float(settings.get("max_total_exposure_pct") or 0.5),
+    )
+    if cap_err:
+        return _json(cap_err, 422)
     try:
         update_bot(int(bot_id), settings)
+        # Extra fields not covered by the rigid update_bot SQL go through
+        # the partial helper: adaptive_limit, max_slippage_pct, stop_loss_pct,
+        # max_hold_hours, trailing_*, bot_type.
+        extras: Dict[str, Any] = {}
+        for k in ("adaptive_limit", "max_slippage_pct", "stop_loss_pct",
+                  "max_hold_hours", "trailing_stop_enabled",
+                  "trailing_activation_pct", "trailing_distance_pct",
+                  "risk_profile", "bot_type"):
+            if k in payload and payload[k] is not None:
+                extras[k] = payload[k]
+        if extras:
+            try:
+                from db import update_bot_fields as _ubf
+                _ubf(int(bot_id), extras)
+            except Exception as _eex:
+                logger.warning("update_bot_fields extras failed: %s", _eex)
         return _json({"ok": True, "bot": get_bot(int(bot_id))})
     except Exception as e:
         return _json({"ok": False, "error": str(e)}, 500)
@@ -6094,7 +6204,36 @@ def api_startup_status():
 
 @app.get("/api/health")
 def api_health():
-    """Health check for deployment and monitoring. Expanded: bots, DB metrics, circuit breaker, data quality."""
+    """Fast liveness for monitors: SQLite + version only (typically <500ms)."""
+    t0 = time.time()
+    db_ok = True
+    try:
+        init_db()
+    except Exception:
+        db_ok = False
+    db_ms = int((time.time() - t0) * 1000)
+    bots_running = 0
+    bots_total = 0
+    try:
+        _rows = list_bots()
+        bots_total = len(_rows)
+        bots_running = sum(1 for x in _rows if int(x.get("last_running", 0)) == 1)
+    except Exception:
+        pass
+    return _json({
+        "ok": db_ok,
+        "status": "healthy" if db_ok else "degraded",
+        "db_ok": db_ok,
+        "db_latency_ms": db_ms,
+        "version": "3.0.0",
+        "ts": now_ts(),
+        "bots": {"running": bots_running, "total": bots_total},
+    })
+
+
+@app.get("/api/health/deep")
+def api_health_deep():
+    """Deep health: brokers, bot manager, background threads (cached)."""
     _now = time.time()
     with _globals_lock:
         _cached = _HEALTH_CACHE.get("result")
@@ -6108,7 +6247,7 @@ def api_health():
         except Exception:
             db_ok = False
         kr = bool(_kraken_ready())
-        expanded = {}
+        expanded: Dict[str, Any] = {}
         try:
             from health_monitor import build_expanded_health
             expanded = build_expanded_health(
@@ -6145,12 +6284,12 @@ def api_health():
         expanded["last_reco_long_ts"] = _last_reco_long_ts
         expanded["kraken_last_candle_ts"] = _kraken_last_candle_ts
         expanded["alpaca_last_candle_ts"] = _alpaca_last_candle_ts
-        # LIVE-HARDENED: uptime and autopilot heartbeat for dashboard monitoring
         expanded["uptime_sec"] = int(time.time() - _APP_START_TIME) if _APP_START_TIME else 0
         try:
             expanded["last_autopilot_heartbeat_ts"] = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0) or None
         except Exception:
             expanded["last_autopilot_heartbeat_ts"] = None
+        expanded["endpoint"] = "deep"
         result = expanded
         with _globals_lock:
             _HEALTH_CACHE["result"] = result
@@ -6381,46 +6520,11 @@ def api_notifications_test():
         return _json({"ok": False, "error": str(e)}, 500)
 
 
-@app.get("/api/safety_check")
-def api_safety_check():
-    """Live-trading safety check for UI and automation. Includes kill_switch and allow_live_trading for checklist."""
-    blocking = []
-    api_auth_enabled = bool(WORKER_API_TOKEN)
-    kraken_ready = bool(_kraken_ready())
-    alpaca_paper_ready = bool(ALPACA_PAPER_READY)
-    alpaca_live_ready = bool(ALPACA_LIVE_READY)
-    any_live = _has_live_bots()
-    live_context = LIVE_TRADING_ENABLED or any_live
-    kill_switch = bool(get_setting("kill_switch", "0").strip().lower() in ("1", "true", "yes", "y", "on"))
-    try:
-        from bot_manager import ALLOW_LIVE_TRADING as _ALLOW
-        allow_live_trading = bool(_ALLOW)
-    except Exception:
-        allow_live_trading = False
-
-    if live_context and not api_auth_enabled:
-        blocking.append("WORKER_API_TOKEN missing for live trading")
-    if LIVE_ENDPOINTS_DISABLED:
-        blocking.append(LIVE_ENDPOINTS_DISABLED_REASON or "Live endpoints disabled")
-    if any_live and not (kraken_ready or alpaca_paper_ready or alpaca_live_ready):
-        blocking.append("Live bots configured but no trading clients ready")
-
-    live_ready = LIVE_TRADING_ENABLED and allow_live_trading and (kraken_ready or alpaca_live_ready) and api_auth_enabled and not blocking and not kill_switch
-    return _json(
-        {
-            "ok": True,
-            "api_auth_enabled": api_auth_enabled,
-            "allow_live_trading": allow_live_trading,
-            "live_trading_enabled": LIVE_TRADING_ENABLED,
-            "kill_switch": kill_switch,
-            "kraken_ready": kraken_ready,
-            "alpaca_paper_ready": alpaca_paper_ready,
-            "alpaca_live_ready": alpaca_live_ready,
-            "live_ready": live_ready,
-            "any_live_bots": any_live,
-            "blocking_issues": blocking,
-        }
-    )
+# NOTE: GET /api/safety_check was removed. It returned a looser live_ready
+# (only checked api_auth + allow_live + exchange ready + kill_switch_state) and
+# diverged from /api/safety/checklist's strict 10-item gate. All callers now
+# use /api/safety/checklist, which calls services.safety_checklist
+# .compute_live_readiness() — the single source of truth for live readiness.
 
 
 @app.get("/api/pnl")
@@ -6540,137 +6644,24 @@ def api_alpaca_symbols():
 
 
 @app.get("/api/prices")
-def api_prices(symbols: str = "", market_type: str = "all"):
+async def api_prices(symbols: str = "", market_type: str = "all"):
     """
-    Batch price fetch endpoint. Fast, cached, supports both crypto and stocks.
-    symbols: comma-separated list (e.g. "XBT/USD,ETH/USD,INTC,AAPL")
-    market_type: "crypto", "stocks", or "all"
-    Returns { prices: { "XBT/USD": 12345.0, "INTC": 45.23, ... }, changes: {...}, volumes: {...} }
+    Batch price fetch: crypto (Kraken bulk ticker) + stocks (Alpaca snapshots
+    w/ latestTrade) in parallel, 3s per venue, optional partial payload.
+    Per-symbol TTL cache (10s) in services.prices_fetch.
     """
-    from symbol_classifier import is_stock_symbol, is_crypto_symbol
-    
-    out: Dict[str, Optional[float]] = {}
-    changes: Dict[str, Optional[float]] = {}
-    volumes: Dict[str, Optional[float]] = {}
+    from services import prices_fetch as _pf
 
-    req = [s.strip() for s in (symbols or "").split(",") if s.strip()]
-    if not req:
-        return _json({"ok": True, "prices": out, "changes": changes, "volumes": volumes})
+    payload = await _pf.fetch_prices_async(symbols or "", market_type or "all", timeout_sec=3.0)
+    return _json(payload)
 
-    # Fast path: return cached result if still fresh (avoids 10–14 s Alpaca snapshot latency)
-    _prices_cache_key = f"{market_type}:{','.join(sorted(req))}"
-    _now = time.time()
-    with _globals_lock:
-        _cached_prices = _PRICES_CACHE.get(_prices_cache_key)
-    if _cached_prices and (_now - _cached_prices["ts"]) < _PRICES_CACHE_TTL:
-        return _json(_cached_prices["result"])
 
-    _prices_deadline = time.time() + 5.0
-    
-    # Separate crypto and stocks
-    crypto_symbols = []
-    stock_symbols = []
-    
-    for s in req:
-        if is_stock_symbol(s):
-            stock_symbols.append(s)
-        elif is_crypto_symbol(s) or "/" in s:
-            crypto_symbols.append(s)
-        else:
-            # Try to infer - if short and no slash, assume stock
-            if len(s) < 6:
-                stock_symbols.append(s)
-            else:
-                crypto_symbols.append(s)
-    
-    # Fetch crypto prices: batch ticker (1 Kraken call) when 3+ symbols, else per-symbol cache
-    if crypto_symbols and (market_type == "all" or market_type == "crypto") and time.time() < _prices_deadline:
-        if _kraken_ready():
-            mk = _markets()
-            use_batch = len(crypto_symbols) >= 3
-            batch_map = _tickers_batch_cached(ttl_sec=15) if use_batch else {}
-            for s in crypto_symbols:
-                if time.time() >= _prices_deadline:
-                    break
-                norm = _normalize_symbol(s)
-                resolved = _resolve_symbol(norm)
-                ticker = None
-                if use_batch and batch_map:
-                    ticker = batch_map.get(resolved) or batch_map.get(norm) or batch_map.get(s)
-                else:
-                    if mk and resolved in mk:
-                        ticker = _ticker_cached(resolved, ttl_sec=15) or {}
-                if ticker:
-                    price = float(ticker.get("last") or 0.0) if ticker.get("last") else None
-                    out[norm] = price if price and price > 0 else None
-                    pct = ticker.get("percentage")
-                    changes[norm] = float(pct) if pct is not None else None
-                    qv = ticker.get("quoteVolume")
-                    volumes[norm] = float(qv) if qv is not None else None
-                else:
-                    out[norm] = None
-    
-    # Fetch stock prices (batch snapshot from Alpaca)
-    if stock_symbols and (market_type == "all" or market_type == "stocks") and time.time() < _prices_deadline:
-        client = alpaca_live if alpaca_live else alpaca_paper
-        if client:
-            try:
-                for i in range(0, len(stock_symbols), 100):
-                    if time.time() >= _prices_deadline:
-                        break
-                    batch = stock_symbols[i:i+100]
-                    try:
-                        snap_data = client.get_snapshots(batch)
-                        # Alpaca returns {"snapshots": {"SYMBOL": {...}}}
-                        snapshots = snap_data.get("snapshots", {}) if isinstance(snap_data, dict) else {}
-                        for sym in batch:
-                            snap = snapshots.get(sym) or snapshots.get(sym.upper()) or {}
-                            if snap:
-                                latest_trade = snap.get("latestTrade", {})
-                                daily_bar = snap.get("dailyBar", {}) or {}
-                                prev_bar = snap.get("prevDailyBar", {}) or {}
-                                
-                                price = None
-                                if latest_trade and latest_trade.get("p"):
-                                    price = float(latest_trade.get("p", 0))
-                                elif daily_bar and daily_bar.get("c"):
-                                    price = float(daily_bar.get("c", 0))
-                                
-                                out[sym] = price if price and price > 0 else None
-                                
-                                # Change %: prefer prev close vs current; else intraday (close vs open)
-                                if price and price > 0:
-                                    prev_c = prev_bar.get("c") if prev_bar else None
-                                    if prev_c is not None:
-                                        prev_close = float(prev_c)
-                                        if prev_close > 0:
-                                            changes[sym] = ((price - prev_close) / prev_close) * 100.0
-                                    elif daily_bar and daily_bar.get("o") is not None:
-                                        o = float(daily_bar.get("o", 0))
-                                        if o > 0:
-                                            changes[sym] = ((price - o) / o) * 100.0
-                                
-                                if daily_bar and daily_bar.get("v") is not None:
-                                    volumes[sym] = float(daily_bar.get("v", 0))
-                            else:
-                                out[sym] = None
-                    except Exception as e:
-                        logger.warning(f"Batch snapshot fetch failed for batch: {e}")
-                        # Fallback to individual fetches from cache
-                        for sym in batch:
-                            ticker = _ticker_cached(sym, ttl_sec=15) or {}
-                            price = float(ticker.get("last") or 0.0) if ticker.get("last") else None
-                            out[sym] = price if price and price > 0 else None
-            except Exception as e:
-                logger.warning(f"Stock price batch fetch error: {e}")
-                # Fallback: mark all as None
-                for sym in stock_symbols:
-                    out[sym] = None
-    
-    _prices_result = {"ok": True, "prices": out, "changes": changes, "volumes": volumes}
-    with _globals_lock:
-        _PRICES_CACHE[_prices_cache_key] = {"ts": time.time(), "result": _prices_result}
-    return _json(_prices_result)
+@app.get("/api/icons/map")
+def api_icons_map():
+    """Base-symbol → CoinGecko id for client-side throttled icon loads."""
+    from services.icon_map import SYMBOL_TO_COINGECKO_ID
+
+    return _json({"ok": True, "map": SYMBOL_TO_COINGECKO_ID})
 
 
 @app.get("/api/market/ticker")
@@ -7294,6 +7285,9 @@ async def api_kill_set(request: Request):
     enabled = bool(payload.get("enabled"))
     try:
         set_setting("kill_switch", "1" if enabled else "0")
+        # Remember that the user has toggled the kill switch at least once -
+        # powers the "Kill switch tested" item on the Safety checklist.
+        set_setting("kill_switch_tested", "1")
     except Exception:
         pass
     return _json({"ok": True, "kill_switch": bool(_kill_switch_state())})
@@ -7405,10 +7399,63 @@ def api_bot_status(bot_id: int):
     except Exception:
         pass
 
+    # Compute a human-readable display_state so the Bot row can replace the
+    # indefinite "Checking..." with a concrete status (IDLE / WAITING_FOR_FILL /
+    # FILLED / MANAGING / CLOSING / ERROR / PAUSED / COOLDOWN / STOPPED).
+    display_state = None
+    try:
+        from services.bot_display import compute_display_state
+        current_deal: Dict[str, Any] = {}
+        try:
+            deals = list_deals(int(bot_id), limit=1) or []
+            if deals:
+                current_deal = deals[0] or {}
+        except Exception:
+            current_deal = {}
+        display_state = compute_display_state(snap, current_deal)
+    except Exception:
+        display_state = None
+
+    # Live-value enrichment: realized_pnl + position_pct_of_capital
+    try:
+        stats = bot_deal_stats(int(bot_id)) or {}
+        snap["realized_pnl"] = float(stats.get("realized_total") or 0.0)
+    except Exception:
+        snap["realized_pnl"] = 0.0
+    try:
+        lp = float(snap.get("last_price") or 0.0)
+        bp = float(snap.get("base_pos") or 0.0)
+        position_quote = lp * bp if lp and bp else 0.0
+        # Use cached portfolio snapshot if available; otherwise leave None.
+        total_usd = 0.0
+        try:
+            from worker_api import _PORTFOLIO_CACHE as _PC
+            cached = _PC.get("result") or {}
+            pobj = cached.get("portfolio") or {}
+            total_usd = float(pobj.get("total_usd") or 0.0)
+        except Exception:
+            total_usd = 0.0
+        snap["position_pct_of_capital"] = round((position_quote / total_usd) * 100.0, 2) if total_usd > 0 else None
+    except Exception:
+        snap["position_pct_of_capital"] = None
+
+    try:
+        if b.get("last_poll_error"):
+            snap["last_poll_error"] = str(b.get("last_poll_error") or "")[:2000]
+        _lpa = b.get("last_polled_at")
+        if _lpa is not None and str(_lpa).strip():
+            try:
+                snap["last_polled_at_ts"] = int(_lpa)
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+
     return _json({
         "ok": True,
         "bot": b,
         "snap": snap,
+        "display_state": display_state,
         "regime": regime,
         "kraken_ready": _kraken_ready(),
         "kraken_error": KRAKEN_ERROR,
@@ -10984,7 +11031,7 @@ async def api_recommendation_create_bot(symbol: str, request: Request):
             "min_free_cash_pct": float(payload.get("min_free_cash_pct") or 0.2),
             "max_concurrent_deals": int(payload.get("max_concurrent_deals") or 4),
             "spread_guard_pct": float(payload.get("spread_guard_pct") or 0.004),
-            "limit_timeout_sec": int(payload.get("limit_timeout_sec") or 8),
+            "limit_timeout_sec": int(payload.get("limit_timeout_sec") or 45),
             "daily_loss_limit_pct": float(payload.get("daily_loss_limit_pct") or 0.05),
             "pause_hours": int(payload.get("pause_hours") or 6),
         }
@@ -12134,8 +12181,14 @@ def api_bot_deals(bot_id: int, limit: int = 50):
 # API: Trade Journal
 # =========================================================
 @app.get("/api/journal")
-def api_journal_list(days: int = 90, strategy: Optional[str] = None):
-    """List closed deals with journal entries for trade journal page."""
+def api_journal_list(
+    days: int = 90,
+    strategy: Optional[str] = None,
+    limit: int = 100,
+):
+    """List closed deals + optional canonical `journal` rows (backfill / write-on-close)."""
+    lim = int(max(1, min(500, int(limit))))
+    journal_rows = list_journal_entries(limit=lim, offset=0)
     since = now_ts() - (int(days) * 86400) if days else None
     deals = list_closed_deals_for_journal(since_ts=since, limit=500)
     if strategy and str(strategy).strip():
@@ -12154,7 +12207,7 @@ def api_journal_list(days: int = 90, strategy: Optional[str] = None):
             "bot_name": bot.get("name"),
             "bot_symbol": bot.get("symbol"),
         })
-    return _json({"ok": True, "deals": out})
+    return _json({"ok": True, "journal": journal_rows, "deals": out})
 
 
 @app.get("/api/journal/{deal_id}")

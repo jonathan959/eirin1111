@@ -31,6 +31,7 @@ from db import (
     add_order_event,
     add_intelligence_decision,
     update_bot,
+    update_bot_poll_status,
     list_deals,
     list_strategy_decisions,
     get_intelligence_decisions,
@@ -659,8 +660,20 @@ class BotRunner:
                 self._notify_discord(f"⚠️ {self._bot_label()}: {msg}", force=True)
 
     def _heartbeat(self) -> None:
+        ts = int(time.time())
         with self._lock:
-            self.state.last_tick_ts = int(time.time())
+            self.state.last_tick_ts = ts
+        try:
+            update_bot_poll_status(self.bot_id, ts, error=None)
+        except Exception:
+            logger.debug("update_bot_poll_status failed for bot %s", self.bot_id, exc_info=True)
+
+    def _record_poll_error(self, message: str) -> None:
+        """Best-effort persist poll failure for supervisor / Bots UI tooltip."""
+        try:
+            update_bot_poll_status(self.bot_id, int(time.time()), error=message[:1900])
+        except Exception:
+            logger.debug("update_bot_poll_status (error) failed for bot %s", self.bot_id, exc_info=True)
 
     def _global_pause_on(self) -> bool:
         env = os.getenv("PAUSE_ALL_BOTS", "").strip().lower()
@@ -3210,9 +3223,30 @@ class BotRunner:
 
                 try:
                     per_symbol_pct = float(bot.get("per_symbol_exposure_pct", 0.15))
+                    base_quote_val = float(bot.get("base_quote") or 0.0)
                     if per_symbol_pct > 0 and equity > 0:
-                        if (position_value / equity) >= per_symbol_pct:
-                            risk_reason = "Per-symbol exposure cap reached."
+                        pr = position_value / equity
+                        blocked = (pr >= per_symbol_pct - 1e-15) or (
+                            base_quote_val > equity * per_symbol_pct + 1e-9
+                        )
+                        if blocked:
+                            from db import get_bot as _gb, try_per_symbol_autotune
+
+                            try_per_symbol_autotune(
+                                int(self.bot_id),
+                                float(equity),
+                                base_quote_val,
+                                float(position_value or 0.0),
+                                notify=getattr(self, "_notify_discord", None),
+                                bot_label=self._bot_label(),
+                            )
+                            bot = _gb(int(self.bot_id)) or bot
+                            per_symbol_pct = float(bot.get("per_symbol_exposure_pct", 0.15))
+                            pr = position_value / equity
+                            if (pr >= per_symbol_pct - 1e-15) or (
+                                base_quote_val > equity * per_symbol_pct + 1e-9
+                            ):
+                                risk_reason = "Per-symbol exposure cap reached."
                 except Exception:
                     pass
 

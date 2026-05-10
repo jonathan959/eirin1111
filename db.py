@@ -739,7 +739,7 @@ def init_db() -> None:
             min_free_cash_pct REAL NOT NULL DEFAULT 0.1,
             max_concurrent_deals INTEGER NOT NULL DEFAULT 6,
             spread_guard_pct REAL NOT NULL DEFAULT 0.003,
-            limit_timeout_sec INTEGER NOT NULL DEFAULT 8,
+            limit_timeout_sec INTEGER NOT NULL DEFAULT 45,
             daily_loss_limit_pct REAL NOT NULL DEFAULT 0.06,
             pause_hours INTEGER NOT NULL DEFAULT 6,
             auto_restart INTEGER NOT NULL DEFAULT 1,
@@ -996,6 +996,36 @@ def init_db() -> None:
         );
         """
     )
+
+    # --- journal (canonical closed-trade rows for /api/journal + analytics)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deal_id INTEGER,
+            bot_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            strategy TEXT,
+            side TEXT NOT NULL DEFAULT 'long',
+            qty REAL,
+            entry_px REAL,
+            exit_px REAL,
+            entry_ts INTEGER NOT NULL,
+            exit_ts INTEGER NOT NULL,
+            pnl_quote REAL,
+            pnl_pct REAL,
+            entry_reason TEXT,
+            exit_reason TEXT NOT NULL,
+            lessons TEXT,
+            source TEXT NOT NULL DEFAULT 'paper',
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_bot_entry_exit ON journal(bot_id, entry_ts, exit_ts);"
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_journal_bot_exit ON journal(bot_id, exit_ts);")
 
     # --- strategy performance trades (rolling stats)
     cur.execute(
@@ -1560,11 +1590,14 @@ def init_db() -> None:
         _ensure_column(con, "bots", "min_free_cash_pct", "REAL NOT NULL DEFAULT 0.1")
         _ensure_column(con, "bots", "max_concurrent_deals", "INTEGER NOT NULL DEFAULT 6")
         _ensure_column(con, "bots", "spread_guard_pct", "REAL NOT NULL DEFAULT 0.003")
-        _ensure_column(con, "bots", "limit_timeout_sec", "INTEGER NOT NULL DEFAULT 8")
+        _ensure_column(con, "bots", "limit_timeout_sec", "INTEGER NOT NULL DEFAULT 45")
         _ensure_column(con, "bots", "daily_loss_limit_pct", "REAL NOT NULL DEFAULT 0.06")
         _ensure_column(con, "bots", "pause_hours", "INTEGER NOT NULL DEFAULT 6")
         _ensure_column(con, "bots", "auto_restart", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(con, "bots", "last_running", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "bots", "last_polled_at", "INTEGER")
+        _ensure_column(con, "bots", "last_poll_error", "TEXT")
+        _ensure_column(con, "bots", "last_autotune_date", "TEXT")
         _ensure_column(con, "bots", "market_type", "TEXT NOT NULL DEFAULT 'crypto'")
         _ensure_column(con, "bots", "alpaca_mode", "TEXT NOT NULL DEFAULT 'paper'")
 
@@ -1632,6 +1665,19 @@ def init_db() -> None:
         _ensure_column(con, "bots", "stop_loss_pct", "REAL NOT NULL DEFAULT 0.08")
         _ensure_column(con, "bots", "max_hold_hours", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(con, "bots", "risk_profile", "TEXT NOT NULL DEFAULT 'balanced'")
+
+        # "Phantom cancelled deals" fix: adaptive limit pricing + slippage guard.
+        # adaptive_limit=1 -> if a limit order is unfilled after 50% of the
+        # timeout, cancel and repost at mid + 0.05% (buy side). After N
+        # reposts (see bot_manager) we fall back to a market order clamped
+        # by max_slippage_pct.
+        _ensure_column(con, "bots", "adaptive_limit", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(con, "bots", "max_slippage_pct", "REAL NOT NULL DEFAULT 0.003")
+        # repost_count: how many times the bot re-issued the entry limit
+        # for this deal before filling. Surfaces in the Bot row and caps
+        # at 3 before falling back to a market order.
+        _ensure_column(con, "deals", "repost_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "deals", "last_repost_at", "INTEGER")
 
         # Deals table - tracking for trailing stops
         _ensure_column(con, "deals", "highest_price", "REAL")
@@ -1978,7 +2024,7 @@ def create_bot(data: Dict[str, Any]) -> int:
         float(data.get("min_free_cash_pct", 0.1)),
         int(data.get("max_concurrent_deals", 6)),
         float(data.get("spread_guard_pct", 0.003)),
-        int(data.get("limit_timeout_sec", 8)),
+        int(data.get("limit_timeout_sec", 45)),
         float(data.get("daily_loss_limit_pct", 0.06)),
         int(data.get("pause_hours", 6)),
         int(data.get("auto_restart", 1)),
@@ -2088,7 +2134,7 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
         float(data.get("min_free_cash_pct", 0.1)),
         int(data.get("max_concurrent_deals", 6)),
         float(data.get("spread_guard_pct", 0.003)),
-        int(data.get("limit_timeout_sec", 8)),
+        int(data.get("limit_timeout_sec", 45)),
         float(data.get("daily_loss_limit_pct", 0.06)),
         int(data.get("pause_hours", 6)),
         int(data.get("auto_restart", 1)),
@@ -2132,6 +2178,47 @@ def update_bot(bot_id: int, data: Dict[str, Any]) -> None:
         )
 
     write_txn(bid, _do, name="update_bot")
+
+
+def update_bot_fields(bot_id: int, fields: Dict[str, Any]) -> int:
+    """Partial update for the bots table.
+
+    Only updates a whitelist of scalar columns. Prevents callers from
+    setting arbitrary SQL / unknown columns. Returns rowcount.
+    """
+    allowed = {
+        "name", "symbol", "enabled", "dry_run",
+        "base_quote", "safety_quote", "max_safety", "first_dev", "step_mult",
+        "tp", "hard_sl_pct", "trend_filter", "trend_sma", "max_spend_quote",
+        "poll_seconds", "strategy_mode", "forced_strategy", "max_open_orders",
+        "vol_gap_mult", "tp_vol_mult", "min_gap_pct", "max_gap_pct",
+        "regime_hold_candles", "regime_switch_ticks", "regime_switch_threshold",
+        "max_total_exposure_pct", "per_symbol_exposure_pct", "min_free_cash_pct",
+        "max_concurrent_deals", "spread_guard_pct", "limit_timeout_sec",
+        "daily_loss_limit_pct", "pause_hours", "auto_restart", "last_running",
+        "market_type", "alpaca_mode", "max_drawdown_pct", "trading_mode",
+        "intended_hold_days", "conviction_level", "auto_dip_buy",
+        "fundamental_exit_only", "rebalance_enabled", "grid_lower",
+        "grid_upper", "grid_levels", "stop_loss_pct", "max_hold_hours",
+        "trailing_stop_enabled", "trailing_activation_pct",
+        "trailing_distance_pct", "risk_profile", "bot_type",
+        "adaptive_limit", "max_slippage_pct",
+        "last_polled_at", "last_poll_error",
+        "last_autotune_date",
+    }
+    filtered = {k: v for k, v in (fields or {}).items() if k in allowed}
+    if not filtered:
+        return 0
+    keys = list(filtered.keys())
+    assigns = ", ".join(f"{k}=?" for k in keys)
+    vals = [filtered[k] for k in keys]
+    vals.append(int(bot_id))
+
+    def _do(con) -> int:
+        cur = con.execute(f"UPDATE bots SET {assigns} WHERE id=?", tuple(vals))
+        return int(cur.rowcount or 0)
+
+    return write_txn(int(bot_id), _do, name="update_bot_fields")
 
 
 def update_bots_by_type(bot_type: str, enabled: int) -> int:
@@ -2212,6 +2299,27 @@ def set_bot_running(bot_id: int, running: bool) -> None:
         con.execute("UPDATE bots SET last_running=? WHERE id=?", (val, bid))
 
     write_txn(bid, _do, name="set_bot_running")
+
+
+def update_bot_poll_status(bot_id: int, polled_ts: int, error: Optional[str] = None) -> None:
+    """Update bot poll heartbeat (unix ts) and optional error text for supervisor/UI."""
+    bid = int(bot_id)
+    ts = int(polled_ts)
+    err: Optional[str] = None if error is None else str(error)[:2000]
+
+    def _do(con) -> None:
+        if err is None:
+            con.execute(
+                "UPDATE bots SET last_polled_at=?, last_poll_error=NULL WHERE id=?",
+                (ts, bid),
+            )
+        else:
+            con.execute(
+                "UPDATE bots SET last_polled_at=?, last_poll_error=? WHERE id=?",
+                (ts, err, bid),
+            )
+
+    write_txn(bid, _do, name="update_bot_poll_status")
 
 
 def get_bot(bot_id: int) -> Optional[Dict[str, Any]]:
@@ -2419,6 +2527,9 @@ def close_deal(
     hold_sec: Optional[int] = None,
     safety_count: Optional[int] = None,
     entry_avg_estimated: bool = False,
+    journal_entry_reason: Optional[str] = None,
+    journal_exit_reason: Optional[str] = None,
+    journal_source: Optional[str] = None,
 ) -> None:
     """Mark a deal CLOSED, write the trade-feedback row, and update the
     recommendation_performance row if any — all in a single per-bot
@@ -2454,11 +2565,12 @@ def close_deal(
         # Re-fetch inside the txn so bot_id/opened_at are consistent with the
         # row we're about to UPDATE (cheap; no extra lock).
         row = con.execute(
-            "SELECT bot_id, opened_at FROM deals WHERE id=?",
+            "SELECT bot_id, opened_at, symbol FROM deals WHERE id=?",
             (int(deal_id),),
         ).fetchone()
         opened_ts = int(row["opened_at"] or 0) if row else 0
         bot_id_val = int(row["bot_id"]) if row else None
+        deal_symbol = str(row["symbol"] or "") if row else ""
 
         con.execute(
             """
@@ -2538,6 +2650,51 @@ def close_deal(
                 logger.exception(
                     "close_deal: _record_recommendation_outcome failed (non-fatal)"
                 )
+
+        # Canonical journal row (idempotent on bot_id+entry_ts+exit_ts)
+        try:
+            from services.journal import JOURNAL_EXIT_REASONS, normalize_exit_reason
+
+            br = con.execute("SELECT dry_run FROM bots WHERE id=?", (int(bot_id_val or 0),)).fetchone()
+            src = journal_source
+            if not src:
+                src = "paper" if (br and int(br["dry_run"] or 1) == 1) else "live"
+            ex_r = journal_exit_reason or normalize_exit_reason(str(exit_strategy or ""))
+            if ex_r not in JOURNAL_EXIT_REASONS:
+                ex_r = "manual_close"
+            en_r = (journal_entry_reason if journal_entry_reason is not None else "") or str(
+                entry_strategy or ""
+            )[:2000]
+            con.execute(
+                """
+                INSERT OR IGNORE INTO journal (
+                    deal_id, bot_id, symbol, strategy, side, qty,
+                    entry_px, exit_px, entry_ts, exit_ts,
+                    pnl_quote, pnl_pct, entry_reason, exit_reason, lessons, source, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(deal_id),
+                    int(bot_id_val or 0),
+                    deal_symbol,
+                    str(entry_strategy or "")[:200],
+                    "long",
+                    float(base_amount) if base_amount is not None else None,
+                    float(entry_avg) if entry_avg is not None else None,
+                    float(exit_avg) if exit_avg is not None else None,
+                    int(opened_ts),
+                    int(closed_ts),
+                    float(realized_pnl_quote) if realized_pnl_quote is not None else None,
+                    float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
+                    en_r,
+                    ex_r,
+                    None,
+                    str(src)[:32],
+                    int(closed_ts),
+                ),
+            )
+        except Exception as _jex:
+            logger.debug("close_deal: journal row skipped: %s", _jex)
 
     write_txn(bot_id_for_lock, _do, name="close_deal")
 
@@ -2714,6 +2871,48 @@ def manual_close_deal_and_journal(
                     "manual_close_deal_and_journal: _record_recommendation_outcome failed (deal=%d)",
                     int(deal_id),
                 )
+
+        # Canonical journal row (same uniqueness as close_deal)
+        try:
+            from services.journal import JOURNAL_EXIT_REASONS, normalize_exit_reason
+
+            deal_sym = str(drow.get("symbol") or "")
+            br = con.execute("SELECT dry_run FROM bots WHERE id=?", (int(bot_id),)).fetchone()
+            src = "paper" if (br and int(br["dry_run"] or 1) == 1) else "live"
+            ex_r = normalize_exit_reason(str(journal_exit_reason or exit_strategy or ""))
+            if ex_r not in JOURNAL_EXIT_REASONS:
+                ex_r = "manual_close"
+            en_r = str(entry_strategy or "")[:2000]
+            con.execute(
+                """
+                INSERT OR IGNORE INTO journal (
+                    deal_id, bot_id, symbol, strategy, side, qty,
+                    entry_px, exit_px, entry_ts, exit_ts,
+                    pnl_quote, pnl_pct, entry_reason, exit_reason, lessons, source, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(deal_id),
+                    int(bot_id),
+                    deal_sym,
+                    str(entry_strategy or "")[:200],
+                    "long",
+                    float(base_amount) if base_amount is not None else None,
+                    float(entry_avg) if entry_avg is not None else None,
+                    float(exit_avg) if exit_avg is not None else None,
+                    int(opened_ts),
+                    int(closed_ts),
+                    float(realized_pnl_quote) if realized_pnl_quote is not None else None,
+                    float(realized_pnl_pct_val) if realized_pnl_pct_val is not None else None,
+                    en_r,
+                    ex_r,
+                    None,
+                    str(src)[:32],
+                    int(closed_ts),
+                ),
+            )
+        except Exception as _mj:
+            logger.debug("manual_close_deal_and_journal: canonical journal skipped: %s", _mj)
 
         rp = float(realized_pnl_quote)
         rp_pct = ((float(exit_avg) - float(entry_avg)) / float(entry_avg)) * 100.0 if entry_avg and float(entry_avg) > 0 else 0.0
@@ -3143,6 +3342,222 @@ def list_closed_deals_for_journal(since_ts: Optional[int] = None, limit: int = 2
         ).fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+def list_journal_entries(limit: int = 500, offset: int = 0) -> List[Dict[str, Any]]:
+    """List journal rows newest first."""
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT id, deal_id, bot_id, symbol, strategy, side, qty, entry_px, exit_px,
+               entry_ts, exit_ts, pnl_quote, pnl_pct, entry_reason, exit_reason,
+               lessons, source, created_at
+        FROM journal
+        ORDER BY COALESCE(exit_ts, entry_ts, created_at) DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (int(limit), int(offset)),
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def upsert_journal_trade(
+    bot_id: int,
+    symbol: str,
+    strategy: str,
+    side: str,
+    qty: float,
+    entry_px: float,
+    exit_px: float,
+    entry_ts: int,
+    exit_ts: int,
+    pnl_quote: float,
+    pnl_pct: Optional[float],
+    entry_reason: str,
+    exit_reason: str,
+    lessons: Optional[str],
+    source: str,
+    deal_id: Optional[int] = None,
+) -> None:
+    """Idempotent insert; UNIQUE(bot_id, entry_ts, exit_ts)."""
+    from services.journal import JOURNAL_EXIT_REASONS, normalize_exit_reason
+
+    ex_r = normalize_exit_reason(exit_reason)
+    if ex_r not in JOURNAL_EXIT_REASONS:
+        ex_r = "manual_close"
+    con = _conn()
+    con.execute(
+        """
+        INSERT OR IGNORE INTO journal (
+            deal_id, bot_id, symbol, strategy, side, qty, entry_px, exit_px,
+            entry_ts, exit_ts, pnl_quote, pnl_pct, entry_reason, exit_reason,
+            lessons, source, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            int(deal_id) if deal_id is not None else None,
+            int(bot_id),
+            str(symbol or ""),
+            str(strategy or ""),
+            str(side or "long"),
+            float(qty or 0.0),
+            float(entry_px or 0.0),
+            float(exit_px or 0.0),
+            int(entry_ts),
+            int(exit_ts),
+            float(pnl_quote or 0.0),
+            float(pnl_pct) if pnl_pct is not None else None,
+            str(entry_reason or "backfilled"),
+            ex_r,
+            lessons,
+            str(source or "backfill"),
+            now_ts(),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def try_per_symbol_autotune(
+    bot_id: int,
+    equity: float,
+    base_quote: float,
+    position_value: float,
+    *,
+    notify: Optional[Any] = None,
+    bot_label: str = "",
+) -> bool:
+    """Once per UTC day: raise per_symbol_exposure_pct so base order fits and/or position ratio clears."""
+    import json as _json
+    from datetime import timezone, datetime
+
+    bot = get_bot(int(bot_id))
+    if not bot:
+        return False
+    today = datetime.now(timezone.utc).date().isoformat()
+    last = (bot.get("last_autotune_date") or "").strip()
+    if last == today:
+        return False
+
+    psp = float(bot.get("per_symbol_exposure_pct") or 0.0)
+    max_total = float(bot.get("max_total_exposure_pct") or 0.5)
+    eq = float(equity or 0.0)
+    if eq <= 0 or psp <= 0:
+        return False
+
+    pr = float(position_value or 0.0) / eq
+    base = float(base_quote or 0.0)
+    blocked = (pr >= psp - 1e-15) or (base > eq * psp + 1e-9)
+    if not blocked:
+        return False
+
+    min_need = 0.0
+    if base > eq * psp + 1e-9:
+        min_need = max(min_need, base / eq)
+    if pr >= psp - 1e-15:
+        min_need = max(min_need, pr + 1e-6)
+
+    new_psp = math.ceil(min_need / 0.01) * 0.01
+    new_psp = min(new_psp, max_total)
+    if new_psp <= psp + 1e-12:
+        return False
+
+    sym = str(bot.get("symbol") or "")
+    before = psp
+    update_bot_fields(
+        int(bot_id),
+        {"per_symbol_exposure_pct": float(new_psp), "last_autotune_date": today},
+    )
+    lessons = _json.dumps({"before_per_symbol_pct": before, "after_per_symbol_pct": new_psp, "equity": eq})
+    t0 = now_ts()
+    upsert_journal_trade(
+        int(bot_id),
+        sym,
+        "autotune",
+        "n/a",
+        0.0,
+        0.0,
+        0.0,
+        t0,
+        t0 + 1,
+        0.0,
+        0.0,
+        "autotune",
+        "manual_close",
+        lessons,
+        "paper" if int(bot.get("dry_run") or 1) == 1 else "live",
+        deal_id=None,
+    )
+    if notify:
+        try:
+            notify(
+                f"🔧 {bot_label or ('Bot #' + str(bot_id))}: autotune per-symbol exposure {before*100:.1f}% → {new_psp*100:.1f}%",
+                force=True,
+            )
+        except TypeError:
+            try:
+                notify(
+                    f"🔧 autotune bot {bot_id}: per-symbol exposure {before*100:.1f}% → {new_psp*100:.1f}%",
+                    force=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return True
+
+
+def backfill_journal_from_closed_deals() -> int:
+    """Insert journal rows for CLOSED deals missing a matching journal row."""
+    from services.journal import JOURNAL_EXIT_REASONS, normalize_exit_reason
+
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT d.id AS deal_id, d.bot_id, d.symbol, d.opened_at, d.closed_at,
+               d.entry_avg, d.exit_avg, d.base_amount, d.realized_pnl_quote,
+               d.realized_pnl_pct, d.entry_strategy, d.exit_strategy
+        FROM deals d
+        LEFT JOIN journal j
+          ON j.bot_id = d.bot_id AND j.entry_ts = d.opened_at AND j.exit_ts = d.closed_at
+        WHERE d.state = 'CLOSED'
+          AND d.closed_at IS NOT NULL
+          AND d.opened_at IS NOT NULL
+          AND j.id IS NULL
+        """
+    ).fetchall()
+    con.close()
+    n = 0
+    for r in rows:
+        d = dict(r)
+        bid = int(d.get("bot_id") or 0)
+        bot = get_bot(bid) or {}
+        src = "paper" if int(bot.get("dry_run") or 1) == 1 else "live"
+        ex_raw = str(d.get("exit_strategy") or "")
+        ex = normalize_exit_reason(ex_raw)
+        if ex not in JOURNAL_EXIT_REASONS:
+            ex = "manual_close"
+        upsert_journal_trade(
+            bid,
+            str(d.get("symbol") or ""),
+            str(d.get("entry_strategy") or ""),
+            "long",
+            float(d.get("base_amount") or 0.0),
+            float(d.get("entry_avg") or 0.0),
+            float(d.get("exit_avg") or 0.0),
+            int(d.get("opened_at") or 0),
+            int(d.get("closed_at") or 0),
+            float(d.get("realized_pnl_quote") or 0.0),
+            float(d["realized_pnl_pct"]) if d.get("realized_pnl_pct") is not None else None,
+            "backfilled",
+            ex,
+            None,
+            "backfill",
+            deal_id=int(d.get("deal_id") or 0) or None,
+        )
+        n += 1
+    return n
 
 
 def get_deal(deal_id: int, full: bool = False) -> Optional[Dict[str, Any]]:

@@ -23,6 +23,7 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
     @patch('worker_api.create_bot')
     @patch('worker_api.bm')
     async def test_create_stock_bot_auto_detect(self, mock_bm, mock_create, mock_get_bot):
+        mock_bm.get_portfolio_total.return_value = 1_000_000.0
         mock_create.return_value = 99
         mock_get_bot.return_value = {"id": 99, "symbol": "INTC", "market_type": "stocks"}
         
@@ -42,6 +43,7 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
     @patch('worker_api.update_bot')
     @patch('worker_api.bm')
     async def test_update_stock_bot_auto_heal(self, mock_bm, mock_update, mock_get_bot):
+        mock_bm.get_portfolio_total.return_value = 1_000_000.0
         mock_get_bot.return_value = {"id": 16, "symbol": "AAPL", "market_type": "crypto", "enabled": 1}
         mock_update.return_value = None
         
@@ -59,6 +61,7 @@ class TestBotCRUD(unittest.IsolatedAsyncioTestCase):
     @patch('worker_api.bm')
     async def test_create_override_crypto(self, mock_bm, mock_create, mock_get_bot):
         """Test that we FORCE stock market type for stock-looking symbols even if payload says crypto"""
+        mock_bm.get_portfolio_total.return_value = 1_000_000.0
         mock_create.return_value = 100
         mock_get_bot.return_value = {"id": 100, "symbol": "INTC", "market_type": "stocks"}
         

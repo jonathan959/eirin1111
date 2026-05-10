@@ -110,7 +110,7 @@
               <td class="mono">{{ "DRY" if b.dry_run else "LIVE" }}</td>
 
               <td class="mono">
-                <span class="tag" id="st-{{ b.id }}">Loading…</span>
+                <span class="bot-status stopped" id="st-{{ b.id }}"><span class="status-dot"></span> Checking</span>
                 <span class="muted ml-8" id="ev-{{ b.id }}">—</span>
               </td>
 
@@ -130,6 +130,12 @@
                 <a class="btn" href="/bots/{{ b.id }}">Open</a>
                 <button class="btn" onclick="openEdit({{ b.id }})">Edit</button>
                 <button class="btn" onclick="cloneBot({{ b.id }})">Clone</button>
+                {% if b.dry_run %}
+                <button onclick="openGoLiveModal({{ b.id }})"
+                        title="Promote this dry-run bot to live trading. Requires WORKER_API_TOKEN, ALLOW_LIVE_TRADING=1, and a healthy dry-run track record (≥ 20 closed trades, win rate ≥ 40%, max drawdown ≤ 15%)."
+                        style="font-size:11px; padding:2px 8px; background:#0f2f1a; color:#22c55e; border:1px solid rgba(34,197,94,0.45); border-radius:4px; cursor:pointer; font-weight:600;">🚀 Go Live</button>
+                {% endif %}
+                <button onclick="quickAddFunds({{ b.id }})" title="Add funds" style="font-size:11px; padding:2px 6px; background:#1a2e1a; color:#22c55e; border:1px solid rgba(34,197,94,0.3); border-radius:4px; cursor:pointer;">+$</button>
                 <button class="btn btn-purple" onclick="startBot({{ b.id }})">Start</button>
                 <button class="btn" onclick="stopBot({{ b.id }})">Stop</button>
                 <button class="btn btn-neg" onclick="deleteBot({{ b.id }})">Delete</button>
@@ -158,6 +164,20 @@
     </div>
 
     <div id="formErr" class="muted hidden mb-8"></div>
+
+    <!-- Clone Mode Toggle (visible only when cloning a dry-run bot) -->
+    <div id="cloneModeToggle" class="mb-12" style="display:none; background:rgba(34,197,94,0.06); border:1px solid rgba(34,197,94,0.3); border-radius:8px; padding:10px 14px;">
+      <div class="label" style="margin-bottom:6px;">📋 Clone Mode</div>
+      <div class="muted text-xs" style="margin-bottom:8px;">The original bot's history stays intact. Choose how this clone runs:</div>
+      <label style="display:inline-flex; align-items:center; gap:6px; margin-right:18px; cursor:pointer;">
+        <input type="radio" name="cloneAsLive" value="0" checked onchange="onCloneModeChange(this.value)">
+        <span>Keep as Dry Run</span>
+      </label>
+      <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:#22c55e; font-weight:600;">
+        <input type="radio" name="cloneAsLive" value="1" onchange="onCloneModeChange(this.value)">
+        <span>🚀 Clone as Live Bot</span>
+      </label>
+    </div>
 
     <!-- Bot Templates -->
     <div class="section-md mb-12">
@@ -262,17 +282,17 @@
       <div>
         <div class="label">Auto-restart</div>
         <select id="f_auto_restart" class="input">
-          <option value="0" selected>Off</option>
-          <option value="1">On</option>
+          <option value="0">Off</option>
+          <option value="1" selected>On</option>
         </select>
-        <div class="muted text-xs mt-6">Start a new deal after one closes.</div>
+        <div class="muted text-xs mt-6">After a crash, watchdog can restart this bot if it is still enabled (interval in .env). Off = stay stopped until you start manually.</div>
       </div>
     </div>
 
     <div class="grid grid-3 section-md">
       <div>
         <div class="label">Base order (quote)</div>
-        <input id="f_base" class="input" type="number" step="0.01" value="25" />
+        <input id="f_base" class="input" type="number" step="0.01" value="25" oninput="updateExposureWarning()" />
       </div>
 
       <div>
@@ -320,7 +340,7 @@
 
       <div>
         <div class="label">Hard Stop Loss (%)</div>
-        <input id="f_hard_sl_pct" class="input" type="number" step="0.01" value="0" />
+        <input id="f_hard_sl_pct" class="input" type="number" step="0.01" value="3" />
         <div class="muted text-xs mt-6">Emergency exit if price drops this % below entry (0 = disabled)</div>
       </div>
     </div>
@@ -397,11 +417,29 @@
       </div>
       <div>
         <div class="label">Per-symbol exposure (pct)</div>
-        <input id="f_per_symbol_exposure_pct" class="input" type="number" step="0.01" value="0.15" />
+        <input id="f_per_symbol_exposure_pct" class="input" type="number" step="0.01" value="0.15"
+               oninput="updateExposureWarning()" />
+        <div class="muted text-xs mt-6">Fraction of portfolio that may be deployed into a single symbol.</div>
       </div>
       <div>
         <div class="label">Min free cash (pct)</div>
         <input id="f_min_free_cash_pct" class="input" type="number" step="0.01" value="0.1" />
+      </div>
+    </div>
+    <!-- Bug 2: Live exposure-cap warning -->
+    <div id="exposureWarningBox" class="section-md" style="display:none;">
+      <div class="card" style="border-left:4px solid #b45309; background:rgba(180,83,9,0.08); padding:12px;">
+        <div style="font-weight:700; color:#b45309; margin-bottom:4px;">⚠ Exposure cap conflict</div>
+        <div id="exposureWarningText" class="text-xs" style="line-height:1.5;"></div>
+        <div id="exposureLocalChips" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;"></div>
+      </div>
+    </div>
+
+    <div id="serverExposure422" class="section-md hidden" style="display:none;">
+      <div class="card" style="border-left:4px solid #dc2626; background:rgba(220,38,38,0.08); padding:12px;">
+        <div style="font-weight:700; color:#dc2626; margin-bottom:4px;">Save blocked — exposure cap</div>
+        <div id="serverExposure422Text" class="text-xs" style="line-height:1.5;"></div>
+        <div id="serverExposureChips" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;"></div>
       </div>
     </div>
 
@@ -416,7 +454,20 @@
       </div>
       <div>
         <div class="label">Limit timeout (sec)</div>
-        <input id="f_limit_timeout_sec" class="input" type="number" step="1" value="8" />
+        <input id="f_limit_timeout_sec" class="input" type="number" step="1" value="45" />
+        <div class="muted text-xs">Seconds to wait for a limit fill before cancel+repost. 8 was too aggressive for Kraken.</div>
+      </div>
+      <div>
+        <div class="label">Adaptive limit pricing</div>
+        <label style="display:flex; align-items:center; gap:6px;">
+          <input id="f_adaptive_limit" type="checkbox" checked />
+          <span>Reprice toward taker after 50% timeout</span>
+        </label>
+      </div>
+      <div>
+        <div class="label">Max slippage % (market fallback)</div>
+        <input id="f_max_slippage_pct" class="input" type="number" step="0.001" value="0.003" />
+        <div class="muted text-xs">After 3 reposts, fall back to market order with this cap.</div>
       </div>
     </div>
 
@@ -509,6 +560,63 @@
   </div>
 </div>
 
+<!-- Graduate to Live Modal -->
+<div id="goLiveModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:1000; justify-content:center; align-items:center;">
+  <div style="background:var(--panel); border:1px solid rgba(34,197,94,0.3); border-radius:12px; padding:28px; max-width:480px; width:90%; box-shadow:0 20px 60px rgba(0,0,0,0.5);">
+    <h3 style="margin:0 0 4px 0; color:#22c55e; display:flex; align-items:center; gap:8px;">🚀 Graduate to Live Trading</h3>
+    <p style="margin:0 0 20px 0; color:var(--muted); font-size:13px;" id="goLiveBotName">Bot #0</p>
+    <div id="goLiveStatsBox" style="background:var(--background); border:1px solid var(--border); border-radius:8px; padding:12px 14px; margin-bottom:16px; font-size:13px;">
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Symbol</span><span class="mono" id="goLiveSymbol">—</span></div>
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Strategy</span><span class="mono" id="goLiveStrategy">—</span></div>
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Closed deals</span><span class="mono" id="goLiveDeals">—</span></div>
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Win rate</span><span class="mono" id="goLiveWinRate">—</span></div>
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Realized P&amp;L</span><span class="mono" id="goLiveRealized">—</span></div>
+      <div style="display:flex; justify-content:space-between; padding:3px 0;"><span class="muted">Max drawdown</span><span class="mono" id="goLiveDrawdown">—</span></div>
+    </div>
+
+    <!-- Bug 13 + General: pre-flight checklist before going live. -->
+    <div id="goLivePreflight" style="background:var(--background); border:1px solid var(--border); border-radius:8px; padding:12px 14px; margin-bottom:16px; font-size:12.5px; line-height:1.6;">
+      <div style="font-weight:700; margin-bottom:6px;">Pre-flight checklist</div>
+      <div id="pf_trades">… ≥ 20 closed trades</div>
+      <div id="pf_winrate">… Win rate ≥ 40%</div>
+      <div id="pf_drawdown">… Max drawdown ≤ 15%</div>
+      <div id="pf_token">… WORKER_API_TOKEN configured</div>
+      <div id="pf_exposure">… Exposure cap ≥ Base order</div>
+    </div>
+    <div style="background:rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.3); border-radius:8px; padding:10px 12px; margin-bottom:16px; color:#fca5a5; font-size:12.5px; line-height:1.45;">
+      ⚠ <strong>This switches the bot to LIVE mode.</strong> Real money will be used on the next entry order. All other settings (symbol, strategy, TP, SL, sizing) remain identical. Monitor closely for the first few trades.
+    </div>
+    <div id="goLiveError" style="color:#ef4444; font-size:12px; margin-bottom:12px; display:none;"></div>
+    <div style="margin-bottom:12px;">
+      <label class="form-label" style="font-size:12px; display:block; margin-bottom:4px;">Type <code>LIVE</code> to confirm</label>
+      <input id="goLiveConfirmInput" class="input" type="text" placeholder="Type LIVE" autocomplete="off" style="max-width:200px;" />
+      <div id="goLiveReadyHint" class="muted" style="font-size:11px; margin-top:4px;">Checking safety…</div>
+    </div>
+    <div style="display:flex; gap:8px; justify-content:flex-end;">
+      <button onclick="closeGoLiveModal()" style="padding:8px 16px; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text); cursor:pointer;">Cancel</button>
+      <button id="goLiveConfirmBtn" onclick="confirmGoLive()" disabled style="padding:8px 16px; border:none; border-radius:6px; background:#22c55e; color:#0a1a0a; font-weight:700; cursor:pointer;">Confirm — Go Live</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Funds Modal -->
+<div id="addFundsModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:1000; justify-content:center; align-items:center;">
+  <div style="background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:32px; max-width:400px; width:90%; box-shadow:0 20px 60px rgba(0,0,0,0.4);">
+    <h3 style="margin:0 0 8px 0; color:var(--text);">Add Funds</h3>
+    <p style="margin:0 0 20px 0; color:var(--muted); font-size:13px;" id="addFundsBotName">Bot #0</p>
+    <div style="position:relative; margin-bottom:16px;">
+      <span style="position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--muted); font-weight:600;">$</span>
+      <input type="number" id="addFundsAmount" placeholder="Amount (min $5)" min="5" step="0.01"
+        style="width:100%; padding:12px 12px 12px 28px; border:1px solid var(--border); border-radius:6px; background:var(--background); color:var(--text); font-size:14px; box-sizing:border-box;">
+    </div>
+    <div id="addFundsError" style="color:#ef4444; font-size:12px; margin-bottom:12px; display:none;"></div>
+    <div style="display:flex; gap:8px; justify-content:flex-end;">
+      <button onclick="closeAddFundsModal()" style="padding:8px 16px; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text); cursor:pointer;">Cancel</button>
+      <button id="addFundsConfirmBtn" onclick="confirmAddFunds()" style="padding:8px 16px; border:none; border-radius:6px; background:#22c55e; color:white; font-weight:600; cursor:pointer;">Add Funds</button>
+    </div>
+  </div>
+</div>
+
 <script>
   const _botsList = {{ (bots or [])|tojson }};
   const INITIAL_BOTS = Array.isArray(_botsList) ? _botsList : [];
@@ -519,9 +627,90 @@
   let STOCK_SYMBOLS = [];
   let EDITING_ID = null;
   let CURRENT_MARKET_TYPE = "crypto";
+  let _savingBot = false;
 
   function $(id){ return document.getElementById(id); }
   function setF(id, val) { var e = $(id); if (e) e.value = val; }
+
+  // Bug 2: cached portfolio value used to evaluate the per-symbol exposure cap.
+  let _PORTFOLIO_TOTAL_USD = 0;
+  (function loadPortfolioForExposure(){
+    fetch("/api/portfolio").then(r => r.json()).then(d => {
+      const p = (d && (d.portfolio || d.snapshot)) || {};
+      _PORTFOLIO_TOTAL_USD = Number(p.total_usd || 0);
+      try { updateExposureWarning(); } catch(_){}
+    }).catch(() => {});
+  })();
+
+  function _chipBtn(label, onClick) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.className = "btn";
+    b.style.cssText = "padding:6px 12px; border-radius:9999px; font-size:12px; border:1px solid var(--border); background:var(--panel); cursor:pointer;";
+    b.onclick = onClick;
+    return b;
+  }
+
+  function _hideServerExposure422() {
+    var bx = $("serverExposure422");
+    if (bx) { bx.style.display = "none"; bx.classList.add("hidden"); }
+    var t = $("serverExposure422Text"); if (t) t.textContent = "";
+    var c = $("serverExposureChips"); if (c) c.innerHTML = "";
+  }
+
+  function refreshSaveForExposure() {
+    var saveBtn = $("btnSave");
+    if (!saveBtn) return;
+    var warn = $("exposureWarningBox");
+    var srv = $("serverExposure422");
+    var badLocal = warn && warn.style.display === "block";
+    var badSrv = srv && srv.style.display === "block";
+    saveBtn.disabled = !!(badLocal || badSrv);
+  }
+
+  function updateExposureWarning(){
+    _hideServerExposure422();
+    const box = document.getElementById("exposureWarningBox");
+    const txt = document.getElementById("exposureWarningText");
+    const chips = document.getElementById("exposureLocalChips");
+    if (!box || !txt) return;
+    if (chips) chips.innerHTML = "";
+    const baseQuote = Number(($("f_base") && $("f_base").value) || 0);
+    const exposurePct = Number(($("f_per_symbol_exposure_pct") && $("f_per_symbol_exposure_pct").value) || 0);
+    const portfolio = Number(_PORTFOLIO_TOTAL_USD || 0);
+    if (!(baseQuote > 0) || !(exposurePct > 0) || !(portfolio > 0)){
+      box.style.display = "none";
+      refreshSaveForExposure();
+      return;
+    }
+    const cap = portfolio * exposurePct;
+    if (baseQuote > cap){
+      const minPct = Math.min(0.99, Math.ceil((baseQuote / portfolio) / 0.01) * 0.01);
+      const maxBase = Math.max(1, Math.floor(cap));
+      txt.innerHTML =
+        '<strong>Base order ($' + baseQuote.toFixed(2) + ') exceeds the per-symbol cap ($' + cap.toFixed(2) + ').</strong><br/>' +
+        'Portfolio: $' + portfolio.toFixed(2) + ' × cap ' + (exposurePct * 100).toFixed(1) + '% = $' + cap.toFixed(2) + '. ' +
+        'After the first fill the bot will be blocked with "Per-symbol exposure cap reached" and stop trading.<br/>' +
+        'Use the quick actions below or adjust fields manually.';
+      box.style.display = "block";
+      if (chips) {
+        chips.appendChild(_chipBtn("Set cap to " + (minPct * 100).toFixed(0) + "%", function(){
+          var el = $("f_per_symbol_exposure_pct");
+          if (el) { el.value = String(minPct); el.dispatchEvent(new Event("input")); }
+          updateExposureWarning();
+        }));
+        chips.appendChild(_chipBtn("Set base to $" + maxBase, function(){
+          var el = $("f_base");
+          if (el) { el.value = String(maxBase); el.dispatchEvent(new Event("input")); }
+          updateExposureWarning();
+        }));
+      }
+    } else {
+      box.style.display = "none";
+    }
+    refreshSaveForExposure();
+  }
 
   function toggleAdvanced(){
     const section = document.getElementById("advancedSettings");
@@ -673,19 +862,24 @@
 
   async function getJSON(url, opts){
     const r = await fetch(url, opts || {});
-    
-    // Clone response to read body multiple times if needed
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    // nginx 502/504 often returns HTML — avoid JSON parse noise and show a clear message
+    if (ct.includes("text/html")) {
+      const t = await r.text();
+      const gw = r.status === 502 || r.status === 503 || r.status === 504 || /bad gateway|gateway timeout/i.test(t);
+      if (gw) {
+        throw new Error(url + " -> " + r.status + " Server unreachable (proxy). The app may be restarting — wait 30s and refresh the page.");
+      }
+      throw new Error(url + " -> " + r.status + " " + t.slice(0, 120));
+    }
     const rClone = r.clone();
-    
     let data;
     try {
       data = await r.json();
     } catch (jsonError) {
-      // If JSON parsing fails, read text from cloned response
       const t = await rClone.text();
-      throw new Error(url + " -> " + r.status + " " + t);
+      throw new Error(url + " -> " + r.status + " " + t.slice(0, 120));
     }
-    
     if(!r.ok){
       throw new Error(url + " -> " + r.status + " " + (data?.detail || data?.error || "request failed"));
     }
@@ -712,20 +906,25 @@
     var sb = $("btnSave"); if (sb) sb.textContent = "Create";
     clearErr();
 
+    // Hide the Clone Mode banner by default. cloneBot() will show it if relevant.
+    var cmt = $("cloneModeToggle"); if (cmt) cmt.style.display = "none";
+    var cr0 = document.querySelector('input[name="cloneAsLive"][value="0"]');
+    if (cr0) cr0.checked = true;
+
     setF("f_name", "My Bot");
     setF("f_market_type", prefillMarketType || "crypto");
     setF("f_alpaca_mode", "paper");
     setF("f_dry", "1");
     setF("f_strategy", "classic");
     setF("f_forced_strategy", "");
-    setF("f_auto_restart", "0");
+    setF("f_auto_restart", "1");
     setF("f_enabled", "0");
     setF("f_base", 25);
     setF("f_safety", 25);
     setF("f_max_safety", 3);
-    setF("f_first_dev", 0.015);
+    setF("f_first_dev", 0.010);
     setF("f_step_mult", 1.20);
-    setF("f_tp_pct", 1.2);
+    setF("f_tp_pct", 1.5);
     setF("f_vol_gap_mult", 1.0);
     setF("f_tp_vol_mult", 1.0);
     setF("f_min_gap_pct", 0.003);
@@ -738,10 +937,12 @@
     setF("f_min_free_cash_pct", 0.1);
     setF("f_max_concurrent_deals", 6);
     setF("f_spread_guard_pct", 0.003);
-    setF("f_limit_timeout_sec", 8);
-    setF("f_daily_loss_limit_pct", 0.06);
+    setF("f_limit_timeout_sec", 45);
+    setF("f_max_slippage_pct", 0.003);
+    try { document.getElementById("f_adaptive_limit").checked = true; } catch(_) {}
+    setF("f_daily_loss_limit_pct", 0.03);
     setF("f_pause_hours", 6);
-    setF("f_stop_loss_pct", 0.08);
+    setF("f_stop_loss_pct", 0.02);
     setF("f_max_drawdown_pct", 0.15);
     setF("f_max_hold_hours", 0);
     setF("f_trailing_activation_pct", 0.02);
@@ -821,7 +1022,7 @@
     setVal("f_enabled", b.enabled, 0);
     setVal("f_strategy", b.strategy_mode || b.strategy, "classic_dca");
     setVal("f_forced_strategy", b.forced_strategy, "");
-    setVal("f_auto_restart", b.auto_restart, 0);
+    setVal("f_auto_restart", b.auto_restart, 1);
 
     setVal("f_base", b.base_quote, 0);
     setVal("f_safety", b.safety_quote, 0);
@@ -841,7 +1042,12 @@
     setVal("f_min_free_cash_pct", b.min_free_cash_pct, 0.1);
     setVal("f_max_concurrent_deals", b.max_concurrent_deals, 6);
     setVal("f_spread_guard_pct", b.spread_guard_pct, 0.003);
-    setVal("f_limit_timeout_sec", b.limit_timeout_sec, 8);
+    setVal("f_limit_timeout_sec", b.limit_timeout_sec, 45);
+    setVal("f_max_slippage_pct", b.max_slippage_pct, 0.003);
+    try {
+      var al = document.getElementById("f_adaptive_limit");
+      if (al) al.checked = (b.adaptive_limit == null ? true : !!Number(b.adaptive_limit));
+    } catch(_) {}
     setVal("f_daily_loss_limit_pct", b.daily_loss_limit_pct, 0.06);
     setVal("f_pause_hours", b.pause_hours, 6);
     setVal("f_stop_loss_pct", b.stop_loss_pct, 0.08);
@@ -904,7 +1110,7 @@
       strategy_mode: _v("f_strategy", "classic_dca"),
       forced_strategy: _v("f_forced_strategy", ""),
       max_open_orders: Number(_v("f_max_open_orders", "6")),
-      auto_restart: Number(_v("f_auto_restart", "0")),
+      auto_restart: Number(_v("f_auto_restart", "1")),
 
       base_quote: Number(_v("f_base", "0")),
       safety_quote: Number(_v("f_safety", "0")),
@@ -924,7 +1130,9 @@
       min_free_cash_pct: Number(_v("f_min_free_cash_pct", "0.1")),
       max_concurrent_deals: Number(_v("f_max_concurrent_deals", "6")),
       spread_guard_pct: Number(_v("f_spread_guard_pct", "0.003")),
-      limit_timeout_sec: Number(_v("f_limit_timeout_sec", "8")),
+      limit_timeout_sec: Number(_v("f_limit_timeout_sec", "45")),
+      adaptive_limit: (document.getElementById("f_adaptive_limit") && document.getElementById("f_adaptive_limit").checked) ? 1 : 0,
+      max_slippage_pct: Number(_v("f_max_slippage_pct", "0.003")),
       daily_loss_limit_pct: Number(_v("f_daily_loss_limit_pct", "0.06")),
       pause_hours: Number(_v("f_pause_hours", "6")),
       stop_loss_pct: Number(_v("f_stop_loss_pct", "0.08")),
@@ -933,7 +1141,7 @@
       trailing_activation_pct: Number(_v("f_trailing_activation_pct", "0.02")),
       trailing_distance_pct: Number(_v("f_trailing_distance_pct", "0.01")),
       risk_profile: _v("f_risk_profile", "balanced"),
-      hard_sl_pct: Number(_v("f_hard_sl_pct", "0")) / 100,
+      hard_sl_pct: Number(_v("f_hard_sl_pct", "3")) / 100,
 
       grid_lower: Number(_v("f_grid_lower", "0")) || 0,
       grid_upper: Number(_v("f_grid_upper", "0")) || 0,
@@ -948,46 +1156,331 @@
   }
 
   async function saveBot(){
+    if (_savingBot) return;
+    _savingBot = true;
     clearErr();
     var saveBtn = $("btnSave");
     if (saveBtn) saveBtn.disabled = true;
 
     try{
+      if (EDITING_ID == null) {
+        const payload = payloadFromForm();
+        if (!(payload.symbol && String(payload.symbol).trim())) {
+          showErr("Please choose a symbol (search and select from the list).");
+          return;
+        }
+        const r = await fetch("/api/bots", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json().catch(function() { return {}; });
+        if (r.status === 422 && data.error === "exposure_cap_conflict") {
+          _showServerExposure422(data);
+          return;
+        }
+        if (!r.ok) {
+          showErr(data.error || data.detail || ("Save failed (" + r.status + ")"));
+          return;
+        }
+        window.location.reload();
+        return;
+      }
+
       const payload = payloadFromForm();
-      if (EDITING_ID == null && !(payload.symbol && String(payload.symbol).trim())) {
-        showErr("Please choose a symbol (search and select from the list).");
+      const r = await fetch("/api/bots/" + EDITING_ID, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json().catch(function() { return {}; });
+      if (r.status === 422 && data.error === "exposure_cap_conflict") {
+        _showServerExposure422(data);
         return;
       }
-
-      let res;
-      if(EDITING_ID == null){
-        res = await getJSON("/api/bots", {
-          method:"POST",
-          headers: { "Content-Type":"application/json" },
-          body: JSON.stringify(payload)
-        });
-      }else{
-        res = await getJSON(`/api/bots/${EDITING_ID}`, {
-          method:"PUT",
-          headers: { "Content-Type":"application/json" },
-          body: JSON.stringify(payload)
-        });
-      }
-
-      if(!res.ok){
-        const errs = (res.errors || []).join(" • ");
-        showErr((res.error || "Save failed") + (errs ? (": " + errs) : ""));
+      if (!r.ok) {
+        showErr(data.error || data.detail || ("Save failed (" + r.status + ")"));
         return;
       }
-
-      // simplest: reload to repopulate table + initial list
       window.location.reload();
     }catch(e){
       console.error(e);
       showErr(e.message || String(e));
     }finally{
+      _savingBot = false;
       var saveBtn = $("btnSave");
       if (saveBtn) saveBtn.disabled = false;
+      refreshSaveForExposure();
+    }
+  }
+
+  function _showServerExposure422(data) {
+    var bx = $("serverExposure422");
+    var tx = $("serverExposure422Text");
+    var ch = $("serverExposureChips");
+    if (!bx || !tx) return;
+    bx.style.display = "block";
+    bx.classList.remove("hidden");
+    tx.textContent = data.message || "Exposure cap conflict";
+    if (ch) ch.innerHTML = "";
+    var s = data.suggestions || {};
+    var cur = data.current || {};
+    if (ch && typeof s.per_symbol_pct === "number") {
+      ch.appendChild(_chipBtn("Set cap to " + (s.per_symbol_pct * 100).toFixed(0) + "%", function(){
+        var el = $("f_per_symbol_exposure_pct");
+        if (el) { el.value = String(s.per_symbol_pct); el.dispatchEvent(new Event("input")); }
+        _hideServerExposure422();
+        updateExposureWarning();
+      }));
+    }
+    if (ch && typeof s.base_order_quote === "number") {
+      ch.appendChild(_chipBtn("Set base to $" + Math.round(s.base_order_quote), function(){
+        var el = $("f_base");
+        if (el) { el.value = String(Math.round(s.base_order_quote)); el.dispatchEvent(new Event("input")); }
+        _hideServerExposure422();
+        updateExposureWarning();
+      }));
+    }
+    refreshSaveForExposure();
+  }
+
+  async function clearRiskFlag(botId) {
+    const snap = BOT_SNAP[botId];
+    const reason = snap?.risk_reason || "Unknown risk condition";
+    if(!confirm(`RISK ACKNOWLEDGMENT\n\nBot #${botId} is paused due to:\n"${reason}"\n\nClearing this flag will allow the bot to resume trading.\nAre you sure you want to proceed?`)) return;
+    try {
+      const r = await fetch(`/api/bots/${botId}/clear_risk_flag`, {method:'POST',headers:{'Content-Type':'application/json'}});
+      const d = await r.json();
+      if(d.ok){ showToast(d.message || "Risk flag cleared"); refreshSingle(botId); }
+      else { showToast(d.error || "Failed", true); }
+    } catch(e) { showToast("Error clearing risk flag", true); }
+  }
+
+  let _addFundsBotId = null;
+  function quickAddFunds(botId) {
+    _addFundsBotId = botId;
+    document.getElementById('addFundsBotName').textContent = 'Bot #' + botId;
+    document.getElementById('addFundsAmount').value = '';
+    document.getElementById('addFundsError').style.display = 'none';
+    document.getElementById('addFundsConfirmBtn').disabled = false;
+    document.getElementById('addFundsConfirmBtn').textContent = 'Add Funds';
+    const modal = document.getElementById('addFundsModal');
+    modal.style.display = 'flex';
+  }
+  function closeAddFundsModal() {
+    document.getElementById('addFundsModal').style.display = 'none';
+    _addFundsBotId = null;
+  }
+  async function confirmAddFunds() {
+    const amount = parseFloat(document.getElementById('addFundsAmount').value);
+    const errEl = document.getElementById('addFundsError');
+    const btn = document.getElementById('addFundsConfirmBtn');
+    if (isNaN(amount) || amount < 5) {
+      errEl.textContent = 'Enter a valid amount (minimum $5).';
+      errEl.style.display = 'block';
+      return;
+    }
+    errEl.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Adding...';
+    try {
+      const res = await fetch('/api/bots/' + _addFundsBotId + '/add_funds', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({amount: amount})
+      });
+      const data = await res.json();
+      if (data.ok) {
+        closeAddFundsModal();
+        if (typeof showToast === 'function') showToast('Success', '$' + amount + ' added to bot #' + _addFundsBotId, 'success');
+        refreshStatusRow(_addFundsBotId);
+      } else {
+        errEl.textContent = data.error || 'Failed to add funds';
+        errEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Add Funds';
+      }
+    } catch (e) {
+      errEl.textContent = 'Network error: ' + e.message;
+      errEl.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Add Funds';
+    }
+  }
+
+  // ============================================================
+  // Graduate to Live (dry-run → live promotion)
+  // ============================================================
+  let _goLiveBotId = null;
+  async function openGoLiveModal(botId){
+    _goLiveBotId = botId;
+    const bot = (INITIAL_BOTS || []).find(b => Number(b.id) === Number(botId)) || {};
+    $("goLiveBotName").textContent = (bot.name || ("Bot #" + botId));
+    $("goLiveSymbol").textContent = bot.symbol || "—";
+    $("goLiveStrategy").textContent = (bot.strategy_mode || bot.strategy || "—");
+    $("goLiveDeals").textContent = "loading…";
+    $("goLiveWinRate").textContent = "loading…";
+    $("goLiveRealized").textContent = "loading…";
+    $("goLiveError").style.display = "none";
+    const btn = $("goLiveConfirmBtn");
+    btn.disabled = true;
+    btn.textContent = "Confirm — Go Live";
+    const cInp = $("goLiveConfirmInput");
+    if (cInp) cInp.value = "";
+    window._goLiveLiveReady = false;
+    const hint = $("goLiveReadyHint");
+    if (hint) { hint.textContent = "Checking safety…"; hint.style.color = ""; }
+    $("goLiveModal").style.display = "flex";
+
+    // Server-side safety gate. Mirrors what /api/go_live/confirm will check.
+    try {
+      const sr = await fetch("/api/safety/checklist");
+      const sd = await sr.json();
+      window._goLiveLiveReady = !!(sd && sd.live_ready);
+      if (hint) {
+        if (window._goLiveLiveReady) {
+          hint.textContent = "✓ Safety checklist live_ready: OK";
+          hint.style.color = "#22c55e";
+        } else {
+          hint.textContent = "⚠ Safety checklist not live_ready — fix issues on /safety first";
+          hint.style.color = "#ef4444";
+        }
+      }
+    } catch(_) {
+      window._goLiveLiveReady = false;
+      if (hint) { hint.textContent = "⚠ Could not verify safety checklist"; hint.style.color = "#ef4444"; }
+    }
+    _refreshGoLiveBtn();
+
+    // Fetch closed-deal stats. Backend route may vary across deployments —
+    // try the common one and degrade gracefully if it 404s/errors.
+    let total = 0, wins = 0, realized = 0, maxDDPct = 0;
+    try {
+      const res = await fetch("/api/bots/" + botId + "/deals?state=CLOSED&limit=200");
+      if (res.ok) {
+        const data = await res.json();
+        const deals = (data && (data.deals || data.items || data)) || [];
+        const arr = Array.isArray(deals) ? deals : [];
+        total = arr.length;
+        let peak = 0, equity = 0, troughDD = 0;
+        for (const d of arr) {
+          const pnl = Number(d.realized_pnl_quote ?? d.pnl ?? d.realized_pnl ?? 0) || 0;
+          realized += pnl;
+          if (pnl > 0) wins += 1;
+          equity += pnl;
+          if (equity > peak) peak = equity;
+          const dd = peak > 0 ? ((peak - equity) / Math.max(peak, 1) * 100) : 0;
+          if (dd > troughDD) troughDD = dd;
+        }
+        maxDDPct = troughDD;
+        const wr = total > 0 ? (wins / total * 100) : 0;
+        $("goLiveDeals").textContent = String(total);
+        $("goLiveWinRate").textContent = total > 0 ? (wr.toFixed(1) + "%") : "—";
+        $("goLiveRealized").textContent = (realized >= 0 ? "+" : "") + realized.toFixed(2);
+        $("goLiveDrawdown").textContent = total > 0 ? (maxDDPct.toFixed(1) + "%") : "—";
+      } else {
+        $("goLiveDeals").textContent = "—";
+        $("goLiveWinRate").textContent = "—";
+        $("goLiveRealized").textContent = "—";
+        $("goLiveDrawdown").textContent = "—";
+      }
+    } catch (_) {
+      $("goLiveDeals").textContent = "—";
+      $("goLiveWinRate").textContent = "—";
+      $("goLiveRealized").textContent = "—";
+      $("goLiveDrawdown").textContent = "—";
+    }
+
+    // Bug 13 + General: pre-flight checklist
+    const wrPct = total > 0 ? (wins / total * 100) : 0;
+    const setPF = (id, ok, label) => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.textContent = (ok ? "✓ " : "✗ ") + label;
+        el.style.color = ok ? "#22c55e" : "#ef4444";
+      }
+    };
+    setPF("pf_trades", total >= 20, `Closed trades: ${total}/20`);
+    setPF("pf_winrate", total > 0 && wrPct >= 40, `Win rate: ${total > 0 ? wrPct.toFixed(1) : "—"}% (need ≥ 40%)`);
+    setPF("pf_drawdown", total === 0 || maxDDPct <= 15, `Max drawdown: ${total > 0 ? maxDDPct.toFixed(1) : "—"}% (need ≤ 15%)`);
+
+    // API token + exposure checks. /api/safety/checklist exposes the
+    // granular booleans under .flags now that /api/safety_check is gone.
+    let tokenOk = false;
+    try {
+      const sc = await fetch("/api/safety/checklist").then(r => r.json()).catch(() => ({}));
+      tokenOk = !!(sc && sc.flags && sc.flags.api_auth_enabled);
+    } catch(_) {}
+    setPF("pf_token", tokenOk, tokenOk ? "WORKER_API_TOKEN is set" : "WORKER_API_TOKEN missing — see Safety page");
+
+    const baseQuote = Number(bot.base_quote || 0);
+    const exposurePct = Number(bot.per_symbol_exposure_pct || 0);
+    const cap = (Number(_PORTFOLIO_TOTAL_USD || 0) || 0) * exposurePct;
+    const exposureOk = !(baseQuote > 0 && cap > 0 && baseQuote > cap);
+    setPF("pf_exposure", exposureOk,
+      exposureOk
+        ? `Base order $${baseQuote.toFixed(2)} fits the per-symbol cap $${cap.toFixed(2)}`
+        : `Base order $${baseQuote.toFixed(2)} exceeds per-symbol cap $${cap.toFixed(2)} — bot will pause after first trade`);
+  }
+
+  function closeGoLiveModal(){
+    $("goLiveModal").style.display = "none";
+    _goLiveBotId = null;
+  }
+
+  function _refreshGoLiveBtn(){
+    const btn = $("goLiveConfirmBtn");
+    if (!btn) return;
+    const cInp = $("goLiveConfirmInput");
+    const typed = (cInp ? cInp.value : "").trim().toUpperCase();
+    btn.disabled = !(window._goLiveLiveReady && typed === "LIVE");
+  }
+  document.addEventListener("input", function(e){
+    if (e.target && e.target.id === "goLiveConfirmInput") _refreshGoLiveBtn();
+  });
+
+  async function confirmGoLive(){
+    if (!_goLiveBotId) return;
+    const errEl = $("goLiveError");
+    const btn = $("goLiveConfirmBtn");
+    const cInp = $("goLiveConfirmInput");
+    const typed = (cInp ? cInp.value : "").trim().toUpperCase();
+    if (typed !== "LIVE") {
+      errEl.textContent = 'Type "LIVE" exactly to confirm.';
+      errEl.style.display = "block";
+      return;
+    }
+    errEl.style.display = "none";
+    btn.disabled = true;
+    btn.textContent = "Promoting…";
+    try {
+      // Route through the safety-gated confirm endpoint. The server re-checks
+      // live_ready and writes the full checklist snapshot into the audit log.
+      const res = await fetch("/api/go_live/confirm", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({bot_id: _goLiveBotId, confirm: "LIVE"})
+      });
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+      if (res.ok && (data.ok !== false)) {
+        const id = _goLiveBotId;
+        closeGoLiveModal();
+        if (typeof showToast === "function") {
+          showToast("Bot Promoted to Live", "Bot #" + id + " is now in LIVE mode. Monitor closely for the first few trades.", "success");
+        }
+        setTimeout(() => window.location.reload(), 800);
+      } else {
+        errEl.textContent = data.error || ("HTTP " + res.status + ": failed to promote bot");
+        errEl.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Confirm — Go Live";
+      }
+    } catch (e) {
+      errEl.textContent = "Network error: " + (e && e.message || e);
+      errEl.style.display = "block";
+      btn.disabled = false;
+      btn.textContent = "Confirm — Go Live";
     }
   }
 
@@ -1037,26 +1530,68 @@
     const upnl = $("upnl-" + id);
 
     if(st){
-      var evLower = (lastEvent || '').toLowerCase();
-      var isErr = lastEvent && (evLower.indexOf("error") >= 0 || evLower.indexOf("unavailable") >= 0 || evLower.indexOf("blocked") >= 0);
-      var isRetry = lastEvent && (evLower.indexOf("retrying") >= 0 || evLower.indexOf("timed out") >= 0);
-      var isConfig = lastEvent && (evLower.indexOf("not initialized") >= 0 || evLower.indexOf("api key") >= 0 || evLower.indexOf(".env") >= 0);
-      var txt, cls;
-      if (running) { txt = "Running"; cls = "badge badge-success badge-dot badge-pulse"; }
-      else if (isConfig) { txt = "Config"; cls = "badge badge-warning badge-dot"; }
-      else if (isErr) { txt = "Blocked"; cls = "badge badge-danger badge-dot"; }
-      else if (isRetry) { txt = "Retry"; cls = "badge badge-warning badge-dot"; }
-      else { txt = "Paused"; cls = "badge badge-neutral badge-dot"; }
-      st.textContent = txt;
-      st.className = cls;
-      st.title = lastEvent || '';
+      var snapNow = BOT_SNAP[id] || {};
+      var ds = snapNow.__display_state;
+      if (ds && ds.state) {
+        // Prefer server-computed display_state (IDLE / WAITING_FOR_FILL / ...).
+        var urgencyClass = ({
+          error: 'stopped',
+          warn: 'paused',
+          normal: running ? 'running' : 'paused',
+        })[ds.urgency] || 'paused';
+        if (ds.state === 'STOPPED') urgencyClass = 'stopped';
+        st.innerHTML = '<span class="status-dot"></span> ' + (ds.label || ds.state);
+        st.className = "bot-status " + urgencyClass + (ds.spin ? ' busy' : '');
+      } else {
+        var evLower = (lastEvent || '').toLowerCase();
+        var decisionAction = String(snapNow.decision_action || '').toUpperCase();
+        var decisionReason = String(snapNow.decision_reason || '').toLowerCase();
+        var isExposurePause = decisionAction === 'PAUSE' && (
+          evLower.indexOf('per-symbol exposure') >= 0 || decisionReason.indexOf('per-symbol exposure') >= 0
+        );
+        var isErr = lastEvent && (evLower.indexOf("error") >= 0 || evLower.indexOf("unavailable") >= 0 || evLower.indexOf("blocked") >= 0);
+        var isRetry = lastEvent && (evLower.indexOf("retrying") >= 0 || evLower.indexOf("timed out") >= 0);
+        var isConfig = lastEvent && (evLower.indexOf("not initialized") >= 0 || evLower.indexOf("api key") >= 0 || evLower.indexOf(".env") >= 0);
+        var txt;
+        var statusClass = "stopped";
+        if (isExposurePause) { txt = "Paused — exposure cap"; statusClass = "paused"; }
+        else if (running) { txt = "Running"; statusClass = "running"; }
+        else if (isConfig) { txt = "Config"; statusClass = "paused"; }
+        else if (isErr) { txt = "Blocked"; statusClass = "stopped"; }
+        else if (isRetry) { txt = "Retry"; statusClass = "paused"; }
+        else { txt = "Paused"; statusClass = "paused"; }
+        st.innerHTML = '<span class="status-dot"></span> ' + txt;
+        st.className = "bot-status " + statusClass;
+      }
+      const polledAt = BOT_SNAP[id]?._polled_at;
+      const polledAgo = polledAt ? Math.round((Date.now() - polledAt) / 1000) : null;
+      var detail = (BOT_SNAP[id]?.__display_state?.detail) || (lastEvent || '');
+      st.title = detail + (polledAgo != null ? '\nPolled: ' + polledAgo + 's ago' : '');
     }
     if(ev){
       var evText = lastEvent || "—";
+      // Map internal status codes to human-friendly messages
+      const _statusMap = {
+        'regime risk_off': 'Market conditions not favorable — waiting for trend to improve',
+        'regime ranging': 'Market is sideways — waiting for clear direction',
+        'regime bear': 'Market in downtrend — waiting for reversal',
+        'regime strong_bear': 'Strong downtrend — holding off on new entries',
+        'entry not confirmed': 'Analyzing for optimal entry point — patience pays off',
+        'waiting for data': 'Collecting market data before making decisions',
+        'execution gate blocked': 'Trade conditions not met — spread or liquidity issue',
+        'global exposure cap reached': 'Portfolio fully deployed — protecting capital',
+        'per-symbol exposure cap reached': 'Per-symbol cap reached — increase “Per-symbol exposure %” or reduce Base order',
+        'daily loss limit': 'Daily loss limit hit — pausing to protect capital',
+        'too many open orders': 'Order limit reached — waiting for fills',
+      };
+      const evLow = evText.toLowerCase();
+      for (const [key, friendly] of Object.entries(_statusMap)) {
+        if (evLow.includes(key)) { evText = friendly; break; }
+      }
       var gate = BOT_SNAP[id]?.gate_details;
       if(gate && !gate.allowed && gate.spread_pct != null){
-        evText = `Spread: ${(gate.spread_pct*100).toFixed(3)}% (max ${(gate.spread_threshold*100).toFixed(3)}%)`;
-        if(gate.bid && gate.ask) evText += ` | Bid: ${gate.bid.toFixed(4)} Ask: ${gate.ask.toFixed(4)}`;
+        evText = `Spread: ${(Number(gate.spread_pct||0)*100).toFixed(3)}% (max ${(Number(gate.spread_threshold||0)*100).toFixed(3)}%)`;
+        if(gate.bid && gate.ask) evText += ` | Bid: ${Number(gate.bid).toFixed(4)} Ask: ${Number(gate.ask).toFixed(4)}`;
       }
       // Truncate long messages for table readability; full text on hover
       if (evText.length > 60) {
@@ -1069,7 +1604,29 @@
     if(act){
       var actText = lastEvent || "—";
       if (actText.length > 50) { act.title = actText; actText = actText.substring(0, 47) + '...'; }
-      act.textContent = actText;
+      // Health dot
+      const snap = BOT_SNAP[id];
+      let healthDot = '🟢';
+      let healthTip = 'Healthy';
+      if (snap) {
+        const lastCheck = snap.last_check_ts || snap.updated_ts || snap.last_event_ts || 0;
+        const now = Date.now() / 1000;
+        const ageSec = lastCheck > 0 ? now - lastCheck : 9999;
+        if (snap.last_poll_error) {
+          healthDot = '🔴';
+          healthTip = 'Last poll error: ' + String(snap.last_poll_error || '').substring(0, 120);
+        } else if (snap.last_error) {
+          healthDot = '🔴';
+          healthTip = 'Error: ' + (snap.last_error || '').substring(0, 80);
+        } else if (ageSec > 900) {
+          healthDot = '🟠';
+          healthTip = 'Stale: last check ' + Math.floor(ageSec/60) + 'm ago';
+        } else if (ageSec > 300) {
+          healthDot = '🟡';
+          healthTip = 'Slow: last check ' + Math.floor(ageSec/60) + 'm ago';
+        }
+      }
+      act.innerHTML = '<span class="health-dot" title="' + healthTip.replace(/"/g, '&quot;') + '">' + healthDot + '</span> ' + actText;
     }
     if(strat){
       strat.textContent = (BOT_SNAP[id]?.active_strategy || "—");
@@ -1080,7 +1637,19 @@
       reg.textContent = rl ? `${rl} (${(Number(rc || 0)*100).toFixed(0)}%)` : "—";
     }
     if(risk){
-      risk.textContent = BOT_SNAP[id]?.risk_state || "—";
+      const rlvl = BOT_SNAP[id]?.risk_level || "OK";
+      const rreason = BOT_SNAP[id]?.risk_reason || "";
+      const rSince = BOT_SNAP[id]?.risk_since_ts || 0;
+      if(rlvl === "CRITICAL"){
+        risk.innerHTML = `<span style="color:#ef4444;font-weight:700;" title="${rreason}">CRITICAL</span>` +
+          ` <button onclick="clearRiskFlag(${id})" style="font-size:10px;padding:2px 6px;background:#ef4444;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Acknowledge risk and resume">Acknowledge</button>`;
+      } else if(rlvl === "CAUTION"){
+        risk.innerHTML = `<span style="color:#f59e0b;font-weight:600;" title="${rreason}">CAUTION</span>`;
+      } else if(rlvl === "WARNING"){
+        risk.innerHTML = `<span style="color:#eab308;" title="${rreason}">WARNING</span>`;
+      } else {
+        risk.innerHTML = `<span style="color:var(--muted);">OK</span>`;
+      }
     }
     if(px){
       if(lastPrice == null || Number.isNaN(Number(lastPrice))){
@@ -1088,7 +1657,7 @@
         px.className = "right mono muted";
       }else{
         const p = Number(lastPrice);
-        px.textContent = "$" + p.toFixed(2);
+        px.textContent = "$" + (p < 0.01 ? p.toFixed(6) : p < 10 ? p.toFixed(4) : p.toFixed(2));
         px.className = "right mono";
       }
     }
@@ -1106,11 +1675,16 @@
     if(upnl){
       if(window.__botUpnl && window.__botUpnl[id] != null){
         const v = Number(window.__botUpnl[id]);
-        const isPos = v > 0;
-        const isNeg = v < 0;
-        const sign = isPos ? "+" : "";
-        upnl.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + v.toFixed(2);
-        upnl.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
+        if(Number.isNaN(v)){
+          upnl.textContent = "—";
+          upnl.className = "right mono muted";
+        }else{
+          const isPos = v > 0;
+          const isNeg = v < 0;
+          const sign = isPos ? "+" : "";
+          upnl.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + v.toFixed(2);
+          upnl.className = "right mono " + (isPos ? "pnl-positive" : isNeg ? "pnl-negative" : "muted");
+        }
       }else{
         upnl.textContent = "—";
         upnl.className = "right mono";
@@ -1118,25 +1692,41 @@
     }
   }
 
+  const _retryCounters = {};
+  const _lastGoodSnap = {};
+
   async function refreshStatusRow(id){
     try{
-      // Add timeout protection
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout for status
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
       let data;
       try {
         data = await getJSON(`/api/bots/${id}/status`, { signal: controller.signal });
         clearTimeout(timeoutId);
+        _retryCounters[id] = 0;
       } catch (err) {
         clearTimeout(timeoutId);
-        if (err.name === "AbortError") {
-          setRowStatus(id, false, "Waiting for data (retrying…)", null);
-          return;
+        _retryCounters[id] = (_retryCounters[id] || 0) + 1;
+        const retries = _retryCounters[id];
+        const maxTry = 5;
+        const errMsg = (err && String(err.message || err)) || "";
+        const isGateway = /502|503|504|Server unreachable|Bad Gateway|proxy/i.test(errMsg);
+        if (retries >= maxTry) {
+          const hint = isGateway
+            ? "Site unreachable (server restarting or down). Open /health or wait and refresh."
+            : "API unreachable after " + retries + " attempts — check connection";
+          setRowStatus(id, false, hint, _lastGoodSnap[id]?.last_price || null);
+        } else if (_lastGoodSnap[id]) {
+          setRowStatus(id, !!_lastGoodSnap[id].running, _lastGoodSnap[id].last_event + " (retry " + retries + "/" + maxTry + ")", _lastGoodSnap[id].last_price);
+        } else {
+          setRowStatus(id, false, (isGateway ? "Connecting to server" : "Waiting for data") + " (retry " + retries + "/" + maxTry + ")", null);
         }
-        throw err;
+        return;
       }
       const snap = data.snap || {};
       BOT_SNAP[id] = snap || {};
+      _lastGoodSnap[id] = snap;
+      snap._polled_at = Date.now();
       const avg = snap.avg_entry;
       const last = snap.last_price;
       const pos = snap.base_pos;
@@ -1146,8 +1736,30 @@
       window.__botUpnl[id] = (avg != null && last != null && pos != null)
         ? (Number(last) - Number(avg)) * Number(pos)
         : null;
+      // Cache server-provided display_state (IDLE / WAITING_FOR_FILL / FILLED
+      // / MANAGING / CLOSING / ERROR / PAUSED / COOLDOWN / STOPPED)
+      try { BOT_SNAP[id].__display_state = data.display_state || null; } catch(_){}
       setRowStatus(id, !!snap.running, snap.last_event, snap.last_price);
+      // Paint realized_pnl + position_pct_of_capital live values
+      try {
+        const rp = $("rpnl-" + id);
+        if (rp && snap.realized_pnl != null) {
+          const v = Number(snap.realized_pnl || 0);
+          const sign = v > 0 ? '+' : '';
+          rp.textContent = (v !== 0 ? (v > 0 ? '▲ ' : '▼ ') : '') + sign + v.toFixed(2);
+          rp.className = 'right mono ' + (v > 0 ? 'pnl-positive' : v < 0 ? 'pnl-negative' : 'muted');
+        }
+        const posEl = $("pos-" + id);
+        if (posEl && snap.position_pct_of_capital != null) {
+          posEl.title = snap.position_pct_of_capital + '% of portfolio';
+        }
+      } catch(_){}
     }catch(e){
+      _retryCounters[id] = (_retryCounters[id] || 0) + 1;
+      if (_lastGoodSnap[id]) {
+        // Keep last known status
+        return;
+      }
       const raw = (e && e.message) ? String(e.message) : "Status unavailable";
       const msg = raw.replace(/^[^>]+ -> /, "").trim().slice(0, 80);
       setRowStatus(id, false, "Error: " + msg, null);
@@ -1155,31 +1767,82 @@
     try{
       const stats = await getJSON(`/api/bots/${id}/dealstats`);
       const rp = $("rpnl-" + id);
+      const closedCount = (stats.stats || {}).closed_count || 0;
       const realized = Number((stats.stats || {}).realized_total || 0);
       if(rp){
-        const isPos = realized > 0;
-        const isNeg = realized < 0;
-        const sign = isPos ? "+" : "";
-        rp.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + realized.toFixed(2);
-        rp.className = "right mono " + (isPos ? "pos" : isNeg ? "neg" : "muted");
+        if(closedCount === 0){
+          // No closed deals yet — show dash, not misleading green zero
+          rp.textContent = "—";
+          rp.className = "right mono muted";
+        } else {
+          const isPos = realized > 0;
+          const isNeg = realized < 0;
+          const sign = isPos ? "+" : "";
+          rp.textContent = (isPos ? "▲ " : isNeg ? "▼ " : "") + sign + realized.toFixed(2);
+          rp.className = "right mono " + (isPos ? "pnl-positive" : isNeg ? "pnl-negative" : "muted");
+        }
       }
     }catch(e){
       const rp = $("rpnl-" + id);
       if(rp){
         rp.textContent = "—";
-        rp.className = "right mono";
+        rp.className = "right mono muted";
       }
     }
+    // Fetch and show performance summary (win rate tooltip on realized)
+    fetch('/api/bots/' + id + '/performance').then(r => r.json()).then(p => {
+      if (p.ok) {
+        const realizedEl = $("rpnl-" + id);
+        if (realizedEl) {
+          realizedEl.title = "Realized: $" + (p.realized_pnl || 0).toFixed(2) + " | Deals: " + (p.deals_closed || 0) + " | Win rate: " + (p.win_rate || 0) + "%";
+        }
+      }
+    }).catch(() => {});
   }
 
   async function refreshAllStatuses(){
     const rows = document.querySelectorAll("tr[data-bot-id]");
     const ids = Array.from(rows).map(r => Number(r.getAttribute("data-bot-id")));
     for(const id of ids){
-      refreshStatusRow(id);
+      await refreshStatusRow(id);
     }
     const sp = document.getElementById("lastRefreshSpan");
     if(sp) sp.textContent = "Last refresh: " + new Date().toLocaleTimeString();
+
+    // Update active bot count in header
+    let activeCount = 0;
+    let hasCritical = false;
+    let criticalBots = [];
+    for (const [botId, snap] of Object.entries(BOT_SNAP)) {
+      if (snap && snap.running) activeCount++;
+      if (snap && snap.risk_level === 'CRITICAL') {
+        hasCritical = true;
+        criticalBots.push({id: botId, reason: snap.risk_reason || snap.risk_state || 'Unknown', symbol: snap.symbol || ''});
+      }
+    }
+    const countEl = document.querySelector('.page-head .muted');
+    // Update active count in any visible counter
+    document.querySelectorAll('[data-active-count]').forEach(el => {
+      el.textContent = activeCount;
+    });
+
+    // CRITICAL risk banner (Bots BUG 4)
+    let banner = document.getElementById('criticalRiskBanner');
+    if (hasCritical) {
+      if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'criticalRiskBanner';
+        banner.style.cssText = 'position:sticky;top:0;z-index:100;padding:12px 20px;background:#7f1d1d;border-bottom:2px solid #ef4444;color:#fecaca;font-size:13px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
+        const pageEl = document.querySelector('.page');
+        if (pageEl) pageEl.insertBefore(banner, pageEl.firstChild);
+      }
+      banner.innerHTML = '🚨 <strong>CRITICAL RISK</strong> — ' + criticalBots.map(b =>
+        `Bot #${b.id} (${b.symbol}): ${b.reason} <button onclick="clearRiskFlag(${b.id})" style="padding:2px 8px;background:#ef4444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;margin-left:4px;">Acknowledge</button>`
+      ).join(' | ');
+      banner.style.display = 'flex';
+    } else if (banner) {
+      banner.style.display = 'none';
+    }
   }
 
   async function refreshSymbols(){
@@ -1268,6 +1931,29 @@
           openCreate(symbol, mappedStrategy, suggestedBudget, marketType);
         }, 500);
       }
+    } else if (params.get("openCreate") === "1") {
+      // Strategy Leaderboard "Launch Bot →" path — pre-fill strategy and (optionally)
+      // flip the mode to live. No symbol is supplied; user picks it in the modal.
+      const stratParam = params.get("strategy") || "";
+      const modeParam = (params.get("mode") || "").toLowerCase();
+      setTimeout(() => {
+        openCreate(null, stratParam || null, null, "crypto");
+        if (stratParam) {
+          const stratEl = document.getElementById("f_strategy");
+          if (stratEl) {
+            // Best-effort match: try the option value directly, else search labels.
+            const opts = Array.from(stratEl.options);
+            const match = opts.find(o => o.value === stratParam) ||
+                          opts.find(o => o.value.toLowerCase() === stratParam.toLowerCase()) ||
+                          opts.find(o => (o.textContent || "").toLowerCase().includes(stratParam.toLowerCase()));
+            if (match) stratEl.value = match.value;
+          }
+        }
+        if (modeParam === "live") {
+          const dryEl = document.getElementById("f_dry");
+          if (dryEl) dryEl.value = "0";
+        }
+      }, 400);
     } else {
       // Legacy prefill support
       const prefillSymbol = params.get("prefill_symbol");
@@ -1299,8 +1985,9 @@
       const upnl = parseFloat(row.querySelector("[id^='upnl-']")?.textContent) || 0;
 
       let show = true;
-      if(filter === "running") show = status.includes("RUNNING");
-      else if(filter === "paused") show = status.includes("PAUSED");
+      const statusLower = status.toLowerCase();
+      if(filter === "running") show = statusLower.includes("running");
+      else if(filter === "paused") show = statusLower.includes("paused");
       else if(filter === "profitable") show = upnl > 0;
 
       row.style.display = show ? "" : "none";
@@ -1381,16 +2068,81 @@
     });
   }
 
-  // Update portfolio summary
+  // Update portfolio summary — also compute from bot snapshots as fallback
   async function updatePortfolioSummary(){
     try{
       const r = await fetch("/api/portfolio");
-      const portfolio = await r.json();
-      document.getElementById("portfolioTotal").textContent = "$" + (portfolio.total_usd || 0).toFixed(2);
-      document.getElementById("portfolioTodayPnL").textContent = (portfolio.pnl_today >= 0 ? "+" : "") + (portfolio.pnl_today || 0).toFixed(2) + " USD";
-      document.getElementById("portfolioAllTimePnL").textContent = (portfolio.pnl_all_time >= 0 ? "+" : "") + (portfolio.pnl_all_time || 0).toFixed(2) + " USD";
+      const data = await r.json();
+      console.debug("[portfolio] raw:", data);
+      const port = data.portfolio || data || {};
+      const history = data.history || [];
+      let _tot = Number(port.total_usd || port.total_value || port.equity) || 0;
+
+      // Fallback: sum from bot snapshots if portfolio API returns 0
+      if (_tot === 0 && BOT_SNAP) {
+        let totalFromBots = 0;
+        for (const [, snap] of Object.entries(BOT_SNAP)) {
+          const pos = Number(snap.base_pos || 0);
+          const px = Number(snap.last_price || 0);
+          totalFromBots += pos * px;
+        }
+        if (totalFromBots > 0) _tot = totalFromBots;
+      }
+
+      const totalEl = document.getElementById("portfolioTotal");
+      if (totalEl) totalEl.textContent = _tot > 0 ? "$" + _tot.toFixed(2) : "—";
+
+      // Today P&L from realized deals
+      let _today = 0;
+      try {
+        const pnlRes = await fetch("/api/dashboard/pnl-history?days=1");
+        const pnlData = await pnlRes.json();
+        if (pnlData.ok && pnlData.data && pnlData.data.length > 0) {
+          _today = pnlData.data.reduce((s, d) => s + (d.pnl || 0), 0);
+        }
+      } catch(pe) { console.debug("[portfolio] pnl fetch failed:", pe); }
+
+      if (_today === 0 && history.length > 0 && _tot > 0) {
+        const now = Date.now() / 1000;
+        const target24h = now - 86400;
+        const oldest = history.reduce((best, h) =>
+          Math.abs(h.ts - target24h) < Math.abs(best.ts - target24h) ? h : best
+        , history[0]);
+        _today = _tot - (oldest.total_usd || _tot);
+      }
+      const todayEl = document.getElementById("portfolioTodayPnL");
+      if (todayEl) {
+        if (_today !== 0) {
+          todayEl.textContent = (_today >= 0 ? "+" : "") + _today.toFixed(2) + " USD";
+          todayEl.className = "card-value " + (_today >= 0 ? "pos" : "neg");
+        } else {
+          todayEl.textContent = "$0.00";
+        }
+      }
+
+      // All-time from deals
+      let _allTime = 0;
+      try {
+        const allRes = await fetch("/api/dashboard/pnl-history?days=365");
+        const allData = await allRes.json();
+        if (allData.ok && allData.data) _allTime = allData.data.reduce((s, d) => s + (d.pnl || 0), 0);
+      } catch(ae) { console.debug("[portfolio] all-time fetch failed:", ae); }
+
+      if (_allTime === 0 && history.length > 0 && _tot > 0) {
+        const first = history[0];
+        _allTime = _tot - (first.total_usd || _tot);
+      }
+      const allTimeEl = document.getElementById("portfolioAllTimePnL");
+      if (allTimeEl) {
+        if (_allTime !== 0) {
+          allTimeEl.textContent = (_allTime >= 0 ? "+" : "") + _allTime.toFixed(2) + " USD";
+          allTimeEl.className = "card-value " + (_allTime >= 0 ? "pos" : "neg");
+        } else {
+          allTimeEl.textContent = "$0.00";
+        }
+      }
     }catch(e){
-      console.warn("Failed to update portfolio summary", e);
+      console.warn("[portfolio] updatePortfolioSummary failed:", e);
     }
   }
 
@@ -1433,8 +2185,8 @@
     document.getElementById("f_base").value = template.base_quote;
     document.getElementById("f_safety").value = template.base_quote;
     document.getElementById("f_max_safety").value = template.max_safety;
-    document.getElementById("f_tp").value = (template.tp * 100).toFixed(2);
-    document.getElementById("f_first_dev").value = (template.first_dev * 100).toFixed(2);
+    document.getElementById("f_tp_pct").value = (template.tp * 100).toFixed(2);
+    document.getElementById("f_first_dev").value = template.first_dev;
     document.getElementById("f_step_mult").value = template.step_mult;
     document.getElementById("f_strategy").value = template.strategy;
 
@@ -1468,9 +2220,34 @@
       document.getElementById("f_base").value = botData.base_quote;
       document.getElementById("f_safety").value = botData.safety_quote;
 
+      // Reveal the "Clone Mode" toggle so the user can flip this clone to live
+      // without having to hunt for the Mode select. Only meaningful when the
+      // source bot is in dry run — for live → clone, the choice is moot.
+      const toggle = $("cloneModeToggle");
+      if (toggle) {
+        toggle.style.display = botData.dry_run ? "block" : "none";
+        const r0 = document.querySelector('input[name="cloneAsLive"][value="0"]');
+        const r1 = document.querySelector('input[name="cloneAsLive"][value="1"]');
+        if (r0) r0.checked = true;
+        if (r1) r1.checked = false;
+      }
+
       showToast("Clone Ready", `All settings copied from ${botData.name}. Modify as needed.`, "info");
     } catch (e) {
       showToast("Error", "Failed to clone bot: " + e.message, "error");
+    }
+  }
+
+  // Bridge between the Clone Mode radios and the existing Mode <select>.
+  // When the user picks "Clone as Live", we just flip f_dry — saveBot() reads
+  // f_dry as the source of truth so no other plumbing is needed.
+  function onCloneModeChange(value){
+    const dryEl = $("f_dry");
+    if (!dryEl) return;
+    if (String(value) === "1") {
+      dryEl.value = "0";  // Live (real money)
+    } else {
+      dryEl.value = "1";  // Dry run
     }
   }
 
@@ -1539,7 +2316,7 @@
         let imported = 0;
         for (const cfg of configs) {
           try {
-            const r = await fetch("/api/bots/create", {
+            const r = await fetch("/api/bots", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(cfg)
