@@ -31,12 +31,12 @@ class TestExploreV2Gates(unittest.TestCase):
         self.assertIn("volume", reason.lower())
 
     def test_gate_blocks_wide_spread(self):
-        from explore_v2 import apply_universe_gates
-        # Volume high enough to pass; spread 150 > MAX_SPREAD_BPS (100)
+        from explore_v2 import apply_universe_gates, MAX_SPREAD_BPS
+        # Volume high enough to pass; spread must exceed configured ceiling (default 200 bps).
         ok, reason = apply_universe_gates(
             "BTC/USD",
             volume_24h_quote=15_000_000,
-            spread_bps=150,
+            spread_bps=float(MAX_SPREAD_BPS) + 50.0,
         )
         self.assertFalse(ok)
         self.assertIn("spread", reason.lower())

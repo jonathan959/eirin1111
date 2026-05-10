@@ -11,3 +11,6 @@ os.chdir(_root)
 
 from env_utils import load_env
 load_env()  # uses ENV_FILE or project root .env
+# Starlette TestClient uses ASGI client "testserver", not loopback — if WORKER_API_TOKEN is
+# set from .env, /api/* would 401 without X-API-Key. Tests expect open access.
+os.environ["WORKER_API_TOKEN"] = ""

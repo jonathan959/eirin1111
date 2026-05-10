@@ -191,7 +191,6 @@ from db import (
     get_strategy_win_rates,
     set_setting,
     get_setting,
-    get_strategy_leaderboard,
     get_trade_journal,
     upsert_trade_journal,
     list_trade_journals_for_deals,
@@ -203,6 +202,13 @@ from db import (
     list_portfolio_equity_curve,
     get_latest_regime_for_symbols,
 )
+
+
+def get_strategy_leaderboard(window_days: int = 90):
+    """Journal + backtest fallback leaderboard (exposed for templates / safety_checklist)."""
+    from services.leaderboard import build_leaderboard
+
+    return build_leaderboard(window_days=int(window_days), min_live_trades=10)
 
 
 from kraken_client import KrakenClient
@@ -2433,8 +2439,14 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
         # Stock path - Alpaca preferred; Yahoo Finance fallback when Alpaca not configured (minimal mode)
         client = alpaca_live if alpaca_live else alpaca_paper
         try:
-            import yfinance as yf
+            try:
+                import yfinance as yf  # type: ignore
+            except ModuleNotFoundError:
+                yf = None  # type: ignore
+
             def _yf_candles(sym: str, interval: str, period: str) -> list:
+                if yf is None:
+                    return []
                 try:
                     t = yf.Ticker(sym)
                     hist = t.history(period=period, interval=interval)
@@ -2455,21 +2467,36 @@ def _scan_symbol(symbol: str, horizon: str, btc_ctx: Dict[str, Any]) -> Dict[str
                 except Exception:
                     return []
 
-            candles_1h = _scan_ohlcv_get(symbol, "1h", 300) or \
-                         _yf_candles(symbol, "1h", "60d")
-            if candles_1h: _scan_ohlcv_put(symbol, "1h", 300, candles_1h)
+            def _phase2_candles(sym: str, tf: str, periods: int) -> list:
+                try:
+                    from phase2_data_fetcher import fetch_recent_candles
+                    return fetch_recent_candles(sym, timeframe=tf, periods=int(periods)) or []
+                except Exception:
+                    return []
 
-            candles_4h = _scan_ohlcv_get(symbol, "4h", 300) or \
-                         _yf_candles(symbol, "4h", "180d")
-            if candles_4h: _scan_ohlcv_put(symbol, "4h", 300, candles_4h)
+            candles_1h = _scan_ohlcv_get(symbol, "1h", 300) or _yf_candles(symbol, "1h", "60d")
+            if not candles_1h or len(candles_1h) < 8:
+                candles_1h = candles_1h or _phase2_candles(symbol, "1h", 300)
+            if candles_1h:
+                _scan_ohlcv_put(symbol, "1h", 300, candles_1h)
 
-            candles_1d = _scan_ohlcv_get(symbol, "1d", 500) or \
-                         _yf_candles(symbol, "1d", "2y")
-            if candles_1d: _scan_ohlcv_put(symbol, "1d", 500, candles_1d)
+            candles_4h = _scan_ohlcv_get(symbol, "4h", 300) or _yf_candles(symbol, "4h", "180d")
+            if not candles_4h or len(candles_4h) < 8:
+                candles_4h = candles_4h or _phase2_candles(symbol, "4h", 300)
+            if candles_4h:
+                _scan_ohlcv_put(symbol, "4h", 300, candles_4h)
 
-            candles_1w = _scan_ohlcv_get(symbol, "1w", 300) or \
-                         _yf_candles(symbol, "1wk", "5y")
-            if candles_1w: _scan_ohlcv_put(symbol, "1w", 300, candles_1w)
+            candles_1d = _scan_ohlcv_get(symbol, "1d", 500) or _yf_candles(symbol, "1d", "2y")
+            if not candles_1d or len(candles_1d) < 20:
+                candles_1d = candles_1d or _phase2_candles(symbol, "1d", 500)
+            if candles_1d:
+                _scan_ohlcv_put(symbol, "1d", 500, candles_1d)
+
+            candles_1w = _scan_ohlcv_get(symbol, "1w", 300) or _yf_candles(symbol, "1wk", "5y")
+            if not candles_1w or len(candles_1w) < 8:
+                candles_1w = candles_1w or _phase2_candles(symbol, "1w", 300)
+            if candles_1w:
+                _scan_ohlcv_put(symbol, "1w", 300, candles_1w)
 
             if candles_1h or candles_1d:
                 _alpaca_last_candle_ts = time.time()
@@ -5235,6 +5262,7 @@ def _startup_impl():
         pass
     from db import DB_NAME
     _STARTUP_STATUS["db_path"] = DB_NAME
+    _STARTUP_STATUS["db_path_abs"] = os.path.abspath(DB_NAME)
     _STARTUP_STATUS["timestamp"] = int(time.time())
     try:
         from db import start_wal_checkpoint_thread
@@ -5250,7 +5278,8 @@ def _startup_impl():
         _STARTUP_STATUS["env_loaded_paths"] = env_res.get("loaded_paths") or []
     except Exception:
         _STARTUP_STATUS["env_loaded_paths"] = []
-    logger.info("Database: %s (%s bots)", DB_NAME, _STARTUP_STATUS.get("db_bots", 0))
+    _db_abs = os.path.abspath(DB_NAME)
+    logger.info("Database: %s (abs=%s) (%s bots)", DB_NAME, _db_abs, _STARTUP_STATUS.get("db_bots", 0))
 
     # Purge blocklisted symbols from recommendations (Explore tab)
     try:
@@ -6284,6 +6313,13 @@ def api_health_deep():
         expanded["last_reco_long_ts"] = _last_reco_long_ts
         expanded["kraken_last_candle_ts"] = _kraken_last_candle_ts
         expanded["alpaca_last_candle_ts"] = _alpaca_last_candle_ts
+        try:
+            from db import DB_NAME as _db_name
+            expanded["db_path"] = _db_name
+            expanded["db_path_abs"] = os.path.abspath(_db_name)
+        except Exception:
+            expanded.setdefault("db_path", None)
+            expanded.setdefault("db_path_abs", None)
         expanded["uptime_sec"] = int(time.time() - _APP_START_TIME) if _APP_START_TIME else 0
         try:
             expanded["last_autopilot_heartbeat_ts"] = int(get_setting("autopilot_last_heartbeat_ts", "0") or 0) or None
@@ -7600,10 +7636,12 @@ def api_bot_decisions(bot_id: int, limit: int = 100):
 
 
 @app.get("/api/strategies/leaderboard")
-def api_strategies_leaderboard(window_days: int = 90):
-    """Strategy performance leaderboard: Sharpe, win rate, drawdown."""
-    rows = get_strategy_leaderboard(window_days=int(min(365, max(7, window_days))))
-    return _json({"ok": True, "strategies": rows, "window_days": window_days})
+def api_strategies_leaderboard(window: Optional[int] = None, window_days: int = 90):
+    """Strategy leaderboard: live journal + backtest / inline fallback (see services.leaderboard)."""
+    wd = int(window) if window is not None else int(window_days)
+    wd = int(min(365, max(7, wd)))
+    rows = get_strategy_leaderboard(window_days=wd)
+    return _json({"ok": True, "strategies": rows, "window_days": wd})
 
 
 @app.get("/api/recommendations/scan_status")

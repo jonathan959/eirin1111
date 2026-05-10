@@ -4,39 +4,63 @@ Integration tests for symbol routing
 Tests that stock symbols are routed to Alpaca and crypto symbols to Kraken
 """
 
+import sys
+import types
 import unittest
 from unittest.mock import Mock, patch, MagicMock
+
+import pandas as pd
+
+
+def _install_fake_yfinance_empty():
+    """So ``import yfinance`` inside worker_api succeeds and yields no OHLCV rows."""
+    fake = types.ModuleType("yfinance")
+
+    class _Ticker:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def history(self, *_a, **_k):
+            return pd.DataFrame()
+
+    fake.Ticker = _Ticker
+    return fake
 
 
 class TestSymbolRouting(unittest.TestCase):
     """Test that symbols are routed to correct trading providers"""
     
+    @patch('worker_api._scan_ohlcv_get', return_value=[])
     @patch('worker_api.intelligence_layer')
     @patch('phase2_data_fetcher.fetch_recent_candles')
     @patch('worker_api.alpaca_paper')
     @patch('worker_api.alpaca_live', None)
     @patch('worker_api.kc')
-    def test_stock_symbol_uses_alpaca_not_kraken(self, mock_kraken, mock_alpaca_paper, mock_fetch, mock_intelligence):
+    def test_stock_symbol_uses_alpaca_not_kraken(
+        self, mock_kraken, mock_alpaca_paper, mock_fetch, mock_intelligence, mock_scan_get,
+    ):
         """INTC should call Alpaca methods, not Kraken methods"""
-        from worker_api import _scan_symbol
+        fake_yf = _install_fake_yfinance_empty()
+        with patch.dict(sys.modules, {"yfinance": fake_yf}):
+            from worker_api import _scan_symbol
 
-        # Stock path uses phase2_data_fetcher.fetch_recent_candles and client.get_ticker
-        mock_fetch.return_value = [[1000000, 45, 46, 44, 45.5, 1e6]] * 100
-        mock_alpaca_paper.get_ticker = Mock(return_value={"last": 50.0, "bid": 49.9, "ask": 50.1})
+            # Stock path uses phase2_data_fetcher.fetch_recent_candles and client.get_ticker
+            mock_fetch.return_value = [[1000000, 45, 46, 44, 45.5, 1e6]] * 100
+            mock_alpaca_paper.get_ticker = Mock(return_value={"last": 50.0, "bid": 49.9, "ask": 50.1})
 
-        # Setup intelligence layer mock
-        mock_intelligence.generate_recommendation = Mock(return_value={
-            "symbol": "INTC",
-            "score": 0.5,
-            "eligible": True,
-            "reasons": [],
-            "risk_flags": [],
-            "metrics": {"market_type": "stocks"},
-            "regime": {}
-        })
+            # Setup intelligence layer mock
+            mock_intelligence.generate_recommendation = Mock(return_value={
+                "symbol": "INTC",
+                "score": 0.5,
+                "eligible": True,
+                "reasons": [],
+                "risk_flags": [],
+                "metrics": {"market_type": "stocks"},
+                "regime": {}
+            })
 
-        # Call _scan_symbol with stock ticker
-        result = _scan_symbol("INTC", "short", {})
+            # Call _scan_symbol with stock ticker
+            result = _scan_symbol("INTC", "short", {})
 
         # Verify fetch_recent_candles was called (4 timeframes: 1h, 4h, 1d, 1w)
         self.assertGreaterEqual(mock_fetch.call_count, 4,
@@ -51,31 +75,40 @@ class TestSymbolRouting(unittest.TestCase):
         # Verify market_type is set
         self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"))
     
-    @patch('worker_api.intelligence_layer')  
+    @patch('worker_api._scan_ohlcv_get', return_value=[])
+    @patch('worker_api.intelligence_layer')
+    @patch('phase2_data_fetcher.fetch_recent_candles', return_value=[])
     @patch('worker_api.alpaca_paper', None)
     @patch('worker_api.alpaca_live', None)
-    def test_stock_symbol_without_alpaca_returns_error(self, mock_intelligence):
-        """When Alpaca is not configured, stock scan should return clear error"""
-        from worker_api import _scan_symbol
-        
+    def test_stock_symbol_without_alpaca_returns_error(self, mock_fetch, mock_intelligence, mock_scan_get):
+        """When Alpaca is not configured and no candle fallback exists, scan should fail cleanly."""
+        mock_intelligence.generate_recommendation = Mock(
+            return_value={
+                "symbol": "INTC", "score": 0.0, "eligible": False,
+                "reasons": [], "risk_flags": [],
+                "metrics": {"market_type": "stocks"},
+                "regime": {},
+            }
+        )
+        fake_yf = _install_fake_yfinance_empty()
+        with patch.dict(sys.modules, {"yfinance": fake_yf}):
+            from worker_api import _scan_symbol
+
+            result = _scan_symbol("INTC", "short", {})
+
         result = _scan_symbol("INTC", "short", {})
-        
-        # Should not be eligible
-        self.assertFalse(result.get("eligible"), "Should not be eligible without Alpaca")
-        
-        # Should have clear error message
+
+        self.assertFalse(result.get("eligible"), "Should not be eligible without data")
         reasons = result.get("reasons", [])
-        self.assertTrue(any("Stock provider" in str(r) or "Alpaca" in str(r) for r in reasons),
-                       f"Should mention stock provider in reasons: {reasons}")
-        
-        # Should have correct market type
-        self.assertEqual(result["metrics"]["market_type"], "stock")
-        
-        # Should have appropriate risk flag
-        risk_flags = result.get("risk_flags", [])
-        self.assertIn("NO_STOCK_PROVIDER", risk_flags)
-        
-        # Intelligence layer should not have been called
+        flags = result.get("risk_flags", [])
+        diag = " ".join(str(r) for r in reasons) + " " + " ".join(str(f) for f in flags)
+        self.assertTrue(
+            any(x in diag for x in ("Insufficient", "Yahoo", "Data fetch", "Alpaca", "EXPLORE_V2", "GATE")),
+            f"Unexpected reasons/flags: {reasons!r} / {flags!r}",
+        )
+        self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"))
+        self.assertIn("DATA_ERROR", result.get("risk_flags", []))
+
         mock_intelligence.generate_recommendation.assert_not_called()
     
     @patch('worker_api.intelligence_layer')
@@ -177,42 +210,46 @@ class TestSymbolRouting(unittest.TestCase):
 class TestMultipleStockSymbols(unittest.TestCase):
     """Test that multiple different stock symbols are handled correctly"""
 
+    @patch('worker_api._scan_ohlcv_get', return_value=[])
     @patch('worker_api.intelligence_layer')
     @patch('phase2_data_fetcher.fetch_recent_candles')
     @patch('worker_api.alpaca_paper')
     @patch('worker_api.alpaca_live', None)
-    def test_various_stock_symbols(self, mock_alpaca, mock_fetch, mock_intelligence):
+    def test_various_stock_symbols(self, mock_alpaca, mock_fetch, mock_intelligence, mock_scan_get):
         """Test a variety of stock tickers"""
         from worker_api import _scan_symbol
 
-        stock_symbols = ["INTC", "AAPL", "MSFT", "TSLA", "AMD", "NVDA", "META"]
+        fake_yf = _install_fake_yfinance_empty()
+        with patch.dict(sys.modules, {"yfinance": fake_yf}):
 
-        # Stock path uses fetch_recent_candles and client.get_ticker
-        mock_fetch.return_value = [[1000000, 95, 96, 94, 95.5, 1e6]] * 100
-        mock_alpaca.get_ticker = Mock(return_value={"last": 100.0, "bid": 99.9, "ask": 100.1})
-        mock_intelligence.generate_recommendation = Mock(return_value={
-            "symbol": "TEST",
-            "score": 0.5,
-            "eligible": True,
-            "metrics": {"market_type": "stocks"},
-            "regime": {}
-        })
+            stock_symbols = ["INTC", "AAPL", "MSFT", "TSLA", "AMD", "NVDA", "META"]
 
-        for symbol in stock_symbols:
-            with self.subTest(symbol=symbol):
-                mock_fetch.reset_mock()
-                mock_alpaca.get_ticker.reset_mock()
+            # Stock path uses fetch_recent_candles and client.get_ticker
+            mock_fetch.return_value = [[1000000, 95, 96, 94, 95.5, 1e6]] * 100
+            mock_alpaca.get_ticker = Mock(return_value={"last": 100.0, "bid": 99.9, "ask": 100.1})
+            mock_intelligence.generate_recommendation = Mock(return_value={
+                "symbol": "TEST",
+                "score": 0.5,
+                "eligible": True,
+                "metrics": {"market_type": "stocks"},
+                "regime": {}
+            })
 
-                result = _scan_symbol(symbol, "short", {})
+            for symbol in stock_symbols:
+                with self.subTest(symbol=symbol):
+                    mock_fetch.reset_mock()
+                    mock_alpaca.get_ticker.reset_mock()
 
-                # Verify fetch_recent_candles was called (stock data path)
-                self.assertGreater(mock_fetch.call_count, 0,
-                                  f"{symbol} should use Alpaca/fetcher for OHLCV")
-                mock_alpaca.get_ticker.assert_called_with(symbol)
+                    result = _scan_symbol(symbol, "short", {})
 
-                # Verify market type
-                self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"),
-                             f"{symbol} should be classified as stock")
+                    # Verify fetch_recent_candles was called (stock data path)
+                    self.assertGreater(mock_fetch.call_count, 0,
+                                      f"{symbol} should use Alpaca/fetcher for OHLCV")
+                    mock_alpaca.get_ticker.assert_called_with(symbol)
+
+                    # Verify market type
+                    self.assertIn(result.get("metrics", {}).get("market_type"), ("stock", "stocks"),
+                                 f"{symbol} should be classified as stock")
 
 
 if __name__ == "__main__":

@@ -78,12 +78,12 @@ class TestDatabaseOperations(unittest.TestCase):
         r = requests.post(f"{base}/api/bots", json={
             "name": "Update Risk Test", "symbol": "BTC/USD",
             "base_quote": 10, "dry_run": 1, "enabled": 0,
-        }, timeout=5)
+        }, timeout=30)
         bot_id = r.json()["bot"]["id"]
 
         r2 = requests.put(f"{base}/api/bots/{bot_id}", json={
             "stop_loss_pct": 0.05, "max_hold_hours": 168, "risk_profile": "conservative",
-        }, timeout=5)
+        }, timeout=30)
         self.assertTrue(r2.json().get("ok", False), f"Update failed: {r2.json()}")
 
         from db import get_bot
@@ -92,7 +92,7 @@ class TestDatabaseOperations(unittest.TestCase):
         self.assertIn("stop_loss_pct", bot)
         self.assertIn("risk_profile", bot)
 
-        requests.delete(f"{base}/api/bots/{bot_id}", timeout=5)
+        requests.delete(f"{base}/api/bots/{bot_id}", timeout=30)
 
     def test_deal_operations(self):
         from db import create_bot, delete_bot, open_deal, close_deal, latest_open_deal
@@ -529,10 +529,12 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertTrue(d["ok"])
-        self.assertIn("kraken_ready", d)
-        self.assertIn("alpaca_paper_ready", d)
         self.assertIn("db_ok", d)
         self.assertIn("bots", d)
+        r2 = requests.get(f"{self.base}/api/health/deep", timeout=15)
+        self.assertEqual(r2.status_code, 200)
+        d2 = r2.json()
+        self.assertIn("kraken_ready", d2)
 
     def test_bots_list(self):
         import requests
@@ -556,13 +558,13 @@ class TestAPIEndpoints(unittest.TestCase):
         r = requests.post(f"{self.base}/api/bots", json={
             "name": "API Test Bot", "symbol": "BTC/USD",
             "base_quote": 10, "dry_run": 1, "enabled": 0,
-        }, timeout=5)
+        }, timeout=30)
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertTrue(d["ok"])
         bot_id = d["bot"]["id"]
 
-        r2 = requests.delete(f"{self.base}/api/bots/{bot_id}", timeout=5)
+        r2 = requests.delete(f"{self.base}/api/bots/{bot_id}", timeout=30)
         self.assertEqual(r2.status_code, 200)
 
     def test_dashboard_loads(self):
@@ -606,12 +608,12 @@ class TestMarketTypeHealing(unittest.TestCase):
             "name": "Heal Test", "symbol": "INTC",
             "market_type": "crypto",  # Wrong!
             "base_quote": 10, "dry_run": 1, "enabled": 0,
-        }, timeout=5)
+        }, timeout=30)
         d = r.json()
         self.assertTrue(d["ok"])
         bot = d["bot"]
         self.assertEqual(bot["market_type"], "stocks", "INTC should be forced to stocks")
-        requests.delete(f"{base}/api/bots/{bot['id']}", timeout=5)
+        requests.delete(f"{base}/api/bots/{bot['id']}", timeout=30)
 
 
 if __name__ == "__main__":

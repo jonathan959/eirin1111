@@ -5181,13 +5181,60 @@ class BotRunner:
             self._stopping = False
 
 
+class OrphanBotRunner:
+    """In-memory placeholder when ``bots`` has no row for this id — no exchange client, no tick loop."""
+
+    def __init__(self, bot_id: int, manager: "BotManager"):
+        self.bot_id = int(bot_id)
+        self.manager = manager
+        self._lock = threading.RLock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._stopping = False
+        self.state = RuntimeState()
+        self.state.running = False
+        self.state.last_event = "orphaned: bot_id not found in database"
+
+    def start(self, silent: bool = False) -> str:
+        return "Orphaned (no bot row)."
+
+    def stop(self, silent: bool = False) -> str:
+        self.state.running = False
+        return "Stopped (orphan)."
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "running": False,
+                "last_price": None,
+                "avg_entry": None,
+                "base_pos": 0.0,
+                "safety_used": 0,
+                "spent_quote": 0.0,
+                "tp_price": None,
+                "tp_order_id": None,
+                "deal_id": None,
+                "last_event": self.state.last_event,
+                "errors": 0,
+                "last_tick_ts": 0,
+                "orphaned": True,
+                "unrealized_pnl_quote": None,
+                "unrealized_pnl_pct": None,
+                "pnl_status": "FLAT",
+            }
+
+    def force_close_dry_position(self) -> Dict[str, Any]:
+        return {"ok": True, "deal_id": None, "note": "orphan runner"}
+
+
 class BotManager:
     def __init__(self, kc: KrakenClient, alpaca_paper: Optional[AlpacaClient] = None, alpaca_live: Optional[AlpacaClient] = None):
         self.kc = kc
         self.alpaca_paper = alpaca_paper
         self.alpaca_live = alpaca_live
-        self._bots: Dict[int, BotRunner] = {}
+        self._bots: Dict[int, Any] = {}
         self._lock = threading.Lock()
+        self._orphan_logged: set = set()
         self._md_lock = threading.Lock()
         # Per-bot DB locks moved to db._bot_locks (single source of truth, see
         # audit/write_txn_design.md §3.1). bot_db_lock() below delegates to it.
@@ -5510,32 +5557,36 @@ class BotManager:
         """Get or create BotRunner with correct client based on bot's market_type."""
         bot_id = int(bot_id)
         with self._lock:
+            existing = self._bots.get(bot_id)
+            if isinstance(existing, OrphanBotRunner):
+                if get_bot(bot_id):
+                    del self._bots[bot_id]
             if bot_id not in self._bots:
-                # Load bot to determine market_type
                 bot = get_bot(bot_id)
                 if not bot:
-                    # Fallback to Kraken if bot not found
-                    client = self.kc
+                    if bot_id not in self._orphan_logged:
+                        self._orphan_logged.add(bot_id)
+                        logger.warning(
+                            "BotManager: bot_id=%s missing from DB — orphan runner (no retries, no trading)",
+                            bot_id,
+                        )
+                    self._bots[bot_id] = OrphanBotRunner(bot_id, self)
                 else:
                     # Get correct client based on market_type OR symbol classification
                     symbol = str(bot.get("symbol", ""))
                     stored_market_type = bot.get("market_type", "crypto")
                     detected_market_type = classify_symbol(symbol) if symbol else "crypto"
-                    # Use either stored "stocks" or detected "stock"
                     is_stock = stored_market_type in ("stock", "stocks") or detected_market_type == "stock"
-                    
+
                     if is_stock:
-                        # Get Alpaca client and wrap in adapter
                         real_client = self.get_client_for_bot(bot, override_market_type="stock")
                         client = AlpacaAdapter(real_client)
-                        # Ensure market is set up for the symbol
                         if symbol:
                             client.ensure_market(symbol)
                     else:
-                        # Crypto - use Kraken
                         client = self.kc
-                
-                self._bots[bot_id] = BotRunner(bot_id, client, self)
+
+                    self._bots[bot_id] = BotRunner(bot_id, client, self)
             return self._bots[bot_id]
 
     def start(self, bot_id: int, silent: bool = False) -> str:

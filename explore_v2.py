@@ -4,6 +4,10 @@ Explore V2: Risk-adjusted, regime-aware, diversified recommendations.
 
 When EXPLORE_V2=1, apply hard gates and enhanced scoring.
 Feature flag: EXPLORE_V2 (default: 1)
+
+Gate failures set EXPLORE_V2_GATE:* on risk_flags; worker_api maps those to
+db.explore_signals status=rejected on each scan so the main Explore table
+and "Recently Rejected" stay mutually exclusive.
 """
 
 import os
@@ -60,6 +64,12 @@ def enhance_score(
     """
     if not _ENABLED:
         return base_score, []
+    # Apply adaptive scoring weights from recommendation_validator calibration
+    try:
+        from adaptive_scorer import apply_adaptive_score
+        base_score = apply_adaptive_score(base_score, regime=regime)
+    except Exception:
+        pass
     score = base_score
     reasons = []
 
@@ -77,10 +87,11 @@ def enhance_score(
     ret_90d = snap.get("return_90d") or snap.get("ret_90d")
     if ret_30d is not None:
         ret_30d = float(ret_30d)
-        if ret_30d < -0.25:
-            penalty = min(5, abs(ret_30d) * 15)
+        # Penalize material 30d drawdowns (<= -20%); scale so typical -20%..-35% trims score.
+        if ret_30d <= -0.20:
+            penalty = min(8.0, max(1.0, abs(ret_30d) * 20.0))
             score -= penalty
-            reasons.append(f"30d drop: -{penalty:.0f}")
+            reasons.append(f"30d crash: -{penalty:.0f}")
     if ret_90d is not None:
         ret_90d = float(ret_90d)
         if ret_90d < -0.40:
@@ -125,7 +136,7 @@ def diversify_picks(
             by_cluster.setdefault(c, []).append(it)
         per_cluster = max(2, top_k // max(1, len(by_cluster)))
         out: List[Dict[str, Any]] = []
-        for c, lst in sorted(by_cluster.items(), key=lambda x: -max(float(i.get("score") or 0) for i in x[1])):
+        for c, lst in sorted(by_cluster.items(), key=lambda x: -max((float(i.get("score") or 0) for i in x[1]), default=0.0) if x[1] else 0.0):
             out.extend(lst[:per_cluster])
         out.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
     else:

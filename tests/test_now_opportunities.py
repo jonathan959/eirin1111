@@ -40,6 +40,8 @@ def test_now_opportunities_basic(monkeypatch):
     monkeypatch.setattr(autopilot, "get_autopilot_config", fake_get_autopilot_config)
     monkeypatch.setattr("db.list_bots", fake_list_bots)
     monkeypatch.setattr("db.list_recommendations", fake_list_recommendations)
+    monkeypatch.setattr(autopilot, "_explore_feed_fallback", lambda **kwargs: [])
+    monkeypatch.setattr("worker_api._alpaca_any_ready", lambda: True)
 
     items = autopilot.get_now_opportunities(asset_filter="both", max_count=3)
     # ETH should be excluded (already has a bot); XBT and AAPL are candidates
@@ -72,6 +74,7 @@ def test_now_opportunities_min_score(monkeypatch):
     monkeypatch.setattr(autopilot, "get_autopilot_config", fake_get_autopilot_config)
     monkeypatch.setattr("db.list_bots", fake_list_bots)
     monkeypatch.setattr("db.list_recommendations", fake_list_recommendations)
+    monkeypatch.setattr(autopilot, "_explore_feed_fallback", lambda **kwargs: [])
 
     items = autopilot.get_now_opportunities(asset_filter="both", max_count=3)
     # No items should pass the min_score filter
