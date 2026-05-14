@@ -112,6 +112,7 @@
               <td class="mono">
                 <span class="bot-status stopped" id="st-{{ b.id }}"><span class="status-dot"></span> Checking</span>
                 <span class="muted ml-8" id="ev-{{ b.id }}">—</span>
+                <div class="muted text-xs" id="bsbadges-{{ b.id }}" style="margin-top:4px;line-height:1.35;max-width:420px;white-space:normal;" title="Signal = scanner/strategy view. Action = what execution may do now."></div>
               </td>
 
               <td class="mono" id="act-{{ b.id }}">—</td>
@@ -1518,6 +1519,20 @@
     }
   }
 
+  function _escAttr(s){
+    return String(s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function renderBotStatusBadges(id, bs){
+    const el = document.getElementById('bsbadges-' + id);
+    if (!el) return;
+    if (!bs || !bs.signal) { el.innerHTML = ''; return; }
+    const why = _escAttr(bs.reason || '');
+    const sig = _escAttr(bs.signal);
+    const act = _escAttr(bs.action_state || '');
+    el.innerHTML = '<span class="tag" style="font-size:11px;margin-right:6px;" title="'+why+'">'+sig+'</span>' +
+      '<span class="tag tag-warn" style="font-size:11px;" title="'+why+'">'+act+'</span>';
+  }
+
   function setRowStatus(id, running, lastEvent, lastPrice){
     const st = $("st-" + id);
     const ev = $("ev-" + id);
@@ -1739,6 +1754,10 @@
       // Cache server-provided display_state (IDLE / WAITING_FOR_FILL / FILLED
       // / MANAGING / CLOSING / ERROR / PAUSED / COOLDOWN / STOPPED)
       try { BOT_SNAP[id].__display_state = data.display_state || null; } catch(_){}
+      try {
+        BOT_SNAP[id].bot_status = data.bot_status || null;
+        renderBotStatusBadges(id, data.bot_status || null);
+      } catch(_){}
       setRowStatus(id, !!snap.running, snap.last_event, snap.last_price);
       // Paint realized_pnl + position_pct_of_capital live values
       try {

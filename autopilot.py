@@ -307,6 +307,11 @@ def _capital_for_score(score: float) -> float:
     return 0.0
 
 
+def _explore_feed_fallback(**_: Any) -> List[Dict[str, Any]]:
+    """Hook for explore_signals rows when recommendations are sparse; tests monkeypatch this."""
+    return []
+
+
 def get_top_recommendations(
     horizon: str = "long",
     min_score: float = 80,

@@ -214,6 +214,11 @@ def get_strategy_leaderboard(window_days: int = 90):
 from kraken_client import KrakenClient
 from alpaca_client import AlpacaClient
 from bot_manager import BotManager, ALLOW_LIVE_TRADING
+from services.bot_status import (
+    recommendation_rating_legacy,
+    compute_bot_status,
+    load_latest_signal_for_bot,
+)
 from alpaca_adapter import AlpacaAdapter
 from explore_scorer import signal_age_penalty, price_confirmation_score
 from explore_rank import (
@@ -715,7 +720,6 @@ from strategies import (
     ema_series,
     rsi,
     adx,
-    macd,
     _atr,
     rolling_return,
     max_drawdown,
@@ -1633,10 +1637,34 @@ def api_bots():
                         b["last_tick_ts"] = snap.get("last_tick_ts")
                         b["unrealized_pnl_pct"] = snap.get("unrealized_pnl_pct")
                         b["decision_action"] = snap.get("decision_action")
+                        try:
+                            _ls = load_latest_signal_for_bot(dict(b))
+                            _intel = {
+                                "decision_action": snap.get("decision_action"),
+                                "decision_reason": snap.get("decision_reason"),
+                                "allowed_actions": snap.get("intelligence_allowed"),
+                            }
+                            _risk = {"level": snap.get("risk_level"), "reason": snap.get("risk_reason")}
+                            _gate = snap.get("gate_details") if isinstance(snap.get("gate_details"), dict) else {}
+                            b["bot_status"] = compute_bot_status(
+                                dict(b),
+                                _ls,
+                                _intel,
+                                _risk,
+                                _gate,
+                                global_pause=bool(_pause_state()),
+                                kill_switch=bool(_kill_switch_state()),
+                                allow_live_trading=bool(ALLOW_LIVE_TRADING),
+                                base_pos=float(snap.get("base_pos") or 0.0),
+                            ).to_dict()
+                        except Exception:
+                            b["bot_status"] = None
                     else:
                         b["state"] = "STOPPED" if not int(b.get("enabled", 0)) else "UNKNOWN"
+                        b["bot_status"] = None
                 except Exception:
                     b["state"] = "UNKNOWN"
+                    b["bot_status"] = None
                 try:
                     od = latest_open_deal(bot_id)
                     b["open_deal"] = od
@@ -7487,6 +7515,31 @@ def api_bot_status(bot_id: int):
     except Exception:
         pass
 
+    bot_status_dict: Optional[Dict[str, Any]] = None
+    try:
+        _ls = load_latest_signal_for_bot(dict(b))
+        _intel = {
+            "decision_action": snap.get("decision_action"),
+            "decision_reason": snap.get("decision_reason"),
+            "allowed_actions": snap.get("intelligence_allowed"),
+        }
+        _risk = {"level": snap.get("risk_level"), "reason": snap.get("risk_reason")}
+        _gate = snap.get("gate_details")
+        bot_status_dict = compute_bot_status(
+            dict(b),
+            _ls,
+            _intel,
+            _risk,
+            _gate if isinstance(_gate, dict) else {},
+            global_pause=bool(_pause_state()),
+            kill_switch=bool(_kill_switch_state()),
+            allow_live_trading=bool(ALLOW_LIVE_TRADING),
+            base_pos=float(snap.get("base_pos") or 0.0),
+        ).to_dict()
+    except Exception as _bse:
+        logger.debug("api_bot_status bot_status: %s", _bse)
+        bot_status_dict = None
+
     return _json({
         "ok": True,
         "bot": b,
@@ -7498,6 +7551,7 @@ def api_bot_status(bot_id: int):
         "paused": bool(_pause_state()),
         "data_health": data_health,
         "last_decisions": last_decisions,
+        "bot_status": bot_status_dict,
     })
 
 
@@ -9928,23 +9982,10 @@ def api_recommendations(
             if not _db_factor_scores:
                 _db_factor_scores = metrics.get("factor_scores") or {}
 
-            # Rating: use conviction grade when available, fall back to score buckets
-            if _db_conviction == "A":
-                rating = "Strong Buy"
-            elif _db_conviction == "B":
-                rating = "Buy"
-            elif _db_conviction == "C":
-                rating = "Watch"
-            elif _db_conviction == "D":
-                rating = "Avoid"
-            elif score >= 85:
-                rating = "Strong Buy"
-            elif score >= 55:
-                rating = "Buy"
-            elif score >= 40:
-                rating = "Watch"
-            else:
-                rating = "Avoid"
+            rating = recommendation_rating_legacy(
+                str(_db_conviction) if _db_conviction is not None else None,
+                float(score or 0.0),
+            )
 
             regime = {}
             reasons = []
@@ -10799,16 +10840,8 @@ def api_recommendation_symbol(symbol: str, horizon: str = "short"):
         else:
             ticker = _ticker_cached(sym, ttl_sec=120) or {}
     
-    score = float(row.get("score") or 0.0)
     _d_conv = row.get("conviction_grade") or metrics.get("conviction_grade")
-    if _d_conv == "A": rating = "Strong Buy"
-    elif _d_conv == "B": rating = "Buy"
-    elif _d_conv == "C": rating = "Watch"
-    elif _d_conv == "D": rating = "Avoid"
-    elif score >= 85: rating = "Strong Buy"
-    elif score >= 55: rating = "Buy"
-    elif score >= 40: rating = "Watch"
-    else: rating = "Avoid"
+    rating = recommendation_rating_legacy(str(_d_conv) if _d_conv is not None else None, score)
 
     _d_factor_scores = {}
     try:

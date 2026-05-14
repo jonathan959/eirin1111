@@ -51,16 +51,10 @@ for i in $(seq 1 45); do
     echo "App ready after ${i}*2s"
     exit 0
   fi
-  if [ "$i" -eq 10 ]; then
-    echo "App not up after 20s; starting tradingserver as fallback (one_server:app)."
-    sudo systemctl stop ai-bot 2>/dev/null || true
-    sleep 2
-    sudo systemctl start tradingserver 2>/dev/null || true
-  fi
   sleep 2
 done
 
-echo "WARNING: App may still be starting. Check: sudo journalctl -u ai-bot -n 30"
+echo "WARNING: App may still be starting. Check: sudo journalctl -u ai-bot -n 80 --no-pager"
 exit 0
 
 

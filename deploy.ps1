@@ -57,6 +57,7 @@ $Files = @(
   "unified_alpaca_client.py", "websocket_manager.py", "data_cache.py", "enhanced_rate_limiter.py",
   "correlation_trading.py", "seasonality.py",
   "earnings_momentum.py", "zscore_trading.py", "momentum_ranking.py",
+  "explore_composite_scorer.py", "explore_rank.py", "explore_scorer.py",
   "rl_agent.py", "high_frequency.py",
   "app.py", "requirements.txt", "db_backup.py"
 )
@@ -140,6 +141,12 @@ if (Test-Path $envPath) {
 if (Test-Path (Join-Path $LocalRoot "scripts")) {
   & scp @SshArgs -i $KeyPath -r (Join-Path $LocalRoot "scripts") "$User@${HostName}:$RemoteDir/"
 }
+if (Test-Path (Join-Path $LocalRoot "services")) {
+  Remove-Item -Recurse -Force (Join-Path $LocalRoot "services/__pycache__") -ErrorAction SilentlyContinue
+  & ssh @SshArgs -i $KeyPath "$User@$HostName" "rm -rf $RemoteDir/services/__pycache__ 2>/dev/null || true"
+  Write-Host "Copying services/..." -ForegroundColor Cyan
+  & scp @SshArgs -i $KeyPath -r (Join-Path $LocalRoot "services") "$User@${HostName}:$RemoteDir/"
+}
 foreach ($s in $Scripts) {
   $p = Join-Path $LocalRoot $s
   if (Test-Path $p) { & scp @SshArgs -i $KeyPath $p "$User@${HostName}:$RemoteDir/" }
@@ -158,9 +165,9 @@ if (Test-Path $journalConf) {
 Write-Host "Installing service + Nginx..." -ForegroundColor Cyan
 # Fix temp dirs (often broken/full after EC2 reboot) - run inline, no file copy needed
 Invoke-Ssh "sudo chmod 1777 /tmp 2>/dev/null; mkdir -p $RemoteDir/tmp; chmod 700 $RemoteDir/tmp"
-# Use tradingserver (one_server) for full UI including Explore; stop ai-bot to avoid port conflict
-Invoke-Ssh "sudo systemctl stop ai-bot 2>/dev/null; sudo systemctl disable ai-bot 2>/dev/null; sudo fuser -k 8000/tcp 2>/dev/null; sleep 2"
-Invoke-Ssh "sudo cp $RemoteDir/tradingserver.service /etc/systemd/system/tradingserver.service; sudo systemctl daemon-reload; sudo systemctl enable --now tradingserver"
+# Production: ai-bot (one_server_v2:app). Stop tradingserver so only one binds :8000.
+Invoke-Ssh "sudo systemctl stop tradingserver 2>/dev/null; sudo systemctl disable tradingserver 2>/dev/null; sudo fuser -k 8000/tcp 2>/dev/null; sleep 2"
+Invoke-Ssh "sudo cp $RemoteDir/ai-bot.service /etc/systemd/system/ai-bot.service; sudo systemctl daemon-reload; sudo systemctl enable --now ai-bot"
 Invoke-Ssh "sudo mkdir -p /etc/systemd/journald.conf.d; sudo cp $RemoteDir/journald_size_limit.conf /etc/systemd/journald.conf.d/ 2>/dev/null; sudo systemctl restart systemd-journald 2>/dev/null || true"
 Invoke-Ssh "sed -i 's/\r$//' $RemoteDir/check_nginx.sh $RemoteDir/setup_nginx.sh $RemoteDir/install_ai_bot.sh $RemoteDir/scripts/*.sh 2>/dev/null; chmod +x $RemoteDir/scripts/*.sh $RemoteDir/install_ai_bot.sh 2>/dev/null; chmod +x $RemoteDir/check_nginx.sh $RemoteDir/setup_nginx.sh; bash $RemoteDir/setup_nginx.sh"
 # Install daily disk cleanup cron (4am UTC) - prevents disk fill from logs
@@ -183,7 +190,7 @@ if (-not $validatePass) {
   exit 1
 }
 
-Write-Host "Validation passed. Restarting tradingserver (clean restart, no reboot needed)..." -ForegroundColor Green
+Write-Host "Validation passed. Restarting application (deploy_restart.sh → ai-bot on :8000)..." -ForegroundColor Green
 Invoke-Ssh "sed -i 's/\r$//' $RemoteDir/deploy_restart.sh 2>/dev/null; chmod +x $RemoteDir/deploy_restart.sh; bash $RemoteDir/deploy_restart.sh || true"
 
 Write-Host "Waiting for service (up to 90s)..." -ForegroundColor Yellow

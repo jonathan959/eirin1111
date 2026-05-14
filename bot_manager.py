@@ -58,7 +58,6 @@ from strategies import (
     dominant_regime,
     StrategyContext,
     _atr,
-    macd,
 )
 from intelligence_layer import (
     IntelligenceLayer,
@@ -380,6 +379,7 @@ class RuntimeState:
     risk_since_ts: int = 0
     gate_details: Optional[Dict[str, Any]] = None
     forced_strategy: Optional[str] = None
+    intelligence_allowed: Optional[str] = None
     consecutive_losses: int = 0
     # Trailing stop (Part 1 profit optimization)
     trailing_active: bool = False
@@ -509,6 +509,7 @@ class BotRunner:
                 "risk_reason": self.state.risk_reason,
                 "risk_since_ts": self.state.risk_since_ts,
                 "forced_strategy": self.state.forced_strategy,
+                "intelligence_allowed": self.state.intelligence_allowed,
                 "gate_details": self.state.gate_details,
                 "unrealized_pnl_quote": upnl_q,
                 "unrealized_pnl_pct": upnl_p,
@@ -3737,6 +3738,8 @@ class BotRunner:
                 
                 # Evaluate with Intelligence Layer
                 intel_decision = self.intelligence_layer.evaluate(intel_context)
+                with self._lock:
+                    self.state.intelligence_allowed = _safe_enum_val(intel_decision.allowed_actions)
 
                 # Scope guard: stocks are analysis-only unless Alpaca integration is active
                 if is_stock_symbol(symbol) and not isinstance(self.kc, AlpacaAdapter):
