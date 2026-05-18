@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-command EC2 verification: services, ports, health.
-# Run ON THE EC2 SERVER: ssh ubuntu@3.148.6.246 "cd /home/ubuntu/local_3comas_clone_v2 && bash scripts/verify_ec2.sh"
+# Run ON THE EC2 SERVER: ssh ubuntu@3.151.143.63 "cd /home/ubuntu/local_3comas_clone_v2 && bash scripts/verify_ec2.sh"
 # (No set -e: continue even if some checks fail)
 echo "=== EC2 Verification ==="
 echo ""

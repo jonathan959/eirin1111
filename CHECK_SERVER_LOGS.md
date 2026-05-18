@@ -2,10 +2,10 @@
 
 ## 1. SSH into the server
 
-From **PowerShell** on your PC (use your key path):
+From **PowerShell** on your PC (use your key path, or `$env:EIRIN_DEPLOY_KEY` / `.\eirin-bot-key.pem` beside the repo — see `deploy.ps1`):
 
 ```powershell
-ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirn-bot-key.pem" ubuntu@3.148.6.246
+ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirin-bot-key.pem" ubuntu@3.151.143.63
 ```
 
 ## 2. Where to look for errors
@@ -49,13 +49,13 @@ sudo journalctl -u tradingserver -n 300 --no-pager | grep -B 2 -A 15 "Traceback\
 Run this in PowerShell – it SSHs in and shows the last 150 lines of the app log:
 
 ```powershell
-ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirn-bot-key.pem" ubuntu@3.148.6.246 "cd ~/local_3comas_clone_v2 && tail -150 deploy.log"
+ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirin-bot-key.pem" ubuntu@3.151.143.63 "cd ~/local_3comas_clone_v2 && tail -150 deploy.log"
 ```
 
 For systemd service logs:
 
 ```powershell
-ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirn-bot-key.pem" ubuntu@3.148.6.246 "sudo journalctl -u tradingserver -n 150 --no-pager"
+ssh -i "C:\Users\jonat\OneDrive\Desktop\server\eirin-bot-key.pem" ubuntu@3.151.143.63 "sudo journalctl -u tradingserver -n 150 --no-pager"
 ```
 
 ---

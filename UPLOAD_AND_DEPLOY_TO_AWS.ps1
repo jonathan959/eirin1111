@@ -1,5 +1,5 @@
 # Upload local project (this folder) to AWS server and deploy.
-# Server: http://3.148.6.246/
+# Server: http://3.151.143.63/
 # Run from this folder: .\UPLOAD_AND_DEPLOY_TO_AWS.ps1
 #
 # First-time setup (run once in PowerShell):
@@ -10,8 +10,9 @@
 # Then run: .\UPLOAD_AND_DEPLOY_TO_AWS.ps1
 
 $ErrorActionPreference = "Stop"
-$Server = "3.148.6.246"
 $ProjectRoot = $PSScriptRoot
+$Server = (Get-Content (Join-Path $ProjectRoot "deploy_host.txt") -Raw).Trim()
+if (-not $Server) { throw "deploy_host.txt is missing or empty." }
 $User = if ($env:AWS_DEPLOY_USER) { $env:AWS_DEPLOY_USER } else { "ubuntu" }
 $KeyPath = $env:AWS_DEPLOY_KEY
 $RemoteDir = if ($env:AWS_DEPLOY_REMOTE_DIR) { $env:AWS_DEPLOY_REMOTE_DIR } else { "local_3comas_clone_v2" }

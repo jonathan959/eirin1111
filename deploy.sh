@@ -1,9 +1,15 @@
 #!/bin/bash
-# deploy.sh - Deploy trading bot to ubuntu@3.148.6.246
+# deploy.sh - Deploy trading bot (host from deploy_host.txt)
 # Follow DEPLOYMENT_RULES.md - SSH-only, no Docker
 
 set -e
-HOST="ubuntu@3.148.6.246"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEPLOY_HOST="$(tr -d '[:space:]' < "$SCRIPT_DIR/deploy_host.txt")"
+if [ -z "$DEPLOY_HOST" ]; then
+  echo "ERROR: deploy_host.txt missing or empty"
+  exit 1
+fi
+HOST="ubuntu@${DEPLOY_HOST}"
 REMOTE_PATH="/home/ubuntu/bot"
 SERVICE="tradingserver"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

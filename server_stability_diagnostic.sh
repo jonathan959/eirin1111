@@ -1,6 +1,6 @@
 #!/bin/bash
 # server_stability_diagnostic.sh - Run on the EC2 instance to diagnose stability issues
-# Usage: ssh ubuntu@3.148.6.246 'bash -s' < server_stability_diagnostic.sh
+# Usage: ssh ubuntu@3.151.143.63 'bash -s' < server_stability_diagnostic.sh
 # Or: scp to server and run: bash server_stability_diagnostic.sh
 
 set -e

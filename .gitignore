@@ -129,6 +129,7 @@ celerybeat.pid
 
 # Environments
 .env
+aws-deploy.env
 .venv
 env/
 venv/

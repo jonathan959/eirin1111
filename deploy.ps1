@@ -1,20 +1,102 @@
-# Trading bot deploy - 3.148.6.246 (Elastic IP) only. No DuckDNS.
-# Usage: .\deploy.ps1 [-Quick] [-BringUpOnly]
+# Trading bot deploy - production host from deploy_host.txt (single source of truth). No DuckDNS.
+# Usage: .\deploy.ps1 [-Quick] [-BringUpOnly] [-KeyPath <pem>]
 #   -Quick       Skip backup (use when bots are running and backup hangs)
 #   -BringUpOnly Just run quick_fix_502 on server to restore site, then exit (no deploy)
+#   -KeyPath     SSH private key (.pem); overrides env and defaults — see Resolve-EirinDeployKeyPath below.
 
-param([switch]$Quick, [switch]$BringUpOnly)
+param(
+  [switch]$Quick,
+  [switch]$BringUpOnly,
+  [switch]$RecoverEc2,
+  [switch]$SkipRecover,
+  [string]$KeyPath = ""
+)
 
 $ErrorActionPreference = "Stop"
-$KeyPath = "C:\Users\jonat\OneDrive\Desktop\server\eirn-bot-key.pem"
-$HostName = "3.148.6.246"
+$LocalRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+function Get-EirinDeployHost {
+  $hostFile = Join-Path $LocalRoot "deploy_host.txt"
+  if (-not (Test-Path -LiteralPath $hostFile)) {
+    throw "Missing deploy_host.txt in project root (canonical production IP)."
+  }
+  $h = (Get-Content -LiteralPath $hostFile -Raw).Trim()
+  if (-not $h) { throw "deploy_host.txt is empty." }
+  return $h
+}
+
+function Resolve-EirinDeployKeyPath {
+  param([string]$Explicit)
+  $candidates = [System.Collections.Generic.List[string]]::new()
+  if ($Explicit -and $Explicit.Trim()) {
+    [void]$candidates.Add($Explicit.Trim())
+  }
+  $envKey = $env:EIRIN_DEPLOY_KEY
+  if ($envKey -and $envKey.Trim()) {
+    [void]$candidates.Add($envKey.Trim())
+  }
+  [void]$candidates.Add((Join-Path $LocalRoot "eirin-bot-key.pem"))
+  # Historical desktop stash (correct spelling: eirin-bot-key.pem)
+  [void]$candidates.Add("C:\Users\jonat\OneDrive\Desktop\server\eirin-bot-key.pem")
+
+  foreach ($p in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    if (Test-Path -LiteralPath $p) {
+      return (Resolve-Path -LiteralPath $p).Path
+    }
+  }
+
+  $lines = ($candidates | ForEach-Object { "  - $_" }) -join "`n"
+  Write-Error @"
+No SSH private key found for deploy.
+
+Checked (in order):
+$lines
+
+Fix one of:
+  * Place your EC2 key next to deploy.ps1 as eirin-bot-key.pem
+  * `$env:EIRIN_DEPLOY_KEY = 'C:\full\path\eirin-bot-key.pem'
+  * .\deploy.ps1 -KeyPath 'C:\full\path\eirin-bot-key.pem'
+"@
+  exit 1
+}
+
+$KeyPath = Resolve-EirinDeployKeyPath -Explicit $KeyPath
+Write-Host "Using SSH key: $KeyPath" -ForegroundColor DarkGray
+
+function Test-DeployHostReachable {
+  param([string]$TargetHost, [int]$TimeoutMs = 8000)
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $iar = $c.BeginConnect($TargetHost, 22, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $c.Close(); return $false }
+    $c.EndConnect($iar)
+    $c.Close()
+    return $true
+  } catch { return $false }
+}
+
+$HostName = Get-EirinDeployHost
 $User = "ubuntu"
 $RemoteDir = "/home/ubuntu/local_3comas_clone_v2"
-$LocalRoot = "C:\Users\jonat\OneDrive\Desktop\local_3comas_clone_v2"
 
-if (-not (Test-Path -Path $KeyPath)) {
-  Write-Error "Key not found: $KeyPath"
-  exit 1
+if (-not $SkipRecover -and ($RecoverEc2 -or -not (Test-DeployHostReachable -TargetHost $HostName))) {
+  if (-not (Test-DeployHostReachable -TargetHost $HostName)) {
+    Write-Host "Server $HostName port 22 unreachable - attempting server recovery..." -ForegroundColor Yellow
+  }
+  $recoverScript = Join-Path $LocalRoot "scripts\recover_ec2_and_deploy.ps1"
+  if (Test-Path $recoverScript) {
+    $recoverArgs = @()
+    if ($Quick) { $recoverArgs += "-Quick" }
+    if ($RecoverEc2 -and (Test-DeployHostReachable -TargetHost $HostName)) {
+      $recoverArgs += "-DeployOnly"
+    }
+    & $recoverScript @recoverArgs
+    exit $LASTEXITCODE
+  } else {
+    Write-Host "Missing $recoverScript - ensure $HostName is up and SSH (port 22) is open, then re-run deploy." -ForegroundColor Red
+    exit 1
+  }
 }
 
 if ($BringUpOnly) {

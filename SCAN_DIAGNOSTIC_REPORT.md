@@ -5,7 +5,7 @@
 **Primary: HYPOTHESIS 7 — Thread/Async Contention (Rate Limit Storm)**  
 **Secondary: HYPOTHESIS 1 — Scheduler Timestamp Bug**
 
-### Findings from Live System (http://3.148.6.246)
+### Findings from Live System (http://3.151.143.63)
 
 Before fixes:
 - **All 3 horizons were scanning simultaneously** (short, medium, long all `scanning: true`)

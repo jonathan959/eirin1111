@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_PORT="${SERVICE_PORT:-8000}"
 NGINX_CONFIG="/etc/nginx/sites-available/tradingserver"
-PUBLIC_IP=$(curl -s --max-time 5 http://checkip.amazonaws.com 2>/dev/null || echo "3.148.6.246")
+PUBLIC_IP=$(curl -s --max-time 5 http://checkip.amazonaws.com 2>/dev/null || echo "3.151.143.63")
 
 echo "=== Install Nginx (port $SERVICE_PORT) ==="
 sudo apt-get update -qq

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup nginx reverse proxy for AI bot (3.148.6.246)
+# Setup nginx reverse proxy for AI bot (3.151.143.63)
 
 set -e
 
@@ -7,7 +7,7 @@ REMOTE_DIR="${1:-/home/ubuntu/local_3comas_clone_v2}"
 cd "$REMOTE_DIR" 2>/dev/null || true
 SERVICE_PORT=8000
 NGINX_CONFIG="/etc/nginx/sites-available/ai-bot"
-PUBLIC_IP=$(curl -s --max-time 5 http://checkip.amazonaws.com 2>/dev/null || echo "3.148.6.246")
+PUBLIC_IP=$(curl -s --max-time 5 http://checkip.amazonaws.com 2>/dev/null || echo "3.151.143.63")
 
 echo "=== Setting up Nginx Reverse Proxy (ai-bot) ==="
 echo "Server IP: $PUBLIC_IP"

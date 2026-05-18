@@ -1,12 +1,17 @@
 #!/bin/bash
-# SSH_DIAGNOSTIC.sh - Diagnose SSH connectivity to 3.148.6.246
+# SSH_DIAGNOSTIC.sh - Diagnose SSH connectivity (host from deploy_host.txt)
 # Run this if deploy.sh fails with connection errors
 
-HOST_IP="3.148.6.246"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HOST_IP="$(tr -d '[:space:]' < "$SCRIPT_DIR/deploy_host.txt")"
+if [ -z "$HOST_IP" ]; then
+  echo "ERROR: deploy_host.txt missing or empty"
+  exit 1
+fi
 HOST_USER="ubuntu"
 SSH_TARGET="${HOST_USER}@${HOST_IP}"
 
-echo "=== SSH Diagnostic for 3.148.6.246 ==="
+echo "=== SSH Diagnostic for $HOST_IP ==="
 echo "Target: $SSH_TARGET"
 echo ""
 

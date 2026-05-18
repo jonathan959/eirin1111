@@ -2,11 +2,23 @@
 # Run from project folder: .\CHECK_SERVER_LOGS.ps1
 # Requires: $env:AWS_DEPLOY_KEY set to your .pem path, or edit $KeyPath below.
 
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $KeyPath = $env:AWS_DEPLOY_KEY
-if (-not $KeyPath -or -not (Test-Path $KeyPath)) {
-    $KeyPath = "C:\Users\jonat\OneDrive\Desktop\server\eirn-bot-key.pem"
+if (-not $KeyPath -or -not (Test-Path -LiteralPath $KeyPath)) {
+    $KeyPath = $env:EIRIN_DEPLOY_KEY
 }
-$Server = "3.148.6.246"
+if (-not $KeyPath -or -not (Test-Path -LiteralPath $KeyPath)) {
+    $KeyPath = Join-Path $ScriptRoot "eirin-bot-key.pem"
+}
+if (-not $KeyPath -or -not (Test-Path -LiteralPath $KeyPath)) {
+    $KeyPath = "C:\Users\jonat\OneDrive\Desktop\server\eirin-bot-key.pem"
+}
+if (-not $KeyPath -or -not (Test-Path -LiteralPath $KeyPath)) {
+    Write-Error "No SSH key found. Set `$env:EIRIN_DEPLOY_KEY or `$env:AWS_DEPLOY_KEY, or place eirin-bot-key.pem next to this script."
+    exit 1
+}
+$Server = (Get-Content (Join-Path $ScriptRoot "deploy_host.txt") -Raw).Trim()
+if (-not $Server) { Write-Error "deploy_host.txt is missing or empty."; exit 1 }
 $User = "ubuntu"
 
 Write-Host "=== Finding what is running and where logs are ===" -ForegroundColor Cyan

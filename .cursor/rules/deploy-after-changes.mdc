@@ -1,11 +1,11 @@
 ---
-description: Deploy to live site after changing app code so 3.148.6.246 stays in sync.
+description: Deploy to live site after changing app code so 3.151.143.63 stays in sync.
 alwaysApply: true
 ---
 
 # Deploy to live site after code changes
 
-When you **change application code** (Python, templates, static, db, scripts), the **live site** (http://3.148.6.246) does **not** update automatically.
+When you **change application code** (Python, templates, static, db, scripts), the **live site** (http://3.151.143.63) does **not** update automatically.
 
 **Rule: Whenever you change app code, you MUST run the deploy script yourself** — without being asked. Do not skip this. The user expects the live site to stay in sync automatically.
 

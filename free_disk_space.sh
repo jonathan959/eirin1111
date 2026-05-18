@@ -1,7 +1,7 @@
 #!/bin/bash
 # Free disk space on EC2 - run when "No space left on device"
-# Usage: ssh ubuntu@3.148.6.246 'bash -s' < free_disk_space.sh
-# Or: scp free_disk_space.sh ubuntu@3.148.6.246:~/  && ssh ubuntu@3.148.6.246 'bash ~/free_disk_space.sh'
+# Usage: ssh ubuntu@3.151.143.63 'bash -s' < free_disk_space.sh
+# Or: scp free_disk_space.sh ubuntu@3.151.143.63:~/  && ssh ubuntu@3.151.143.63 'bash ~/free_disk_space.sh'
 
 set -e
 echo "=== Disk usage before ==="
