@@ -1611,65 +1611,72 @@ async def api_create_bot(request: Request):
         return _json({"ok": False, "error": str(e)}, 500)
 
 
+def _enrich_bots_runtime_fields(bots: List[Dict[str, Any]]) -> None:
+    """Attach snapshot-derived fields + bot_status (+ open_deal) — shared by GET /api/bots and SSE."""
+    global bm
+    if bm is None:
+        return
+    for b in bots:
+        bot_id = int(b.get("id") or 0)
+        try:
+            snap = bm.snapshot(bot_id)
+            if snap:
+                is_running = bool(snap.get("running"))
+                has_pos = float(snap.get("base_pos") or 0) > 0
+                risk = snap.get("risk_state")
+                if risk:
+                    state_label = f"RISK_{risk}"
+                elif has_pos:
+                    state_label = "MANAGING_POSITION"
+                elif is_running:
+                    state_label = "WAITING_FOR_SIGNAL"
+                else:
+                    state_label = "STOPPED"
+                b["state"] = state_label
+                b["last_event"] = snap.get("last_event")
+                b["last_tick_ts"] = snap.get("last_tick_ts")
+                b["unrealized_pnl_pct"] = snap.get("unrealized_pnl_pct")
+                b["decision_action"] = snap.get("decision_action")
+                try:
+                    _ls = load_latest_signal_for_bot(dict(b))
+                    _intel = {
+                        "decision_action": snap.get("decision_action"),
+                        "decision_reason": snap.get("decision_reason"),
+                        "allowed_actions": snap.get("intelligence_allowed"),
+                    }
+                    _risk = {"level": snap.get("risk_level"), "reason": snap.get("risk_reason")}
+                    _gate = snap.get("gate_details") if isinstance(snap.get("gate_details"), dict) else {}
+                    b["bot_status"] = compute_bot_status(
+                        dict(b),
+                        _ls,
+                        _intel,
+                        _risk,
+                        _gate,
+                        global_pause=bool(_pause_state()),
+                        kill_switch=bool(_kill_switch_state()),
+                        allow_live_trading=bool(ALLOW_LIVE_TRADING),
+                        base_pos=float(snap.get("base_pos") or 0.0),
+                    ).to_dict()
+                except Exception:
+                    b["bot_status"] = None
+            else:
+                b["state"] = "STOPPED" if not int(b.get("enabled", 0)) else "UNKNOWN"
+                b["bot_status"] = None
+        except Exception:
+            b["state"] = "UNKNOWN"
+            b["bot_status"] = None
+        try:
+            od = latest_open_deal(bot_id)
+            b["open_deal"] = od
+        except Exception:
+            b["open_deal"] = None
+
+
 @app.get("/api/bots")
 def api_bots():
     try:
         bots = list_bots()
-        if bm is not None:
-            for b in bots:
-                bot_id = int(b.get("id") or 0)
-                try:
-                    snap = bm.snapshot(bot_id)
-                    if snap:
-                        is_running = bool(snap.get("running"))
-                        has_pos = float(snap.get("base_pos") or 0) > 0
-                        risk = snap.get("risk_state")
-                        if risk:
-                            state_label = f"RISK_{risk}"
-                        elif has_pos:
-                            state_label = "MANAGING_POSITION"
-                        elif is_running:
-                            state_label = "WAITING_FOR_SIGNAL"
-                        else:
-                            state_label = "STOPPED"
-                        b["state"] = state_label
-                        b["last_event"] = snap.get("last_event")
-                        b["last_tick_ts"] = snap.get("last_tick_ts")
-                        b["unrealized_pnl_pct"] = snap.get("unrealized_pnl_pct")
-                        b["decision_action"] = snap.get("decision_action")
-                        try:
-                            _ls = load_latest_signal_for_bot(dict(b))
-                            _intel = {
-                                "decision_action": snap.get("decision_action"),
-                                "decision_reason": snap.get("decision_reason"),
-                                "allowed_actions": snap.get("intelligence_allowed"),
-                            }
-                            _risk = {"level": snap.get("risk_level"), "reason": snap.get("risk_reason")}
-                            _gate = snap.get("gate_details") if isinstance(snap.get("gate_details"), dict) else {}
-                            b["bot_status"] = compute_bot_status(
-                                dict(b),
-                                _ls,
-                                _intel,
-                                _risk,
-                                _gate,
-                                global_pause=bool(_pause_state()),
-                                kill_switch=bool(_kill_switch_state()),
-                                allow_live_trading=bool(ALLOW_LIVE_TRADING),
-                                base_pos=float(snap.get("base_pos") or 0.0),
-                            ).to_dict()
-                        except Exception:
-                            b["bot_status"] = None
-                    else:
-                        b["state"] = "STOPPED" if not int(b.get("enabled", 0)) else "UNKNOWN"
-                        b["bot_status"] = None
-                except Exception:
-                    b["state"] = "UNKNOWN"
-                    b["bot_status"] = None
-                try:
-                    od = latest_open_deal(bot_id)
-                    b["open_deal"] = od
-                except Exception:
-                    b["open_deal"] = None
+        _enrich_bots_runtime_fields(bots)
         return _json({
             "ok": True,
             "bots": bots,
@@ -1690,6 +1697,7 @@ async def api_bots_stream():
         while True:
             try:
                 bots = list_bots()
+                _enrich_bots_runtime_fields(bots)
                 data = json.dumps(bots)
                 yield f"data: {data}\n\n"
             except Exception as e:
@@ -6590,6 +6598,61 @@ def api_notifications_test():
 # use /api/safety/checklist, which calls services.safety_checklist
 # .compute_live_readiness() — the single source of truth for live readiness.
 
+@app.get("/api/safety/checklist")
+def api_safety_checklist():
+    """Strict 10-item live-readiness checklist used by the Safety page and the
+    Bots page "Live ready / Not ready" badge. Single source of truth — also
+    consulted by the live-promotion gate in PUT /api/bots/{id}."""
+    try:
+        from services.safety_checklist import compute_live_readiness
+        return _json(compute_live_readiness())
+    except Exception as e:
+        logger.exception("/api/safety/checklist failed")
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    """Return current settings (env config + DB-backed settings) for the Settings page."""
+    try:
+        from db import get_setting as _gs
+        return _json({
+            "ok": True,
+            "settings": {
+                "kraken_api_key_set": bool((os.getenv("KRAKEN_API_KEY") or "").strip()),
+                "alpaca_live_key_set": bool((os.getenv("ALPACA_API_KEY_LIVE") or "").strip()),
+                "alpaca_paper_key_set": bool((os.getenv("ALPACA_API_KEY_PAPER") or "").strip()),
+                "discord_webhook_set": bool((os.getenv("DISCORD_WEBHOOK_URL") or "").strip()),
+                "allow_live_trading": bool(ALLOW_LIVE_TRADING),
+                "live_trading_enabled": bool(LIVE_TRADING_ENABLED),
+                "kill_switch": bool(_kill_switch_state()),
+                "worker_api_token_set": bool(WORKER_API_TOKEN),
+                "portfolio_exposure_breaker_enabled": (os.getenv("PORTFOLIO_EXPOSURE_BREAKER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on", "y")),
+                "max_total_exposure_pct": float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50") or 0.50),
+                "kill_switch_tested": str(_gs("kill_switch_tested", "0")).strip().lower() in ("1", "true", "yes"),
+            },
+        })
+    except Exception as e:
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
+
+@app.post("/api/settings")
+async def api_settings_post(request: Request):
+    """Persist DB-backed settings (DB-only — env vars are read-only at runtime)."""
+    try:
+        body = await request.json()
+        from db import set_setting as _ss
+        saved = []
+        # Allow toggling kill switch via API (separately from kill-switch test marker)
+        if "kill_switch" in body:
+            _ss("kill_switch", "1" if body["kill_switch"] else "0")
+            saved.append("kill_switch")
+            # Mark "tested" the first time it's flipped (any direction)
+            _ss("kill_switch_tested", "1")
+        return _json({"ok": True, "saved": saved})
+    except Exception as e:
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+
 
 @app.get("/api/pnl")
 def api_pnl():
@@ -7026,7 +7089,17 @@ def api_portfolio():
         _cached_ts = _PORTFOLIO_CACHE.get("ts", 0.0)
     if _cached is not None and (_now - _cached_ts) < _PORTFOLIO_CACHE_TTL:
         return _json(_cached)
-    snap = _portfolio_snapshot()
+    try:
+        snap = _portfolio_snapshot()
+    except Exception as e:
+        logger.warning("/api/portfolio: snapshot failed (%s); serving stale cache age=%.0fs",
+                       e, _now - _cached_ts if _cached_ts else -1)
+        if _cached is not None:
+            stale = dict(_cached)
+            stale["stale"] = True
+            stale["stale_age_sec"] = int(_now - _cached_ts)
+            return _json(stale)
+        return _json({"ok": False, "error": str(e)[:200], "transient": True}, 503)
     with _globals_lock:
         history = list(PORT_HISTORY[-500:])
     result = {"ok": True, "portfolio": snap, "history": history}
@@ -8115,6 +8188,9 @@ def api_explore_feed(
     signal: str = "all",
     limit: int = 80,
     show_already_active: int = 0,
+    min_score: float = 0.0,
+    high_conviction_only: int = 0,
+    show_unproven: int = 0,
 ):
     """
     Explore tab: read-only from explore_signals (buy/watch).
@@ -8126,7 +8202,13 @@ def api_explore_feed(
     h = "long" if _h.startswith("l") else ("medium" if _h.startswith("m") else "short")
     lim = max(1, min(int(limit), 200))
 
-    _ef_cache_key = f"{h}|{market_type}|{signal}|{show_already_active}"
+    _min_score_f = max(0.0, float(min_score or 0))
+    _high_conv_f = int(high_conviction_only or 0) == 1
+    _show_unproven_f = int(show_unproven or 0) == 1
+    _ef_cache_key = (
+        f"{h}|{market_type}|{signal}|{show_already_active}|{_min_score_f}|"
+        f"{int(_high_conv_f)}|{int(_show_unproven_f)}"
+    )
     _ef_cached = _EXPLORE_FEED_CACHE.get(_ef_cache_key)
     if _ef_cached:
         _ef_ts, _ef_result = _ef_cached
@@ -8330,6 +8412,7 @@ def api_explore_feed(
                 "id": _sk,
                 "label": _lab,
                 "active": bool(_active),
+                "pending": bool(_pending),
                 "status": _status,
                 "pending_progress": {
                     "trades_90d": _trades_90,
@@ -8659,6 +8742,14 @@ def api_explore_feed(
             except Exception:
                 pass
 
+        _strat_key_item = pat_id or sid or ""
+        try:
+            from services.explore_screener_filters import strategy_flags_for_id as _strat_flags_for_id
+
+            _strat_active, _strat_pending = _strat_flags_for_id(_strat_key_item, _strategy_health)
+        except Exception:
+            _strat_active, _strat_pending = False, False
+
         _bt_sigs = int(float((bt_info or {}).get("signals") or 0))
         _bt_avg_ret = float((bt_info or {}).get("avg_return") or 0.0)
         _strategy_evidence_line = ""
@@ -8731,6 +8822,8 @@ def api_explore_feed(
                 "change_pct": chg24,
                 "explore_strategy": strat_display,
                 "explore_strategy_id": pat_id or sid,
+                "strategy_is_active": _strat_active,
+                "strategy_is_pending": _strat_pending,
                 "scanner_strategy": ds or None,
                 "scanner_strategy_reason": hr or None,
                 "strategy_reason": reason_out,
@@ -8757,6 +8850,7 @@ def api_explore_feed(
                 "composite_reasons": composite_reasons,
                 "composite_flags": composite_flags,
                 "composite_summary": composite_summary,
+                "risk_reward_ratio": composite_rr,
                 "risk_reward_display": composite_rr_display,
                 "risk_reward_color": composite_rr_color,
                 "strategy_evidence_line": _strategy_evidence_line,
@@ -8791,6 +8885,19 @@ def api_explore_feed(
         items = [it for it in items if _sym_ok(it)]
     except Exception:
         pass
+
+    _sidelined_feed: List[Dict[str, Any]] = []
+    try:
+        from services.explore_screener_filters import apply_screener_filters as _apply_screener_filters
+
+        items, _sidelined_feed = _apply_screener_filters(
+            items,
+            min_score=_min_score_f,
+            high_conviction_only=_high_conv_f,
+            show_unproven=_show_unproven_f,
+        )
+    except Exception as _sf_err:
+        logger.debug("explore screener filters: %s", _sf_err)
 
     # DCA entry plan for buy signals
     def _build_dca_plan(
@@ -8855,6 +8962,18 @@ def api_explore_feed(
             )
     except Exception:
         pass
+    for _side in _sidelined_feed:
+        explore_rejected_payload.append(
+            {
+                "symbol": _side.get("symbol"),
+                "rejection_reason": _side.get("screener_reject_reason") or "Screener filter",
+                "strategy": _side.get("explore_strategy") or "",
+                "updated_ts": _side.get("updated_ts") or _side.get("signal_ts"),
+                "composite_score": _side.get("composite_score"),
+                "score": _side.get("score"),
+            }
+        )
+    explore_rejected_payload = explore_rejected_payload[:80]
 
     with _globals_lock:
         state_h = (_RECO_STATE.get(h) or {}).copy()
@@ -8989,6 +9108,22 @@ def api_explore_feed(
         "market_conditions": _market_conditions,
         "horizons": _horizons_for_ui,
         "data_source": feed_data_source,
+        "screener_filters": {
+            "min_score": _min_score_f,
+            "high_conviction_only": _high_conv_f,
+            "show_unproven": _show_unproven_f,
+            "high_conviction_min": 70,
+        },
+        "explore_watchlist_candidates": [
+            {
+                "symbol": x.get("symbol"),
+                "composite_score": x.get("composite_score"),
+                "explore_strategy": x.get("explore_strategy"),
+                "screener_reject_reason": x.get("screener_reject_reason"),
+            }
+            for x in _sidelined_feed
+            if not x.get("strategy_is_pending")
+        ][:30],
     }
     _EXPLORE_FEED_CACHE[_ef_cache_key] = (time.time(), _ef_response)
     if len(_EXPLORE_FEED_CACHE) > 30:
@@ -10731,7 +10866,7 @@ def explore_signal_audit(symbol: str = "", grade: str = "", limit: int = 50, day
         return _json({"ok": False, "error": str(e)}, 500)
 
 
-@app.get("/explore/accuracy")
+@app.get("/api/explore/accuracy")
 def explore_accuracy(days: int = 30):
     """Explore page accuracy stats: signal-level 24h/72h win rates + bot-based.
 
@@ -10765,7 +10900,7 @@ def explore_accuracy(days: int = 30):
         return _json({"ok": False, "error": str(exc), "transient": True}, 503)
 
 
-@app.get("/explore/accuracy/symbols")
+@app.get("/api/explore/accuracy/symbols")
 def explore_accuracy_symbols(symbols: str = "", days: int = 90):
     """Per-symbol win rates for explore cards."""
     from db import get_per_symbol_accuracy
@@ -10979,6 +11114,62 @@ def api_logs(lines: int = 200, service: str = "tradingserver"):
     except Exception as e:
         logger.exception("api_logs failed")
         return _json({"ok": False, "error": str(e)[:200]}, 500)
+
+
+@app.get("/api/activity/unread")
+def api_activity_unread():
+    """Notification bell badge count. Aliased to notifications/unread_count so the
+    layout's 5-second poller doesn't 404 on every page."""
+    try:
+        from notification_manager import get_unread_count
+        return _json({"ok": True, "count": int(get_unread_count() or 0)})
+    except Exception:
+        return _json({"ok": True, "count": 0})
+
+
+@app.get("/api/explore/active_positions")
+def api_explore_active_positions():
+    """Active bot positions overlay for the Explore page.
+    Returns: {"ok": True, "positions": [{symbol, quantity, avg_entry,
+              current_price, take_profit_price, take_profit_pct, unrealized_pnl}]}
+    """
+    try:
+        from db import list_bots as _lb, list_deals as _ld
+        positions = []
+        for b in (_lb() or []):
+            try:
+                if not int(b.get("enabled") or 0):
+                    continue
+                bid = int(b.get("id") or 0)
+                if not bid:
+                    continue
+                for d in (_ld(bid, limit=20) or []):
+                    if str(d.get("state") or "").lower() != "open":
+                        continue
+                    sym = b.get("symbol") or d.get("symbol")
+                    qty = float(d.get("base_amount") or 0)
+                    avg = float(d.get("entry_avg") or 0)
+                    if not sym or qty <= 0 or avg <= 0:
+                        continue
+                    cur = 0.0
+                    try:
+                        cur = float(_safe_last_price(sym) or 0)
+                    except Exception:
+                        cur = avg
+                    tp_pct = float(b.get("take_profit_pct") or 0)
+                    tp_px = avg * (1.0 + tp_pct / 100.0) if tp_pct else 0.0
+                    upnl = (cur - avg) * qty if cur > 0 else 0.0
+                    positions.append({
+                        "symbol": sym, "quantity": qty, "avg_entry": avg,
+                        "current_price": cur, "take_profit_price": tp_px,
+                        "take_profit_pct": tp_pct, "unrealized_pnl": upnl,
+                        "bot_id": bid, "bot_name": b.get("name") or "",
+                    })
+            except Exception:
+                continue
+        return _json({"ok": True, "positions": positions})
+    except Exception as e:
+        return _json({"ok": True, "positions": [], "error": str(e)[:200]})
 
 
 @app.get("/api/activity")

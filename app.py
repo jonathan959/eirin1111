@@ -67,8 +67,8 @@ WORKER_URL = os.getenv("WORKER_URL", "http://127.0.0.1:9001").rstrip("/")
 # Optional worker API token; if you set WORKER_API_TOKEN in .env, app will forward it.
 WORKER_API_TOKEN = os.getenv("WORKER_API_TOKEN", "").strip()
 
-# Requests timeouts (1-60 seconds)
-WORKER_TIMEOUT_SEC = max(1.0, min(60.0, float(os.getenv("WORKER_TIMEOUT_SEC", "8"))))
+# Requests timeouts (1-60 seconds). Default 20s — Kraken/Alpaca calls can spike well beyond 8s.
+WORKER_TIMEOUT_SEC = max(1.0, min(60.0, float(os.getenv("WORKER_TIMEOUT_SEC", "20"))))
 
 # Security config
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
@@ -525,11 +525,14 @@ def _worker_raw(method: str, path: str, params: Optional[Dict[str, Any]] = None)
 def _safe_worker_health() -> Dict[str, Any]:
     """
     Used by templates so dashboard never breaks.
+
+    Must hit /health/full (not /health). /health is the ultra-lite liveness probe and only
+    returns {status, ok, timestamp} — it does NOT include kraken_ready / alpaca_*_ready.
+    Calling /health here made every page render "Kraken not ready" even when Kraken was up.
     """
-    resp = _worker_json("GET", "/health")
+    resp = _worker_json("GET", "/health/full")
     try:
         payload = resp.body
-        # resp.body is bytes; decode safely
         import json
         data = json.loads(payload.decode("utf-8"))
         return data if isinstance(data, dict) else {"ok": False, "error": "bad_health_payload"}
@@ -695,8 +698,34 @@ def _build_dashboard_context(request: Request) -> Dict[str, Any]:
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
     return templates.TemplateResponse("dashboard.html", _build_dashboard_context(request))
+
+
+@app.get("/autopilot", response_class=HTMLResponse)
+def ui_autopilot(request: Request):
+    return templates.TemplateResponse("autopilot_dashboard.html", _build_dashboard_context(request))
+
+
+@app.get("/setup-autopilot", response_class=HTMLResponse)
+def ui_setup_autopilot(request: Request):
+    return templates.TemplateResponse("setup_autopilot.html", _build_dashboard_context(request))
+
+
+@app.get("/safety", response_class=HTMLResponse)
+def ui_safety(request: Request):
+    return templates.TemplateResponse("safety.html", _build_dashboard_context(request))
+
+
+@app.get("/journal", response_class=HTMLResponse)
+def ui_journal(request: Request):
+    return templates.TemplateResponse("journal.html", _build_dashboard_context(request))
+
+
+@app.get("/strategies", response_class=HTMLResponse)
+def ui_strategies(request: Request):
+    return templates.TemplateResponse("strategies_leaderboard.html", _build_dashboard_context(request))
 
 
 @app.get("/dca", response_class=HTMLResponse)
@@ -901,6 +930,75 @@ def _load_settings() -> Dict[str, Any]:
         "db_path": "botdb.sqlite3",
         "worker_url": WORKER_URL,
     }
+
+
+# =========================================================
+# Catch-all API + /explore/* proxy to worker_api.
+#
+# Must come AFTER every explicit @app.route in this file so that explicit routes
+# win precedence. Without this catch-all every API endpoint that isn't
+# explicitly proxied here returns 404 (we hit ~16 of these during the audit:
+# /api/portfolio/history, /api/logs, /api/notifications/unread_count,
+# /api/activity/unread, /api/explore/*, /api/bots/{id}/dealstats,
+# /api/bots/{id}/performance, /api/bots/{id}/pnl_series,
+# /api/analytics/performance, /explore/fear-greed, etc.)
+# =========================================================
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def api_catchall_proxy(path: str, request: Request):
+    qs = dict(request.query_params)
+    body = None
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+    url = f"{WORKER_URL}/api/{path}"
+    try:
+        r = requests.request(
+            method=request.method,
+            url=url,
+            params=qs or None,
+            json=body,
+            headers=_worker_headers(),
+            timeout=WORKER_TIMEOUT_SEC,
+        )
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/octet-stream"),
+        )
+    except requests.exceptions.RequestException as e:
+        return JSONResponse(
+            {"ok": False, "error": "worker_unreachable", "detail": str(e)}, status_code=502
+        )
+
+
+@app.api_route("/explore/{path:path}", methods=["GET", "POST"])
+async def explore_nonapi_proxy(path: str, request: Request):
+    """Proxy non-/api/-prefixed worker routes like /explore/fear-greed that the
+    Explore page calls directly. Keeps the worker layout flexible without
+    requiring template rewrites."""
+    qs = dict(request.query_params)
+    url = f"{WORKER_URL}/explore/{path}"
+    try:
+        r = requests.request(
+            method=request.method, url=url, params=qs or None,
+            headers=_worker_headers(), timeout=WORKER_TIMEOUT_SEC,
+        )
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        return Response(
+            content=r.content, status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/octet-stream"),
+        )
+    except requests.exceptions.RequestException as e:
+        return JSONResponse(
+            {"ok": False, "error": "worker_unreachable", "detail": str(e)}, status_code=502
+        )
 
 
 def _save_settings(settings: Dict[str, Any]) -> bool:

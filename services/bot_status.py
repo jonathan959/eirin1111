@@ -76,6 +76,61 @@ def signal_from_recommendation(latest_signal: Optional[Dict[str, Any]]) -> str:
     return SIGNAL_NEUTRAL
 
 
+# Strategy/runtime exit actions from BotRunner (smart_decide / risk exits).
+_STRONG_EXIT_DECISION_PREFIXES = ("EXIT",)
+_STRONG_EXIT_DECISION_EXACT = frozenset(
+    {
+        "SELL",
+        "CLOSE",
+        "EXIT",
+        "STOP_LOSS",
+        "TAKE_PROFIT",
+        "TRAILING_EXIT",
+        "PARTIAL_EXIT",
+        "TIME_EXIT",
+    }
+)
+
+# Long-only book: reco score strictly below this while holding → Sell on the *signal* axis.
+# Option B (stricter): use 35.0 instead of 40.0 — confirm with ops if too noisy.
+POSITION_WEAK_SIGNAL_SCORE_LT = 40.0
+
+
+def strategy_decision_implies_strong_sell(decision_action: Optional[str]) -> bool:
+    """True when the engine's latest strategy decision is an exit / risk-off sell."""
+    da = str(decision_action or "").strip().upper()
+    if da in _STRONG_EXIT_DECISION_EXACT:
+        return True
+    for pref in _STRONG_EXIT_DECISION_PREFIXES:
+        if pref in da and da != "ENTER":
+            return True
+    return False
+
+
+def compute_signal_axis(
+    latest_signal: Optional[Dict[str, Any]],
+    *,
+    base_pos: float = 0.0,
+    strategy_decision_action: Optional[str] = None,
+) -> str:
+    """
+    Full signal axis including exits:
+
+    - Explicit exit decisions from the runner → Strong Sell.
+    - Long position + weak scanner score → Sell (bottom band default: score < 40).
+    - Otherwise recommendation-only mapping via :func:`signal_from_recommendation`.
+    """
+    if strategy_decision_implies_strong_sell(strategy_decision_action):
+        return SIGNAL_STRONG_SELL
+
+    has_long = float(base_pos or 0.0) > 0.0
+    score = float(latest_signal.get("score") or 0.0) if latest_signal else 0.0
+    if has_long and score < POSITION_WEAK_SIGNAL_SCORE_LT:
+        return SIGNAL_SELL
+
+    return signal_from_recommendation(latest_signal)
+
+
 def load_latest_signal_for_bot(bot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Best-effort DB lookup of the latest recommendation for the bot symbol."""
     sym = str(bot.get("symbol") or "").strip()
@@ -132,7 +187,11 @@ def compute_bot_status(
     risk = risk_ctx or {}
     gate = exec_gate_result or {}
 
-    signal = signal_from_recommendation(latest_signal)
+    signal = compute_signal_axis(
+        latest_signal,
+        base_pos=float(base_pos or 0.0),
+        strategy_decision_action=intel.get("decision_action"),
+    )
 
     dry_run = bool(int(bot.get("dry_run", 1)))
     if dry_run:

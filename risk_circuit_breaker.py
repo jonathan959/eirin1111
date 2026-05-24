@@ -23,8 +23,13 @@ def _clamp_exposure_pct(val: float) -> float:
 
 
 def _breaker_enabled() -> bool:
-    """Check if portfolio exposure breaker is enabled."""
-    return os.getenv("PORTFOLIO_EXPOSURE_BREAKER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+    """Check if portfolio exposure breaker is enabled.
+
+    Default ON: with real money on the line the safer default is to enforce the
+    daily-loss / drawdown / exposure / concurrent-deal limits. Set
+    PORTFOLIO_EXPOSURE_BREAKER_ENABLED=0 explicitly to disable.
+    """
+    return os.getenv("PORTFOLIO_EXPOSURE_BREAKER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def check_circuit_breakers(

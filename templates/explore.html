@@ -1547,6 +1547,53 @@
   let currentSector = 'all';
   let currentMinScore = 55;
   let currentMinMlConfidence = 0;
+  const SCREENER_HIGH_CONVICTION_MIN = 70;
+  const SCREENER_MIN_WIN_RATE_90D = 40;
+  const SCREENER_MIN_RISK_REWARD = 1.0;
+
+  window.__SHOW_UNPROVEN = (localStorage.getItem('explore_show_unproven') || '0') === '1';
+
+  function screenerEffectiveScore(item) {
+    if (item && item.composite_score != null) return Number(item.composite_score) || 0;
+    return Number(item && item.score != null ? item.score : 0) || 0;
+  }
+
+  function screenerParseRiskReward(item) {
+    if (!item) return null;
+    if (item.risk_reward_ratio != null) {
+      const n = Number(item.risk_reward_ratio);
+      return Number.isFinite(n) ? n : null;
+    }
+    const disp = String(item.risk_reward_display || '').trim();
+    if (!disp || disp === '—' || disp === 'N/A') return null;
+    const m = disp.match(/^([\d.]+)\s*:?\s*1/);
+    if (m) return Number(m[1]);
+    return null;
+  }
+
+  function screenerIsNegativeEdge(item) {
+    const rr = screenerParseRiskReward(item);
+    if (rr != null && rr < SCREENER_MIN_RISK_REWARD) return true;
+    const wr = item && item.backtest_win_rate_90d;
+    if (wr != null && Number(wr) < SCREENER_MIN_WIN_RATE_90D) return true;
+    return false;
+  }
+
+  function screenerPassesStrategyGate(item) {
+    if (item && item.strategy_is_active) return true;
+    if (window.__SHOW_UNPROVEN && item && item.strategy_is_pending) return true;
+    return false;
+  }
+
+  function screenerPassesMainTable(item) {
+    if (!item) return false;
+    if (screenerIsNegativeEdge(item)) return false;
+    if (!screenerPassesStrategyGate(item)) return false;
+    const comp = screenerEffectiveScore(item);
+    if (currentMinScore > 0 && comp < currentMinScore) return false;
+    if (window.__HIGH_CONV_ONLY && comp < SCREENER_HIGH_CONVICTION_MIN) return false;
+    return true;
+  }
   
   async function addToServerWatchlist(symbol) {
     try {
@@ -1772,7 +1819,10 @@
     
     try {
       const showActive = document.getElementById('chk-show-already-active')?.checked ? 1 : 0;
-      const url = `/api/explore/feed?horizon=${currentHorizon}&market_type=${marketTypeParam}&signal=${currentSignal}&limit=${currentLimit}&show_already_active=${showActive}`;
+      const highConv = window.__HIGH_CONV_ONLY ? 1 : 0;
+      const showUnproven = window.__SHOW_UNPROVEN ? 1 : 0;
+      const minScoreParam = currentMinScore > 0 ? currentMinScore : 0;
+      const url = `/api/explore/feed?horizon=${currentHorizon}&market_type=${marketTypeParam}&signal=${currentSignal}&limit=${currentLimit}&show_already_active=${showActive}&min_score=${minScoreParam}&high_conviction_only=${highConv}&show_unproven=${showUnproven}`;
       const onRetry = (attempt, status) => {
         if (tbody && !append && (!allData || allData.length === 0)) {
           const reason = status === 503 ? 'scanner warming up' : (status ? `HTTP ${status}` : 'network error');
@@ -2353,7 +2403,12 @@
     const strategyFilter = document.getElementById('filter-strategy')?.value || 'all';
     const compositeFilter = parseInt(document.getElementById('filter-min-composite')?.value || '0', 10);
     const gradeFilter = document.getElementById('filter-grade')?.value || 'all';
+    const sidelinedByScreener = [];
     const filtered = allData.filter(item => {
+      if (!screenerPassesMainTable(item)) {
+        sidelinedByScreener.push(item);
+        return false;
+      }
       const mt = (item.market_type || '').toLowerCase();
       const isCrypto = mt === 'crypto' || (item.symbol && item.symbol.includes('/'));
       if (currentFilter === 'crypto') if (!isCrypto) return false;
@@ -2436,7 +2491,9 @@
     const metaEl0 = document.getElementById('exploreResultsMeta');
     if (metaEl0) {
       const cap0 = document.getElementById('filter-limit') ? document.getElementById('filter-limit').value : String(currentLimit);
-      metaEl0.textContent = 'Showing ' + filtered.length + ' · fetch cap ' + cap0;
+      const minLbl = currentMinScore > 0 ? (' · min score ' + currentMinScore) : '';
+      const convLbl = window.__HIGH_CONV_ONLY ? ' · high-conviction' : '';
+      metaEl0.textContent = 'Showing ' + filtered.length + ' · fetch cap ' + cap0 + minLbl + convLbl;
     }
 
     if (filtered.length === 0) {
@@ -2496,13 +2553,28 @@
       });
     }, 100);
 
-    // Populate Watchlist section (Grade C: composite 40-59, or watch/wait signal).
-    // The API uses 'wait' for low-conviction watch-tier items; treat as equivalent to 'watch'.
-    const watchItems = allData.filter(i => {
+    // Watchlist: approaching threshold + screener-sidelined (not in main table)
+    const watchFromApi = (lastExploreApiResponse && lastExploreApiResponse.explore_watchlist_candidates) || [];
+    const watchItems = [];
+    const watchSeen = new Set();
+    function _pushWatch(w) {
+      const sym = w && w.symbol;
+      if (!sym || watchSeen.has(sym)) return;
+      watchSeen.add(sym);
+      watchItems.push(w);
+    }
+    watchFromApi.forEach(_pushWatch);
+    sidelinedByScreener.filter(i => {
+      const comp = screenerEffectiveScore(i);
+      return comp >= 40 && comp < SCREENER_HIGH_CONVICTION_MIN;
+    }).forEach(_pushWatch);
+    allData.filter(i => {
       const sig = (i.signal || '').toLowerCase();
-      const comp = i.composite_score || 0;
-      return sig === 'watch' || sig === 'wait' || (comp >= 40 && comp < 60 && sig !== 'buy');
-    }).slice(0, 20);
+      const comp = screenerEffectiveScore(i);
+      return (sig === 'watch' || sig === 'wait' || (comp >= 40 && comp < 60 && sig !== 'buy'))
+        && !screenerPassesMainTable(i);
+    }).forEach(_pushWatch);
+    watchItems.splice(20);
     const watchSec = document.getElementById('watchlistSection');
     const watchBody = document.getElementById('watchlistBody');
     const watchCount = document.getElementById('watchlistCount');
@@ -2532,17 +2604,29 @@
       }
     }
 
-    // Populate Rejection Log — server-driven from explore_signals (no overlap with main table)
+    // Rejection log — API rejections + client-sidelined negative-edge rows
     const rejApi = (lastExploreApiResponse && lastExploreApiResponse.explore_rejected) || [];
     let rejectItems;
+    const rejSeen = new Set();
+    sidelinedByScreener.filter(screenerIsNegativeEdge).forEach(i => {
+      if (i.symbol) rejSeen.add(i.symbol);
+    });
     if (rejApi.length > 0) {
       const nowSec = Math.floor(Date.now() / 1000);
       rejectItems = rejApi.map(r => ({
         symbol: r.symbol,
-        rejection_reason: r.rejection_reason || '',
+        rejection_reason: r.rejection_reason || r.screener_reject_reason || '',
         strategy: r.strategy || '',
         signal_age_sec: r.updated_ts ? (nowSec - r.updated_ts) : null,
       }));
+      sidelinedByScreener.filter(i => screenerIsNegativeEdge(i) && i.symbol && !rejSeen.has(i.symbol)).forEach(i => {
+        rejectItems.push({
+          symbol: i.symbol,
+          rejection_reason: 'Screener: poor R:R or sub-40% 90d win rate',
+          strategy: i.explore_strategy || '',
+          signal_age_sec: null,
+        });
+      });
     } else {
       rejectItems = allData.filter(i => {
         const rflags = i.risk_flags || [];
@@ -2969,7 +3053,7 @@
     const bar = document.getElementById('accuracyBar');
     if (!bar) return;
     try {
-      const res = await fetch('/explore/accuracy?days=30');
+      const res = await fetch('/api/explore/accuracy?days=30');
       // 5xx → endpoint temporarily unavailable. NEVER show "Not enough data yet"
       // here — that message is reserved for HTTP 200 + enough_data:false (the
       // genuine "no signals tracked yet" state). Conflating the two confuses
@@ -3041,7 +3125,7 @@
     const symbols = items.map(i => i.symbol).filter(Boolean).slice(0, 50);
     if (!symbols.length) return;
     try {
-      const res = await fetch('/explore/accuracy/symbols?symbols=' + encodeURIComponent(symbols.join(',')));
+      const res = await fetch('/api/explore/accuracy/symbols?symbols=' + encodeURIComponent(symbols.join(',')));
       const data = await res.json();
       if (!data.ok || !data.symbols) return;
       items.forEach(item => {
@@ -3237,6 +3321,7 @@
     const hasPrice = item.price !== null && item.price !== undefined && item.price > 0;
     const price = hasPrice ? ((item.price || 0) < 10 ? (item.price || 0).toFixed(4) : (item.price || 0).toFixed(2)) : '—';
     const itemScore = item.score ?? 0;
+    const displayScore = screenerEffectiveScore(item);
     const isExploreFE = !!item.explore_feed;
     // Use backend signal (which applies all regime, RSI, volume, BTC, age gates) as source of truth.
     // Fall back to score-based logic only when signal field is absent (legacy rows).
@@ -3283,8 +3368,8 @@
     const typeLabel = isCrypto ? 'CRYPTO' : 'STOCK';
     const rid = 'sl_' + item.symbol.replace(/[^a-zA-Z0-9]/g, '');
     const regime = item.regime_label || item.regime_1d || item.regime_4h || '';
-    const score = item.composite_score != null ? item.composite_score : (item.score ?? 0);
-    const scoreDisplay = Number(score).toFixed(1);
+    const score = displayScore;
+    const scoreDisplay = Number(displayScore).toFixed(0);
     const scoreClass = score >= 75 ? 'score-bright' : (score >= 60 ? 'score-high' : (score >= 45 ? 'score-mid' : (score < 30 ? 'score-danger' : 'score-low')));
     const exploreAction = isExploreFE ? exploreActionLabel(_backendSignal, score, item) : null;
 
@@ -3329,7 +3414,7 @@
     const histBadge = (item._hist_win_rate != null && item._hist_total >= 5) ? `<span class="hist-badge" title="Past recommendation outcomes for this symbol (${item._hist_total} closed in DB) — not the pattern backtest">${item._hist_win_rate}% rec. win</span>` : '';
 
     return `
-      <tr class="${isAvoid ? 'row-avoid' : ''} ${cardClass}" onclick="exploreRowClick(event, ${rowIdx})" style="cursor:pointer" data-symbol="${item.symbol}" data-score="${Math.round(itemScore || 0)}">
+      <tr class="${isAvoid ? 'row-avoid' : ''} ${cardClass}" onclick="exploreRowClick(event, ${rowIdx})" style="cursor:pointer" data-symbol="${item.symbol}" data-score="${Math.round(displayScore || 0)}">
         <td>
           <div class="symbol-cell">
             <span class="watchlist-star ${isInWatchlist(item.symbol) ? 'active' : ''}" onclick="toggleWatchlist('${safeSym}'); event.stopPropagation();" title="Toggle watchlist">⭐</span>
@@ -3354,12 +3439,13 @@
         <td class="center" onclick="event.stopPropagation()">
           <div class="status-cell-wrap" style="flex-direction:column; gap:3px;">
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;">
-              ${renderSignalBadge((item.signal || '').toLowerCase() || 'wait', item.score)}
-              ${renderScoreBar(item.score)}
+              <span class="score-headline" style="font-size:22px;font-weight:800;line-height:1;color:var(--text-primary);" title="Composite score">${scoreDisplay}</span>
+              ${renderSignalBadge((item.signal || '').toLowerCase() || 'wait', displayScore)}
+              ${renderScoreBar(displayScore)}
             </div>
             <div style="display:flex; align-items:center; gap:5px;">
               ${isExploreFE ? `<span class="score-badge ${scoreClass} score-tooltip" title="${String(exploreAction.hint || '').replace(/"/g, '&quot;')}">
-                <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:800;color:${exploreAction.fg};background:${exploreAction.bg};letter-spacing:0.4px;">${exploreAction.label}<span style="opacity:0.88;font-weight:700;font-size:10px;">${scoreDisplay}</span></span>
+                <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:6px;font-size:11px;font-weight:800;color:${exploreAction.fg};background:${exploreAction.bg};letter-spacing:0.4px;">${exploreAction.label}</span>
                 <div class="score-tooltip-content">
                   <div style="text-align:left;max-width:320px;">
                     <strong>${(item.explore_strategy || '').replace(/</g,'&lt;')}</strong>
@@ -4428,7 +4514,7 @@
     }
   }
 
-  // High-conviction-only filter (persisted in localStorage)
+  // High-conviction-only filter (persisted in localStorage) — composite >= 70
   window.__HIGH_CONV_ONLY = (localStorage.getItem('explore_high_conv_only') || '1') === '1';
   function toggleHighConvOnly() {
     window.__HIGH_CONV_ONLY = !window.__HIGH_CONV_ONLY;
@@ -4437,41 +4523,42 @@
     if (t) t.checked = !!window.__HIGH_CONV_ONLY;
     if (typeof applyFilters === 'function') applyFilters();
   }
+  function toggleShowUnproven() {
+    window.__SHOW_UNPROVEN = !window.__SHOW_UNPROVEN;
+    localStorage.setItem('explore_show_unproven', window.__SHOW_UNPROVEN ? '1' : '0');
+    const t = document.getElementById('showUnprovenToggle');
+    if (t) t.checked = !!window.__SHOW_UNPROVEN;
+    if (typeof applyFilters === 'function') applyFilters();
+  }
   setTimeout(function(){
     const t = document.getElementById('highConvToggle');
     if (t) t.checked = !!window.__HIGH_CONV_ONLY;
+    const u = document.getElementById('showUnprovenToggle');
+    if (u) u.checked = !!window.__SHOW_UNPROVEN;
   }, 50);
 
-  // Add the "High conviction only" toggle to the existing filters-bar.
   setTimeout(function(){
-    const bar = document.querySelector('.filters-bar');
+    const bar = document.querySelector('.filters-bar-filters') || document.querySelector('.filters-bar');
     if (!bar) return;
-    if (document.getElementById('highConvWrap')) return;
-    const el = document.createElement('label');
-    el.id = 'highConvWrap';
-    el.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);margin-left:auto;cursor:pointer;';
-    el.innerHTML = '<input id="highConvToggle" type="checkbox" onchange="toggleHighConvOnly()" ' +
-      (window.__HIGH_CONV_ONLY ? 'checked' : '') +
-      ' /> High-conviction only <span class="pill" title="Conviction >= 75" style="font-size:10px;padding:2px 6px;">NEW</span>';
-    bar.appendChild(el);
+    if (!document.getElementById('highConvWrap')) {
+      const el = document.createElement('label');
+      el.id = 'highConvWrap';
+      el.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer;';
+      el.innerHTML = '<input id="highConvToggle" type="checkbox" onchange="toggleHighConvOnly()" ' +
+        (window.__HIGH_CONV_ONLY ? 'checked' : '') +
+        ' /> High-conviction only <span class="pill" title="Composite score >= 70" style="font-size:10px;padding:2px 6px;">≥70</span>';
+      bar.appendChild(el);
+    }
+    if (!document.getElementById('showUnprovenWrap')) {
+      const el2 = document.createElement('label');
+      el2.id = 'showUnprovenWrap';
+      el2.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer;';
+      el2.innerHTML = '<input id="showUnprovenToggle" type="checkbox" onchange="toggleShowUnproven()" ' +
+        (window.__SHOW_UNPROVEN ? 'checked' : '') +
+        ' /> Show unproven signals';
+      bar.appendChild(el2);
+    }
   }, 200);
-
-  // Inject filter hook: hide low-conviction rows when toggle is ON.
-  const _origApply = window.applyFilters;
-  if (typeof _origApply === 'function') {
-    window.applyFilters = function(){
-      const r = _origApply.apply(this, arguments);
-      try {
-        if (window.__HIGH_CONV_ONLY) {
-          document.querySelectorAll('tr[data-score]').forEach(function(tr){
-            const s = Number(tr.getAttribute('data-score') || 0);
-            if (s < 75) tr.style.display = 'none';
-          });
-        }
-      } catch(_){}
-      return r;
-    };
-  }
 
   // Expose for inline onclicks
   window.openQuickTrade = openQuickTrade;
@@ -4480,6 +4567,7 @@
   window.placeQuickTrade = placeQuickTrade;
   window.saveAsQuickBot = saveAsQuickBot;
   window.toggleHighConvOnly = toggleHighConvOnly;
+  window.toggleShowUnproven = toggleShowUnproven;
 </script>
 
 <!-- Quick Trade Drawer -->
@@ -4545,6 +4633,34 @@
     overflow-y: auto;
   }
   .quick-trade-drawer.open { transform: translateX(0); }
+
+  /* Detail sidebar: slide-in panel on the right when a signal row is clicked.
+     Without this rule, the sidebar div had no positioning and rendered as an
+     empty panel at the bottom of the page. */
+  .explore-detail-sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: min(420px, 96vw);
+    height: 100vh;
+    background: var(--bg-card, #101827);
+    border-left: 1px solid var(--border-color);
+    box-shadow: -8px 0 24px rgba(0,0,0,0.25);
+    transform: translateX(100%);
+    transition: transform 0.22s ease-out;
+    z-index: 200;
+    overflow-y: auto;
+  }
+  .explore-detail-sidebar.open { transform: translateX(0); }
+  .explore-detail-sidebar .sidebar-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  @media (max-width: 768px) { .explore-detail-sidebar { width: 100vw; } }
+
   .qtd-inner { padding: 20px; display: flex; flex-direction: column; gap: 10px; }
   .qtd-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
   .qtd-row { display:flex; justify-content:space-between; align-items:center; gap:12px; font-size:13px; }

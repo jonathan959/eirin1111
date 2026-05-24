@@ -75,6 +75,17 @@
 </div>
 
 <script>
+  // Fallback: layout.html defines _authHeaders but its script block renders after the content block,
+  // so synchronous calls made during page init can't rely on it. Define it here first.
+  if (typeof _authHeaders === 'undefined') {
+    function _authHeaders(opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (window.__API_TOKEN) opts.headers['X-API-Key'] = window.__API_TOKEN;
+      return opts;
+    }
+  }
+
   let allDeals = [];
   let currentDealId = null;
   function fmtDate(ts){ return ts ? new Date(ts*1000).toLocaleDateString() : '—'; }

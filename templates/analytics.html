@@ -363,6 +363,17 @@
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
 <script>
+  // Fallback: layout.html defines _authHeaders but its script block renders after the content block,
+  // so synchronous calls made during page init can't rely on it. Define it here first.
+  if (typeof _authHeaders === 'undefined') {
+    function _authHeaders(opts) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (window.__API_TOKEN) opts.headers['X-API-Key'] = window.__API_TOKEN;
+      return opts;
+    }
+  }
+
   let charts = {};
 
   async function loadAnalytics() {

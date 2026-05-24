@@ -52,6 +52,27 @@ class TestBotStatus(unittest.TestCase):
         self.assertEqual(out.action_state, bs.ACTION_WATCH)
         self.assertIn("Dry run", out.reason)
 
+    def test_open_position_weak_reco_sell(self):
+        b = {"dry_run": 0}
+        sig = {"score": 35.0, "conviction_grade": "D"}
+        intel = {"decision_action": "HOLD"}
+        out = bs.compute_bot_status(b, sig, intel, {"level": "OK"}, {"allowed": True}, base_pos=1.0)
+        self.assertEqual(out.signal, bs.SIGNAL_SELL)
+
+    def test_exit_decision_strong_sell_overrides_high_score(self):
+        b = {"dry_run": 0}
+        sig = {"score": 90.0, "conviction_grade": "A"}
+        intel = {"decision_action": "STOP_LOSS"}
+        out = bs.compute_bot_status(b, sig, intel, {"level": "OK"}, {"allowed": True}, base_pos=0.0)
+        self.assertEqual(out.signal, bs.SIGNAL_STRONG_SELL)
+
+    def test_weak_score_flat_no_position_not_sell(self):
+        b = {"dry_run": 0}
+        sig = {"score": 30.0}
+        intel = {"decision_action": "HOLD"}
+        out = bs.compute_bot_status(b, sig, intel, {"level": "OK"}, {"allowed": True}, base_pos=0.0)
+        self.assertEqual(out.signal, bs.SIGNAL_NEUTRAL)
+
 
 if __name__ == "__main__":
     unittest.main()
