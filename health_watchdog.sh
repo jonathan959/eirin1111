@@ -22,5 +22,4 @@ echo "$now" > "$LOCK"
 
 logger -t ai-bot-watchdog "Health failed, restarting ai-bot"
 sudo systemctl restart ai-bot 2>/dev/null || true
-sudo systemctl restart tradingserver 2>/dev/null || true
 sudo systemctl restart bot-worker 2>/dev/null || true
